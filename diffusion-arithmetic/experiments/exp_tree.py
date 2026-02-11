@@ -44,8 +44,8 @@ PATIENCE     = 2_000
 MOD          = 1000
 DEPTH_TRAIN  = [2, 3]
 DEPTH_OOD    = [4, 5]
-LEAVES_TRAIN = list(range(8))
-LEAVES_TEST  = list(range(10))
+LEAVES_TRAIN = [0, 1, 2, 3, 4, 6, 7, 8, 9]  # exclude 5
+LEAVES_TEST  = list(range(10))               # all digits
 POS_ENCS     = ['absolute', 'rope']
 FORMATS      = ['plain', 'scratchpad']
 
@@ -230,7 +230,7 @@ def run():
 
     # Accuracy
     split_order = TEST_SPLITS
-    labels = ['ID (d2-3)', 'OOD Digit', 'OOD Depth (d4-5, 0-7)', 'OOD Both']
+    labels = ['ID (d2-3)', 'OOD Digit (has 5)', 'OOD Depth (d4-5, no 5)', 'OOD Both']
     fig, axes = plt.subplots(1, 4, figsize=(24, 6))
     for idx, (sp, lb) in enumerate(zip(split_order, labels)):
         ax = axes[idx]

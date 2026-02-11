@@ -41,9 +41,10 @@ N_TRAIN      = 10_000
 N_TEST       = 2_000
 MAX_ITERS    = 15_000
 PATIENCE     = 2_000
-TRAIN_DIGITS = list(range(8))
+TRAIN_DIGITS = [0, 1, 2, 3, 4, 6, 7, 8, 9]  # exclude 5 (mid-range, avoids edge bias)
 ALL_DIGITS   = list(range(10))
-POS_ENCS     = ['absolute', 'rope']     # both tested
+HELD_OUT     = {5}
+POS_ENCS     = ['absolute', 'rope']
 FORMATS      = ['plain', 'reverse', 'scratchpad']
 
 # ── Data generation ─────────────────────────────────
@@ -105,10 +106,10 @@ def build_splits(fmt):
 TEST_SPLITS = ['test_id', 'test_ood_digit', 'test_ood_length', 'test_ood_both']
 
 
-def _has_ood_digit(s, train_digits=TRAIN_DIGITS):
-    """Check if a sample's operands contain out-of-distribution digits."""
+def _has_ood_digit(s, held_out=HELD_OUT):
+    """Check if a sample's operands contain held-out digits."""
     prefix = s.split('=')[0]  # e.g. "123+456"
-    return any(int(c) not in train_digits for c in prefix if c.isdigit())
+    return any(int(c) in held_out for c in prefix if c.isdigit())
 
 
 
@@ -121,8 +122,8 @@ def build_tok(fmt):
 def breakdown_ood_digit_from_eval(test_samples, eval_result, get_ans_fn):
     """
     Break down OOD-digit eval into:
-      - samples where operands use only train digits (0-7)
-      - samples where operands contain OOD digits (8, 9)
+      - samples where operands use only train digits (no 5)
+      - samples where operands contain held-out digit (5)
     """
     per_correct = eval_result['per_sample_correct']
     id_ok, ood_ok = [], []
@@ -132,10 +133,10 @@ def breakdown_ood_digit_from_eval(test_samples, eval_result, get_ans_fn):
         else:
             id_ok.append(ok)
     return {
-        'all_digit_id': sum(id_ok) / max(len(id_ok), 1),
-        'has_ood_digit': sum(ood_ok) / max(len(ood_ok), 1),
-        'n_id': len(id_ok),
-        'n_ood': len(ood_ok),
+        'no_held_out': sum(id_ok) / max(len(id_ok), 1),
+        'has_held_out': sum(ood_ok) / max(len(ood_ok), 1),
+        'n_no_held_out': len(id_ok),
+        'n_has_held_out': len(ood_ok),
     }
 
 
@@ -191,10 +192,10 @@ def run():
                         bd = breakdown_ood_digit_from_eval(
                             splits[sp], res, get_ans)
                         all_results[key]['digit_breakdown'] = bd
-                        print(f"      → digits 0-7 only: {bd['all_digit_id']:.4f} "
-                              f"({bd['n_id']} samples)")
-                        print(f"      → has 8/9:         {bd['has_ood_digit']:.4f} "
-                              f"({bd['n_ood']} samples)")
+                        print(f"      → no 5 in ops:  {bd['no_held_out']:.4f} "
+                              f"({bd['n_no_held_out']} samples)")
+                        print(f"      → has 5 in ops: {bd['has_held_out']:.4f} "
+                              f"({bd['n_has_held_out']} samples)")
 
                     # Scratchpad decode order analysis
                     if objective == 'diffusion' and fmt == 'scratchpad' \
@@ -258,8 +259,8 @@ def run():
 
     # 3) Accuracy: grouped by split
     split_order = TEST_SPLITS
-    labels = ['ID (3d, 0-7)', 'OOD Digit (3d, 0-9)',
-              'OOD Length (4d, 0-7)', 'OOD Both (4d, 0-9)']
+    labels = ['ID (3d, no 5)', 'OOD Digit (3d, all)',
+              'OOD Length (4d, no 5)', 'OOD Both (4d, all)']
     fig, axes = plt.subplots(1, 4, figsize=(24, 6))
     for idx, (sp, lb) in enumerate(zip(split_order, labels)):
         ax = axes[idx]
@@ -290,8 +291,8 @@ def run():
             ax.annotate(f"{obj}_{fmt}", (abs_val, rope_val),
                         fontsize=6, textcoords="offset points", xytext=(3, 3))
     ax.plot([0, 1], [0, 1], 'k--', alpha=0.3)
-    ax.set_xlabel('Absolute PE (4d, digits 0-7)')
-    ax.set_ylabel('RoPE (4d, digits 0-7)')
+    ax.set_xlabel('Absolute PE (4d, no 5)')
+    ax.set_ylabel('RoPE (4d, no 5)')
     ax.set_title('Pure Length Generalisation: RoPE vs Absolute')
     ax.legend(fontsize=7); ax.grid(alpha=0.3)
     ax.set_xlim(-0.05, 1.05); ax.set_ylim(-0.05, 1.05)
@@ -314,12 +315,12 @@ def run():
               f"{convergence_iters.get(k,'?'):>8}")
 
     # Print digit breakdown
-    print("\nDigit OOD Breakdown:")
+    print("\nDigit OOD Breakdown (held-out digit: 5):")
     for k in configs:
         bd = all_results[k].get('digit_breakdown')
         if bd:
-            print(f"  {k}: digits_0-7={bd['all_digit_id']:.4f} ({bd['n_id']}), "
-                  f"has_8/9={bd['has_ood_digit']:.4f} ({bd['n_ood']})")
+            print(f"  {k}: no_5={bd['no_held_out']:.4f} ({bd['n_no_held_out']}), "
+                  f"has_5={bd['has_held_out']:.4f} ({bd['n_has_held_out']})")
 
     if scratchpad_analysis:
         print("\nScratchpad Decode Order (diffusion):")
