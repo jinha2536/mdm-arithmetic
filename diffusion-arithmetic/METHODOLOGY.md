@@ -69,7 +69,7 @@ position $t$에서 $(q_{2i}, q_{2i+1})$을 $\theta_i \cdot t$만큼 회전시킨
 
 ## 모듈 1: Addition (exp_addition.py)
 
-3자리 덧셈을 통해 carry chain 추론 능력을 테스트한다.
+Multi-digit 덧셈을 통해 carry chain 추론 능력을 테스트한다. 3자리/5자리/7자리의 난이도 스케일링으로 AR과 diffusion의 차이가 드러나는 경계를 찾는다.
 
 ### 데이터 구성
 
@@ -77,15 +77,16 @@ position $t$에서 $(q_{2i}, q_{2i+1})$을 $\theta_i \cdot t$만큼 회전시킨
 
 **Plain**: 답을 그대로 출력한다.
 ```
-347+521=0868
+347+521=0868           (3d)
+54321+12345=066666     (5d)
 ```
-Operand는 3자리로 zero-pad하고, 답은 4자리(3+1)로 zero-pad한다. 모델은 `=` 이후를 생성한다.
+Operand는 nd자리로 zero-pad하고, 답은 (nd+1)자리로 zero-pad한다.
 
 **Reverse**: 답을 뒤집어 출력한다.
 ```
 347+521=8680
 ```
-Least significant digit이 먼저 나오므로, carry를 순서대로 처리할 수 있다. AR에게 유리할 수 있는 format이다.
+LSB가 먼저 나오므로 carry를 순서대로 처리할 수 있다. AR에게 유리한 format.
 
 **Scratchpad**: 중간 과정을 명시적으로 출력한다.
 ```
@@ -108,6 +109,16 @@ Seed를 고정(0)하여 held-out set의 재현성을 보장한다. 중복 operan
 
 ### 데이터 분할
 
+**Multi-digit scaling**: 3가지 자릿수에서 실험한다. 3자리에서 accuracy가 ~1.0에 포화되므로, 5자리/7자리로 난이도를 올려 AR과 diffusion의 차이가 드러나는 경계를 찾는다.
+
+| nd | N_train | N_test | OOD 종류 | 비고 |
+|----|---------|--------|---------|------|
+| 3  | 10,000  | 2,000  | Number-level + Length | 논문 비교용 |
+| 5  | 30,000  | 2,000  | Length only | 난이도 확장 |
+| 7  | 50,000  | 2,000  | Length only | 가장 어려운 조건 |
+
+**3자리 splits** (Lee et al. 2023 비교):
+
 | Split | 자릿수 | Operand 조건 | N | 테스트 대상 |
 |-------|--------|-------------|---|-----------|
 | train | 3 | 양쪽 모두 TRAIN_OPS (900개) | 10,000 | — |
@@ -115,13 +126,19 @@ Seed를 고정(0)하여 held-out set의 재현성을 보장한다. 중복 operan
 | test_ood_number | 3 | ≥1개가 HELD_OUT (100개) | 2,000 | Number-level 일반화 |
 | test_ood_length | 4 | 제약 없음 (0-9999) | 2,000 | Length 일반화 |
 
-**왜 이렇게 분리하는가**: Number OOD는 학습 시 보지 못한 operand 값에 대한 일반화를 측정한다. Length OOD는 3자리에서 4자리로의 positional generalization을 측정한다. 두 축은 독립적이다.
+**5자리/7자리 splits**: Operand space가 너무 커서 number-level holdout이 의미 없으므로, uniform random sampling + length OOD만 테스트.
+
+| Split | 자릿수 | N | 테스트 대상 |
+|-------|--------|---|-----------|
+| train | nd | 위 표 참조 | — |
+| test_id | nd | 2,000 | ID 정확도 |
+| test_ood_length | nd+2 | 2,000 | Length 일반화 |
 
 ### 실험 조건
 
-2(objective) × 3(format) × 2(pos_enc) = **12 configurations**:
+3(digit_config) × 2(objective) × 3(format) × 2(pos_enc) = **36 configurations**
 
-{ar, diffusion} × {plain, reverse, scratchpad} × {absolute, rope}
+{3d, 5d, 7d} × {ar, diffusion} × {plain, reverse, scratchpad} × {absolute, rope}
 
 ### 평가 지표
 
@@ -139,11 +156,54 @@ HELD_OUT 100개에서 양쪽 모두 held-out인 쌍의 비율은 약 (100/1000)�
 
 Diffusion의 scratchpad이 AR의 chain-of-thought과 기능적으로 동일한지 검증한다.
 
-- `scratchpad_first_ratio`: 모든 scratchpad 위치가 모든 최종 답 위치보다 먼저 채워진 sample의 비율. 1.0이면 "항상 scratchpad를 먼저 완성한 후 답을 생성"한다는 뜻.
+- `scratchpad_first_ratio`: 모든 scratchpad 위치가 모든 최종 답 위치보다 먼저 채워진 sample의 비율.
 - `avg_scratchpad_rank`: scratchpad 위치들이 채워진 평균 순서 (0 = 가장 먼저).
 - `avg_final_rank`: 최종 답 위치들이 채워진 평균 순서.
 
+**Fixation Order Analysis** (diffusion의 계산 경로 분석):
+
+"Diffusion이 AR과 다른 계산 경로를 학습하는가?"를 직접 검증하기 위한 핵심 분석이다.
+
+답의 각 자릿수 위치(0=MSB, nd=LSB)에 대해, diffusion decoding 중 해당 위치가 **몇 번째 step에서 확정(fix)되었는지**를 추적한다.
+
+- `mean_rank[i]`: 답의 i번째 위치가 확정된 평균 step. 낮을수록 먼저 결정됨.
+- `carry_corr`: carry 발생 여부와 fixation rank 간의 Spearman 상관관계. 양수이면 carry 위치가 더 늦게 결정됨(carry가 불확실성을 높이므로).
+
+**기대 패턴**:
+- 만약 diffusion이 LSB부터 확정하면 → 내부적으로 reverse와 유사한 알고리즘을 학습한 것
+- 만약 MSB부터 확정하면 → plain과 유사
+- 만약 carry 위치를 늦게 확정하면 → carry 전파를 인식하고 있다는 증거
+- 만약 format (plain/reverse/scratchpad)에 따라 fixation order가 달라지면 → format이 학습된 알고리즘에 영향을 줌
+
+이 분석은 각 digit 설정 (3d/5d/7d)에서 독립적으로 수행되며, 자릿수가 늘어남에 따라 패턴이 어떻게 변하는지도 관찰한다.
+
 **Convergence Iteration**: 각 configuration이 수렴한 iteration. Training budget의 공정성을 확인한다.
+
+**Difficulty Curve**: nd별 ID accuracy를 시각화하여, accuracy가 1.0 이하로 떨어지기 시작하는 digit 수와 그때의 AR/diffusion 차이를 분석한다.
+
+### Secondary Analysis: Digit-Position Exclusion (Appendix B.2.1 재현)
+
+메인 실험(number-level OOD)과 별도로, Lee et al.의 Appendix B.2.1을 재현하여 AR과 diffusion의 차이를 추가 분석한다.
+
+**설계**: Digit 5를 **특정 자릿수 위치 하나에서만** 제외하고, 위치별로 별도 모델을 학습시킨다.
+
+| 실험 | 제외 조건 | 학습 데이터 예시 |
+|------|----------|---------------|
+| excl_pos=0 (LSB, ones) | ones 자리에 5 없음 | `123+467=...` (O), `125+467=...` (X) |
+| excl_pos=1 (tens) | tens 자리에 5 없음 | `123+467=...` (O), `153+467=...` (X) |
+| excl_pos=2 (MSB, hundreds) | hundreds 자리에 5 없음 | `123+467=...` (O), `523+467=...` (X) |
+
+총 3(position) × 2(ar, diffusion) = **6 models** 학습. Format은 plain만 사용, position encoding은 absolute만 사용.
+
+**평가 지표**:
+- **Overall accuracy**: 모든 digit, 모든 위치를 포함하는 10,000개 test set에서의 정확도.
+- **Exclusion accuracy**: test set 중 제외된 위치에 digit 5가 등장하는 sample만 추출한 정확도. 이것이 해당 위치에서의 일반화 능력을 직접 측정한다.
+
+**기대 패턴 (논문 기반)**:
+- LSB exclusion이 가장 해롭다. LSB는 carry 없이 순수 덧셈을 배우는 위치이므로, 여기서 5의 패턴을 못 배우면 다른 위치의 carry 계산에도 전이가 안 된다.
+- MSB exclusion이 가장 덜 해롭다. MSB는 carry에 의존하므로, 5가 아닌 다른 digit들의 패턴에서 5의 행동을 추론할 여지가 있다.
+
+**우리의 추가 질문**: Diffusion 모델은 AR과 다른 패턴을 보이는가? Diffusion은 non-sequential decode order를 가지므로, LSB에 대한 의존도가 AR과 다를 수 있다.
 
 ### 신뢰성 분석
 
@@ -305,15 +365,27 @@ $$\mathcal{L}^* = \mathbb{E}_{x, \text{mask}} \left[ -\sum_{i \in \text{masked}}
 | l2r | 왼쪽에서 오른쪽 순서 | AR과 동일한 순서 |
 | r2l | 오른쪽에서 왼쪽 순서 | 역순 |
 
-**Parallel Policies** (한 step에 k tokens):
+**Adaptive Threshold** (variable NFE):
 
-| Policy | 위치 선택 기준 | k |
-|--------|-------------|---|
-| parallel_random | Random k개 | 2, 4 |
-| parallel_confidence | Confidence top-k | 2, 4 |
-| parallel_low_dep | Confidence 기반 + logit 유사도가 낮은 조합 | 2, 4 |
+| Policy | τ | 동작 |
+|--------|---|------|
+| adaptive_τ0.5 | 0.5 | 공격적 병렬화 — 절반 이상 확신하면 동시 decode |
+| adaptive_τ0.7 | 0.7 | 중간 — 70% 이상에서만 동시 decode |
+| adaptive_τ0.9 | 0.9 | 보수적 — 거의 확실한 것만 동시 decode |
 
-`parallel_low_dep`은 서로 독립적인 위치를 골라서 동시에 decode하는 전략이다. Logit vector의 cosine similarity가 낮은 위치 쌍을 선택한다.
+각 step에서 max softmax probability ≥ τ인 **모든** 위치를 동시에 decode한다. 아무 위치도 threshold를 넘지 못하면 가장 confident한 1개를 decode (fallback). 이 방식은 분포의 dependency 구조에 자연스럽게 적응한다: independent한 분포에서는 한번에 많은 위치가 확실하므로 NFE가 크게 줄고, strongly coupled한 분포에서는 한번에 적은 위치만 확실하므로 sequential에 가깝게 동작한다.
+
+**Jacobi Iteration** (variable NFE):
+
+| Policy | max_iter | 동작 |
+|--------|----------|------|
+| jacobi_i5 | 5 | 빠른 수렴 또는 조기 종료 |
+| jacobi_i10 | 10 | 중간 |
+| jacobi_i20 | 20 | 충분한 수렴 보장 |
+
+모든 위치를 동시에 predict한 뒤, 그 결과를 context로 다시 predict하는 과정을 반복한다. Token이 더 이상 변하지 않으면 (fixed point) 수렴. Jacobi iteration의 diffusion 버전으로, 수렴 시 sequential confidence와 동일한 quality를 달성하면서도 수렴이 빠르면 NFE가 L보다 훨씬 적을 수 있다.
+
+**기존 parallel_random/confidence를 제거한 이유**: 고정 k개를 무작위/confidence 순으로 동시 decode하는 방식은 dependency를 무시하기 때문에, sequential보다 항상 나쁜 결과를 보였다. Adaptive threshold와 Jacobi는 모델 자체의 confidence를 활용하여 "언제 병렬화할지"를 결정하므로, speed-quality tradeoff에서 의미있는 비교가 가능하다.
 
 ### 평가 지표
 
@@ -365,6 +437,27 @@ True distribution의 확률 상위 100개 시퀀스 중, 생성된 sample에 1�
 
 Sequential policies는 항상 L=8. Parallel policies는 k에 따라 줄어든다. Quality가 동일하다면 NFE가 낮을수록 효율적이다.
 
+**Decode Order Analysis** (새로 추가):
+
+각 policy가 L개 위치를 어떤 순서로 decode하는지 추적한다. Sequential policy의 경우, 각 step에서 선택된 position을 기록하여:
+- `mean_decode_order[j]`: position j가 평균 몇 번째 step에서 decode되었는지. 0이면 가장 먼저.
+
+**MI-Order Alignment Score** (새로 추가):
+
+Position별 total MI (= 해당 위치와 다른 모든 위치 간 MI의 합)와 decode order 간의 Spearman 상관.
+
+$$\rho = \text{Spearman}\bigl(\sum_j I(X_i; X_j),\ \text{decode\_rank}(i)\bigr)$$
+
+- ρ < 0 (음수): high-MI 위치를 먼저 decode → MI 구조를 활용하는 좋은 전략
+- ρ ≈ 0: decode order가 MI와 무관
+- ρ > 0: high-MI 위치를 나중에 decode → MI 구조와 반대
+
+이 지표는 policy가 분포의 dependency 구조를 얼마나 잘 활용하는지 직접 측정한다.
+
+**Policy Ranking Table** (새로 추가):
+
+각 분포에서 sequential policy들을 excess TV 순으로 1~7위까지 ranking. 분포별로 어떤 policy가 일관되게 좋은지/나쁜지를 한눈에 파악한다.
+
 ### Mutual Information Matrix
 
 각 분포의 dependency 구조를 시각화하기 위해 pairwise MI를 계산한다.
@@ -376,22 +469,31 @@ $$I(X_i; X_j) = \sum_{v_i, v_j} p(X_i=v_i, X_j=v_j) \log \frac{p(X_i=v_i, X_j=v_
 - Distribution C: 모든 pair에서 균일하게 낮지 않은 MI (global coupling)
 - Distribution D: Local + global 패턴의 혼합
 
-이 matrix는 decoding policy의 성능을 해석하는 데 사용된다. 예를 들어 confidence policy가 Distribution B에서 잘 작동하면, local dependency가 있는 구조에서 "확신이 높은 위치부터"가 효과적이라는 해석이 가능하다.
+이 matrix는 decoding policy의 성능을 해석하는 데 사용된다. MI-Order Alignment Score와 함께 사용하면, 특정 policy가 어떤 dependency 구조에서 왜 잘/못 작동하는지 설명할 수 있다.
 
 ---
 
 ## Visualization 목록
 
-### 모듈 1-2 공통
+### 모듈 1
 
-- **Training Curves**: Position encoding별 loss 곡선. Convergence 확인용.
-- **Convergence Bar Chart**: 각 configuration의 수렴 iteration. Budget 공정성 확인.
-- **Accuracy by Split**: Split별 bar chart. AR(빨강) vs diffusion(파랑), hatched=RoPE.
-- **RoPE vs Absolute Scatter**: OOD split에서 absolute(x축) vs RoPE(y축). 대각선 위이면 RoPE가 우세.
+- **Difficulty Curve**: nd별 ID accuracy 곡선. AR vs diffusion이 갈라지는 지점.
+- **Accuracy by Split (per nd)**: 각 자릿수별 bar chart. AR(빨강) vs diffusion(파랑), hatched=RoPE.
+- **Fixation Order**: Diffusion이 답의 각 자릿수를 확정하는 순서. MSB부터인지 LSB부터인지.
+- **Fixation × Format 비교**: plain/reverse/scratchpad에서 fixation order가 어떻게 달라지는지.
+
+### 모듈 2
+
+- **Training Curves**: Position encoding별 loss 곡선.
+- **Accuracy by Split**: ID + depth OOD bar chart.
+- **RoPE vs Absolute Scatter**: Depth OOD에서 absolute vs RoPE 비교.
 
 ### 모듈 3
 
 - **MI Matrix Heatmap**: 4개 분포의 pairwise MI. Dependency 구조 시각화.
-- **TV Heatmap (Raw + Excess)**: Policy × Distribution. Raw TV와 baseline 제거 후 excess TV 병렬 비교.
-- **Spearman Correlation Heatmap**: Policy × Distribution. Path score와 true probability의 순위 상관.
-- **Pareto Chart (NFE vs TV)**: Speed-quality tradeoff. Parallel policies의 k에 따른 변화 추적.
+- **TV Excess Heatmap**: 전체 13 policies (seq 7 + adaptive 3 + jacobi 3) × 4 distributions.
+- **NFE vs TV Scatter**: 핵심 시각화. Sequential은 모두 NFE=8에 모이고, adaptive/jacobi는 NFE가 달라짐. Quality 손실 없이 NFE를 줄이는 정도를 직접 비교.
+- **Decode Order Heatmap**: Adaptive policy별 position decode 순서 (10K 샘플 기반).
+- **MI-Order Alignment**: Sequential policy의 decode order가 MI 구조와 얼마나 일치하는지.
+- **Policy Ranking Table**: 전체 13 policies의 분포별 ranking.
+- **Spearman Correlation**: Path score와 true probability의 순위 상관.
