@@ -13,6 +13,13 @@
     - Scratchpad shows LEVEL-wise intermediates (parallel structure)
     - Scratchpad output is longer → diffusion decode order matters more
 
+  Test splits:
+    test_id          (depth 2-3, leaves 0-9)
+    test_ood_depth   (depth 4-5, leaves 0-9)
+
+  All digits 0-9 used everywhere; OOD tests depth generalisation only.
+  (Number-level OOD does not apply to single-digit leaves.)
+
   Controls:
     - Same greedy decoding, convergence-based training
     - RoPE tested for depth generalisation
@@ -44,8 +51,7 @@ PATIENCE     = 2_000
 MOD          = 1000
 DEPTH_TRAIN  = [2, 3]
 DEPTH_OOD    = [4, 5]
-LEAVES_TRAIN = [0, 1, 2, 3, 4, 6, 7, 8, 9]  # exclude 5
-LEAVES_TEST  = list(range(10))               # all digits
+LEAVES       = list(range(10))               # all digits 0-9
 POS_ENCS     = ['absolute', 'rope']
 FORMATS      = ['plain', 'scratchpad']
 
@@ -123,16 +129,12 @@ def get_tree_full(s):
 
 def build_splits(fmt):
     return {
-        'train':          gen_tree_data(DEPTH_TRAIN, N_TRAIN, LEAVES_TRAIN, fmt, 42),
-        'test_id':        gen_tree_data(DEPTH_TRAIN, N_TEST,  LEAVES_TRAIN, fmt, 1042),
-        'test_ood_digit': gen_tree_data(DEPTH_TRAIN, N_TEST,  LEAVES_TEST,  fmt, 2042),
-        # Depth OOD with IN-distribution digits → isolates depth effect
-        'test_ood_depth': gen_tree_data(DEPTH_OOD,   N_TEST,  LEAVES_TRAIN, fmt, 3042),
-        # Both OOD (hardest)
-        'test_ood_both':  gen_tree_data(DEPTH_OOD,   N_TEST,  LEAVES_TEST,  fmt, 4042),
+        'train':          gen_tree_data(DEPTH_TRAIN, N_TRAIN, LEAVES, fmt, 42),
+        'test_id':        gen_tree_data(DEPTH_TRAIN, N_TEST,  LEAVES, fmt, 1042),
+        'test_ood_depth': gen_tree_data(DEPTH_OOD,   N_TEST,  LEAVES, fmt, 3042),
     }
 
-TEST_SPLITS = ['test_id', 'test_ood_digit', 'test_ood_depth', 'test_ood_both']
+TEST_SPLITS = ['test_id', 'test_ood_depth']
 
 def build_tok(fmt):
     chars = list('0123456789()+*=')
@@ -230,8 +232,8 @@ def run():
 
     # Accuracy
     split_order = TEST_SPLITS
-    labels = ['ID (d2-3)', 'OOD Digit (has 5)', 'OOD Depth (d4-5, no 5)', 'OOD Both']
-    fig, axes = plt.subplots(1, 4, figsize=(24, 6))
+    labels = ['ID (d2-3)', 'OOD Depth (d4-5)']
+    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
     for idx, (sp, lb) in enumerate(zip(split_order, labels)):
         ax = axes[idx]
         vals = [all_results[k].get(sp, 0) for k in configs]
@@ -272,14 +274,12 @@ def run():
     print("\n" + "=" * 70)
     print("SUMMARY")
     print("=" * 70)
-    print(f"{'Config':<35} {'ID':>8} {'OOD-d':>8} {'OOD-D':>8} {'Both':>8} {'conv':>8}")
-    print("-" * 75)
+    print(f"{'Config':<35} {'ID':>8} {'OOD-D':>8} {'conv':>8}")
+    print("-" * 60)
     for k in configs:
         r = all_results[k]
         print(f"{k:<35} {r.get('test_id',0):>8.4f} "
-              f"{r.get('test_ood_digit',0):>8.4f} "
               f"{r.get('test_ood_depth',0):>8.4f} "
-              f"{r.get('test_ood_both',0):>8.4f} "
               f"{convergence_iters.get(k,'?'):>8}")
 
     if scratchpad_analysis:

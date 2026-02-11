@@ -95,28 +95,27 @@ Least significant digit이 먼저 나오므로, carry를 순서대로 처리할 
 
 ### Operand 생성 규칙
 
-각 자릿수는 허용된 digit set에서 **독립적으로** uniform random sampling한다. 즉 operand 전체를 random integer로 뽑는 것이 아니라, 자릿수별로 뽑으므로 특정 digit의 출현 여부를 정확하게 제어할 수 있다.
+Operand는 0-999 범위에서 **정수 값 단위로** sampling한다. 모든 digit (0-9)이 학습 데이터에 등장한다.
 
-**Held-out digit: 5**. 학습 시 operand에 사용하는 digit은 {0,1,2,3,4,6,7,8,9}이고, digit 5만 제외한다. 5를 제외하는 이유:
-- 8, 9를 제외하면 "가장 큰 digit"이 빠지므로 carry 패턴 자체가 체계적으로 달라진다. 예를 들어 8+9=17의 carry는 학습 데이터에 존재하지 않게 된다.
-- 5는 digit 공간의 중앙에 있으므로, 제외해도 carry/sum 패턴의 분포가 크게 왜곡되지 않는다.
-- 모델이 5를 올바르게 처리하려면 "digit identity를 compositionally 이해"해야 하므로, 더 깔끔한 일반화 테스트가 된다.
+**Number-level OOD (Lee et al. 2023과 동일)**: 1000개 operand 값 중 100개(10%)를 random으로 선택하여 학습에서 제외한다. 이는 1000×1000 덧셈 행렬에서 특정 row/column을 빈칸으로 두는 것과 동일하다. Low-rank matrix completion의 관점에서, 나머지 entry들이 빈칸을 제약하므로 모델이 일반화할 수 있다.
 
-단, 5는 **답(sum)에는 등장**할 수 있다 (예: 123+432=0555). 따라서 토큰 '5'의 embedding 자체는 학습되지만, operand 위치에서 5를 본 적은 없다.
+이 설계의 이점:
+- **논문과 직접 비교 가능**: Lee et al.이 성공적으로 보인 일반화와 동일한 조건이다.
+- **Digit embedding 문제 회피**: Digit-level exclusion (예: 5를 모든 위치에서 제거)은 해당 digit의 operand-position embedding이 학습되지 않아 일반화가 원천적으로 불가능하다. Number-level holdout은 모든 digit이 다양한 context에서 학습된다.
+- **LRMC vs 알고리즘 학습 테스트**: LRMC는 row/column 전체가 빈 경우 복원 불가능하지만, 우리가 10%만 제외하면 각 operand의 다른 조합은 학습에 포함되므로 "진정한" 덧셈 알고리즘을 학습했는지 검증할 수 있다.
 
-중복 operand 쌍 `(a, b)`은 제거한다. Seed를 고정하여 재현성을 보장한다.
+Seed를 고정(0)하여 held-out set의 재현성을 보장한다. 중복 operand 쌍 `(a, b)`은 제거한다.
 
 ### 데이터 분할
 
-| Split | 자릿수 | 허용 digits | N | 테스트 대상 |
-|-------|--------|------------|---|-----------|
-| train | 3 | {0-4, 6-9} | 10,000 | — |
-| test_id | 3 | {0-4, 6-9} | 2,000 | In-distribution 정확도 |
-| test_ood_digit | 3 | {0,...,9} | 2,000 | Unseen digit(5) 일반화 |
-| test_ood_length | 4 | {0-4, 6-9} | 2,000 | 순수 length 일반화 |
-| test_ood_both | 4 | {0,...,9} | 2,000 | Digit + length 동시 OOD |
+| Split | 자릿수 | Operand 조건 | N | 테스트 대상 |
+|-------|--------|-------------|---|-----------|
+| train | 3 | 양쪽 모두 TRAIN_OPS (900개) | 10,000 | — |
+| test_id | 3 | 양쪽 모두 TRAIN_OPS | 2,000 | In-distribution 정확도 |
+| test_ood_number | 3 | ≥1개가 HELD_OUT (100개) | 2,000 | Number-level 일반화 |
+| test_ood_length | 4 | 제약 없음 (0-9999) | 2,000 | Length 일반화 |
 
-**왜 이렇게 분리하는가**: `test_ood_length`는 학습 digit({0-4,6-9})만 사용하여 순수하게 length 효과만 측정한다. Digit OOD와 length OOD를 분리하지 않으면, 어디서 실패하는지 구분할 수 없다.
+**왜 이렇게 분리하는가**: Number OOD는 학습 시 보지 못한 operand 값에 대한 일반화를 측정한다. Length OOD는 3자리에서 4자리로의 positional generalization을 측정한다. 두 축은 독립적이다.
 
 ### 실험 조건
 
@@ -130,11 +129,11 @@ Least significant digit이 먼저 나오므로, carry를 순서대로 처리할 
 
 $$\text{Acc} = \frac{1}{N}\sum_{i=1}^{N} \mathbb{1}[\hat{y}_i = y_i]$$
 
-**Digit OOD Breakdown**: `test_ood_digit`의 결과를 두 그룹으로 세분한다.
-- "no 5 in ops": operand에 5가 없는 sample들의 정확도
-- "has 5 in ops": operand에 5가 있는 sample들의 정확도
+**Number OOD Breakdown**: `test_ood_number`의 결과를 두 그룹으로 세분한다.
+- "one held-out": operand 중 정확히 하나만 HELD_OUT에 속하는 sample
+- "both held-out": 양쪽 operand 모두 HELD_OUT에 속하는 sample
 
-이 breakdown은 OOD 정확도 하락이 "held-out digit을 포함한 sample에서만 발생"하는 것인지 확인한다. 3자리 숫자 두 개(6자리)에서 모든 자릿수가 5가 아닐 확률은 $(9/10)^6 \approx 0.531$이므로, 전체 OOD accuracy가 약 53%라면 "5가 포함된 입력은 전부 실패"를 의미한다.
+HELD_OUT 100개에서 양쪽 모두 held-out인 쌍의 비율은 약 (100/1000)² = 1%이므로 대부분은 "one held-out"이다. "Both held-out"은 덧셈 행렬에서 두 row/column 모두 빈 교차점에 해당하며, LRMC에서도 가장 어려운 경우이다.
 
 **Scratchpad Decode Order Analysis** (diffusion + scratchpad에만 해당):
 
@@ -189,15 +188,13 @@ Accuracy 차이가 5% 이상이면 통계적으로 유의하다.
 
 ### 데이터 분할
 
-| Split | 깊이 | 허용 leaf digits | N | 테스트 대상 |
-|-------|------|-----------------|---|-----------|
-| train | {2, 3} | {0-4, 6-9} | 10,000 | — |
-| test_id | {2, 3} | {0-4, 6-9} | 2,000 | In-distribution |
-| test_ood_digit | {2, 3} | {0,...,9} | 2,000 | Unseen leaf digit (5) |
-| test_ood_depth | {4, 5} | {0-4, 6-9} | 2,000 | 순수 depth 일반화 |
-| test_ood_both | {4, 5} | {0,...,9} | 2,000 | Digit + depth 동시 OOD |
+| Split | 깊이 | Leaf digits | N | 테스트 대상 |
+|-------|------|------------|---|-----------|
+| train | {2, 3} | {0,...,9} | 10,000 | — |
+| test_id | {2, 3} | {0,...,9} | 2,000 | In-distribution |
+| test_ood_depth | {4, 5} | {0,...,9} | 2,000 | 순수 depth 일반화 |
 
-`test_ood_depth`는 학습 digit({0-4,6-9})만 사용하여 순수하게 depth 효과만 측정한다.
+Tree의 leaf는 단일 digit(0-9)이므로 number-level OOD가 적용되지 않는다. OOD는 depth generalization만 테스트한다.
 
 ### 실험 조건
 
@@ -208,6 +205,8 @@ Accuracy 차이가 5% 이상이면 통계적으로 유의하다.
 ### 평가 지표
 
 모듈 1과 동일한 Exact Match Accuracy를 사용한다. Scratchpad format에서는 `=>` 뒤의 최종 답(3자리)만 비교한다. Scratchpad decode order analysis도 동일하게 적용한다.
+
+Number-level OOD breakdown은 없다 (leaf가 단일 digit이므로 적용 불가).
 
 ---
 

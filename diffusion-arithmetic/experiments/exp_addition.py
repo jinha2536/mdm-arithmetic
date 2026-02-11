@@ -8,9 +8,15 @@
   Configs trained:
     {ar, diffusion} × {plain, reverse, scratchpad} × {absolute, rope}
   Test splits:
-    test_id (3d, digits 0-7)
-    test_ood_digit (3d, digits 0-9)
-    test_ood_length (4d, digits 0-9)
+    test_id          (3d, operands from TRAIN_OPS)
+    test_ood_number  (3d, ≥1 operand from HELD_OUT_OPS)
+    test_ood_length  (4d, any operands)
+
+  OOD design (matches Lee et al. 2023):
+    Number-level holdout — specific operand VALUES excluded from
+    training, not specific digits.  All 10 digits appear in training
+    (via other operands and sums).  This tests LRMC-style
+    generalisation: can the model compute a+b for unseen (a,b)?
 
   Key controls:
     - Greedy (argmax) decoding for BOTH objectives → fair comparison
@@ -41,9 +47,19 @@ N_TRAIN      = 10_000
 N_TEST       = 2_000
 MAX_ITERS    = 15_000
 PATIENCE     = 2_000
-TRAIN_DIGITS = [0, 1, 2, 3, 4, 6, 7, 8, 9]  # exclude 5 (mid-range, avoids edge bias)
-ALL_DIGITS   = list(range(10))
-HELD_OUT     = {5}
+
+# Number-level OOD: hold out 10% of 3-digit operand values (0-999).
+# All 10 digits still appear in training via other operands and in
+# answer tokens.  This mirrors Lee et al. (2023) Table 4.
+_rng_split = random.Random(0)
+_ALL_3D = list(range(1000))
+_rng_split.shuffle(_ALL_3D)
+N_HELD_OUT    = 100                          # 10% of operand space
+HELD_OUT_OPS  = frozenset(_ALL_3D[:N_HELD_OUT])
+TRAIN_OPS_3D  = sorted(set(_ALL_3D[N_HELD_OUT:]))
+ALL_OPS_3D    = sorted(_ALL_3D)
+HELD_OUT_LIST = sorted(HELD_OUT_OPS)
+
 POS_ENCS     = ['absolute', 'rope']
 FORMATS      = ['plain', 'reverse', 'scratchpad']
 
@@ -51,9 +67,6 @@ FORMATS      = ['plain', 'reverse', 'scratchpad']
 
 def _pad(n, w):
     return str(n).zfill(w)
-
-def _operand(nd, digits, rng):
-    return int(''.join(str(rng.choice(digits)) for _ in range(nd)))
 
 def _fmt_plain(a, b, nd):
     return f"{_pad(a,nd)}+{_pad(b,nd)}={_pad(a+b,nd+1)}"
@@ -73,17 +86,59 @@ def _fmt_scratchpad(a, b, nd):
 FMT_FN = {'plain': _fmt_plain, 'reverse': _fmt_reverse,
            'scratchpad': _fmt_scratchpad}
 
-def gen_addition(nd, n, digits, fmt, seed=42):
+
+def _gen_from_set(nd, n, operand_list, fmt, seed):
+    """Both operands sampled from operand_list."""
     rng = random.Random(seed)
     fn = FMT_FN[fmt]
     seen, out = set(), []
     for _ in range(n * 10):
-        if len(out) >= n: break
-        a, b = _operand(nd, digits, rng), _operand(nd, digits, rng)
-        if (a, b) in seen: continue
+        if len(out) >= n:
+            break
+        a, b = rng.choice(operand_list), rng.choice(operand_list)
+        if (a, b) in seen:
+            continue
         seen.add((a, b))
         out.append(fn(a, b, nd))
     return out
+
+
+def _gen_ood_number(nd, n, held_list, all_list, fmt, seed):
+    """At least one operand from held_list."""
+    rng = random.Random(seed)
+    fn = FMT_FN[fmt]
+    seen, out = set(), []
+    for _ in range(n * 10):
+        if len(out) >= n:
+            break
+        # guarantee at least one held-out operand
+        if rng.random() < 0.5:
+            a, b = rng.choice(held_list), rng.choice(all_list)
+        else:
+            a, b = rng.choice(all_list), rng.choice(held_list)
+        if (a, b) in seen:
+            continue
+        seen.add((a, b))
+        out.append(fn(a, b, nd))
+    return out
+
+
+def _gen_any(nd, n, fmt, seed):
+    """Operands sampled uniformly from [0, 10^nd)."""
+    rng = random.Random(seed)
+    fn = FMT_FN[fmt]
+    mx = 10 ** nd
+    seen, out = set(), []
+    for _ in range(n * 10):
+        if len(out) >= n:
+            break
+        a, b = rng.randint(0, mx - 1), rng.randint(0, mx - 1)
+        if (a, b) in seen:
+            continue
+        seen.add((a, b))
+        out.append(fn(a, b, nd))
+    return out
+
 
 def get_answer(s, fmt):
     if fmt == 'scratchpad': return s.split('>>')[-1]
@@ -92,25 +147,47 @@ def get_answer(s, fmt):
 def get_full_answer(s):
     return s.split('=', 1)[1]
 
+
 def build_splits(fmt):
     return {
-        'train':              gen_addition(3, N_TRAIN, TRAIN_DIGITS, fmt, 42),
-        'test_id':            gen_addition(3, N_TEST,  TRAIN_DIGITS, fmt, 1042),
-        'test_ood_digit':     gen_addition(3, N_TEST,  ALL_DIGITS,   fmt, 2042),
-        # Length OOD with IN-distribution digits → isolates length effect
-        'test_ood_length':    gen_addition(4, N_TEST,  TRAIN_DIGITS, fmt, 3042),
-        # Both OOD (hardest)
-        'test_ood_both':      gen_addition(4, N_TEST,  ALL_DIGITS,   fmt, 4042),
+        'train':            _gen_from_set(3, N_TRAIN,  TRAIN_OPS_3D, fmt, 42),
+        'test_id':          _gen_from_set(3, N_TEST,   TRAIN_OPS_3D, fmt, 1042),
+        'test_ood_number':  _gen_ood_number(3, N_TEST, HELD_OUT_LIST, ALL_OPS_3D, fmt, 2042),
+        'test_ood_length':  _gen_any(4, N_TEST, fmt, 3042),
     }
 
-TEST_SPLITS = ['test_id', 'test_ood_digit', 'test_ood_length', 'test_ood_both']
+TEST_SPLITS = ['test_id', 'test_ood_number', 'test_ood_length']
 
 
-def _has_ood_digit(s, held_out=HELD_OUT):
-    """Check if a sample's operands contain held-out digits."""
-    prefix = s.split('=')[0]  # e.g. "123+456"
-    return any(int(c) in held_out for c in prefix if c.isdigit())
+def _parse_operands(s):
+    """Extract (a, b) as ints from '123+456=...'."""
+    prefix = s.split('=')[0]
+    parts = prefix.split('+')
+    return int(parts[0]), int(parts[1])
 
+
+def breakdown_ood_number(test_samples, eval_result):
+    """
+    Break down test_ood_number into:
+      - one_held:  exactly one operand in HELD_OUT_OPS
+      - both_held: both operands in HELD_OUT_OPS
+    """
+    per_correct = eval_result['per_sample_correct']
+    one_ok, both_ok = [], []
+    for s, ok in zip(test_samples, per_correct):
+        a, b = _parse_operands(s)
+        a_in = a in HELD_OUT_OPS
+        b_in = b in HELD_OUT_OPS
+        if a_in and b_in:
+            both_ok.append(ok)
+        else:
+            one_ok.append(ok)
+    return {
+        'one_held':   sum(one_ok)  / max(len(one_ok), 1),
+        'both_held':  sum(both_ok) / max(len(both_ok), 1),
+        'n_one':  len(one_ok),
+        'n_both': len(both_ok),
+    }
 
 
 def build_tok(fmt):
@@ -119,32 +196,12 @@ def build_tok(fmt):
     return CharTokenizer(chars, {'mask': 'M', 'pad': 'P'})
 
 
-def breakdown_ood_digit_from_eval(test_samples, eval_result, get_ans_fn):
-    """
-    Break down OOD-digit eval into:
-      - samples where operands use only train digits (no 5)
-      - samples where operands contain held-out digit (5)
-    """
-    per_correct = eval_result['per_sample_correct']
-    id_ok, ood_ok = [], []
-    for s, ok in zip(test_samples, per_correct):
-        if _has_ood_digit(s):
-            ood_ok.append(ok)
-        else:
-            id_ok.append(ok)
-    return {
-        'no_held_out': sum(id_ok) / max(len(id_ok), 1),
-        'has_held_out': sum(ood_ok) / max(len(ood_ok), 1),
-        'n_no_held_out': len(id_ok),
-        'n_has_held_out': len(ood_ok),
-    }
-
-
 # ── Main ────────────────────────────────────────────
 
 def run():
     print("=" * 70)
     print("  EXP 1: Addition — AR vs Diffusion × Format × PosEnc")
+    print(f"  Number-level OOD: {N_HELD_OUT} operand values held out")
     print("=" * 70)
     mount_drive()
     torch.manual_seed(42)
@@ -186,16 +243,14 @@ def run():
                     all_results[key][sp] = res['exact_match']
                     print(f"    {sp}: {res['exact_match']:.4f}")
 
-                    # Breakdown for digit OOD: what fraction of errors
-                    # are due to unseen digits vs genuine failure?
-                    if sp == 'test_ood_digit':
-                        bd = breakdown_ood_digit_from_eval(
-                            splits[sp], res, get_ans)
-                        all_results[key]['digit_breakdown'] = bd
-                        print(f"      → no 5 in ops:  {bd['no_held_out']:.4f} "
-                              f"({bd['n_no_held_out']} samples)")
-                        print(f"      → has 5 in ops: {bd['has_held_out']:.4f} "
-                              f"({bd['n_has_held_out']} samples)")
+                    # Breakdown for number OOD
+                    if sp == 'test_ood_number':
+                        bd = breakdown_ood_number(splits[sp], res)
+                        all_results[key]['number_breakdown'] = bd
+                        print(f"      → one held-out:  {bd['one_held']:.4f} "
+                              f"({bd['n_one']} samples)")
+                        print(f"      → both held-out: {bd['both_held']:.4f} "
+                              f"({bd['n_both']} samples)")
 
                     # Scratchpad decode order analysis
                     if objective == 'diffusion' and fmt == 'scratchpad' \
@@ -258,11 +313,10 @@ def run():
     fig.tight_layout(); figs['convergence'] = fig
 
     # 3) Accuracy: grouped by split
-    split_order = TEST_SPLITS
-    labels = ['ID (3d, no 5)', 'OOD Digit (3d, all)',
-              'OOD Length (4d, no 5)', 'OOD Both (4d, all)']
-    fig, axes = plt.subplots(1, 4, figsize=(24, 6))
-    for idx, (sp, lb) in enumerate(zip(split_order, labels)):
+    labels = ['ID (3d, train ops)', 'OOD Number (3d, held-out ops)',
+              'OOD Length (4d)']
+    fig, axes = plt.subplots(1, 3, figsize=(20, 6))
+    for idx, (sp, lb) in enumerate(zip(TEST_SPLITS, labels)):
         ax = axes[idx]
         vals = [all_results[k].get(sp, 0) for k in configs]
         colors = ['#e74c3c' if 'ar' in k else '#3498db' for k in configs]
@@ -291,9 +345,9 @@ def run():
             ax.annotate(f"{obj}_{fmt}", (abs_val, rope_val),
                         fontsize=6, textcoords="offset points", xytext=(3, 3))
     ax.plot([0, 1], [0, 1], 'k--', alpha=0.3)
-    ax.set_xlabel('Absolute PE (4d, no 5)')
-    ax.set_ylabel('RoPE (4d, no 5)')
-    ax.set_title('Pure Length Generalisation: RoPE vs Absolute')
+    ax.set_xlabel('Absolute PE (4d)')
+    ax.set_ylabel('RoPE (4d)')
+    ax.set_title('Length Generalisation: RoPE vs Absolute')
     ax.legend(fontsize=7); ax.grid(alpha=0.3)
     ax.set_xlim(-0.05, 1.05); ax.set_ylim(-0.05, 1.05)
     fig.tight_layout(); figs['rope_vs_abs'] = fig
@@ -304,23 +358,22 @@ def run():
     print("\n" + "=" * 70)
     print("SUMMARY")
     print("=" * 70)
-    print(f"{'Config':<35} {'ID':>8} {'OOD-d':>8} {'OOD-L':>8} {'Both':>8} {'conv':>8}")
-    print("-" * 75)
+    print(f"{'Config':<35} {'ID':>8} {'OOD-Num':>8} {'OOD-Len':>8} {'conv':>8}")
+    print("-" * 70)
     for k in configs:
         r = all_results[k]
         print(f"{k:<35} {r.get('test_id',0):>8.4f} "
-              f"{r.get('test_ood_digit',0):>8.4f} "
+              f"{r.get('test_ood_number',0):>8.4f} "
               f"{r.get('test_ood_length',0):>8.4f} "
-              f"{r.get('test_ood_both',0):>8.4f} "
               f"{convergence_iters.get(k,'?'):>8}")
 
-    # Print digit breakdown
-    print("\nDigit OOD Breakdown (held-out digit: 5):")
+    # Print number OOD breakdown
+    print(f"\nNumber OOD Breakdown ({N_HELD_OUT} held-out operand values):")
     for k in configs:
-        bd = all_results[k].get('digit_breakdown')
+        bd = all_results[k].get('number_breakdown')
         if bd:
-            print(f"  {k}: no_5={bd['no_held_out']:.4f} ({bd['n_no_held_out']}), "
-                  f"has_5={bd['has_held_out']:.4f} ({bd['n_has_held_out']})")
+            print(f"  {k}: one_held={bd['one_held']:.4f} ({bd['n_one']}), "
+                  f"both_held={bd['both_held']:.4f} ({bd['n_both']})")
 
     if scratchpad_analysis:
         print("\nScratchpad Decode Order (diffusion):")
