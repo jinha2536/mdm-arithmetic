@@ -49,18 +49,20 @@ EXP_NAME = 'exp_toy_distribution'
 
 # ── Config ──────────────────────────────────────────
 V = 4            # vocab {0,1,2,3}
-L = 8            # length → V^L = 65536
+L = 8            # length → V^L = 65,536 possible sequences
 MASK_ID = V      # = 4
 TOTAL_V = V + 1  # = 5
 
 N_TRAIN   = 200_000
-N_SAMPLES = 50_000    # per policy for eval
+N_SAMPLES = 500_000   # per policy — need >> V^L for reliable TV/KL
+                       # TV noise ≈ sqrt(V^L / 2πN) ≈ 0.14 at 500K
+BOOTSTRAP_K = 20       # bootstrap resamples for CI
 MAX_EPOCHS = 60
-PATIENCE_EPOCHS = 8   # stop if no improvement for this many epochs
-BATCH_SIZE = 512
+PATIENCE_EPOCHS = 8
+BATCH_SIZE = 1024      # larger batch for faster generation
 LR = 3e-4
 
-D_MODEL = 128; N_HEADS = 4; N_LAYERS = 4
+D_MODEL = 192; N_HEADS = 4; N_LAYERS = 4
 
 # ── Distributions ───────────────────────────────────
 
@@ -89,13 +91,77 @@ class ToyDistribution:
         _, p = self.full_distribution()
         return -(p * (p + 1e-30).log()).sum().item() / np.log(2)
 
+    def optimal_masked_loss(self, n_eval=50_000):
+        """
+        Compute the theoretically optimal cross-entropy for a perfect
+        masked predictor. This is the Bayes-optimal loss — no model of
+        any size can beat this.
+
+        For each (x, mask_config), the optimal predictor outputs
+        p(x_i | x_{unmasked}) for each masked position i.
+        We Monte-Carlo estimate this over random x and random masks.
+        """
+        all_seqs, p_true = self.full_distribution()
+        samples = self.sample(n_eval)
+        total_loss, total_tokens = 0.0, 0
+
+        # For tractability, compute exact conditionals
+        # p(x_i=v | x_unmasked) = sum_{x': x'_unmasked=x_unmasked, x'_i=v} p(x')
+        #                        / sum_{x': x'_unmasked=x_unmasked} p(x')
+        # This is expensive for large V^L, so we use a sampling approach:
+        # sample mask configs, then for each, compute the conditional.
+
+        # Faster approach: for random mask ratios, estimate expected CE
+        rng = np.random.RandomState(0)
+        for trial in range(min(2000, n_eval)):
+            x = samples[trial]
+            t = rng.uniform(0.1, 0.9)
+            mask = torch.bernoulli(torch.full((L,), t)).bool()
+            if not mask.any():
+                mask[rng.randint(L)] = True
+
+            unmasked_vals = x.clone()
+            unmasked_vals[mask] = -1  # sentinel
+
+            # Find all sequences matching unmasked positions
+            match = torch.ones(len(all_seqs), dtype=torch.bool)
+            for pos in range(L):
+                if not mask[pos]:
+                    match = match & (all_seqs[:, pos] == x[pos])
+
+            if match.sum() == 0:
+                continue
+
+            cond_probs = p_true[match]
+            cond_probs = cond_probs / cond_probs.sum()
+            matching = all_seqs[match]
+
+            for pos in mask.nonzero(as_tuple=True)[0]:
+                true_val = x[pos].item()
+                # p(x_pos = true_val | context)
+                p_cond = cond_probs[matching[:, pos] == true_val].sum().item()
+                if p_cond > 1e-10:
+                    total_loss -= np.log(p_cond)
+                else:
+                    total_loss += 20  # cap
+                total_tokens += 1
+
+        return total_loss / max(total_tokens, 1)
+
 
 class NearIndependent(ToyDistribution):
-    def __init__(self, alpha=3.0, seed=42):
+    """
+    p(x) = prod p_i(x_i). Position-wise bias, no dependency.
+    alpha controls peakedness: lower → more peaked marginals.
+      alpha=3.0: near-uniform (H ≈ 1.9 bits/pos → cond_acc ~0.39)
+      alpha=0.5: sparse/peaked (H ≈ 1.0 bits/pos → cond_acc ~0.65)
+    """
+    def __init__(self, alpha=0.5, seed=42):
         super().__init__()
         rng = np.random.RandomState(seed)
         self.pos_log_probs = torch.tensor(
-            np.log(rng.dirichlet([alpha] * V, size=L)), dtype=torch.float32)
+            np.log(rng.dirichlet([alpha] * V, size=L) + 1e-30),
+            dtype=torch.float32)
 
     def log_prob(self, x):
         x = x.reshape(-1, L)
@@ -103,14 +169,18 @@ class NearIndependent(ToyDistribution):
 
 
 class MarkovChain(ToyDistribution):
-    def __init__(self, order=2, sparsity=0.3, seed=42):
+    """
+    2nd-order Markov chain with peaked transition matrices.
+    sparsity controls how peaked: lower → more deterministic transitions.
+    """
+    def __init__(self, order=2, sparsity=0.1, seed=42):
         super().__init__()
         self.k = order
         rng = np.random.RandomState(seed)
         self.trans = {}
         for ctx in iter_product(range(V), repeat=order):
             alpha = rng.uniform(sparsity * 0.5, sparsity, size=V)
-            alpha[rng.randint(V)] += 2.0
+            alpha[rng.randint(V)] += 3.0  # stronger peak
             self.trans[ctx] = torch.tensor(rng.dirichlet(alpha),
                                            dtype=torch.float32)
         self.init_lp = np.log(1.0 / (V ** order))
@@ -126,12 +196,16 @@ class MarkovChain(ToyDistribution):
 
 
 class GlobalSumConstraint(ToyDistribution):
-    def __init__(self, beta=0.3, alpha=3.0, seed=42):
+    """
+    p(x) ∝ exp(-β|Σx_i - τ|²) × ∏ p_i(x_i).
+    beta controls coupling strength: higher → stronger global dependency.
+    """
+    def __init__(self, beta=2.0, alpha=0.5, seed=42):
         super().__init__()
         self.beta, self.target = beta, (V-1)*L/2.0
         rng = np.random.RandomState(seed)
         self.base_lp = torch.tensor(
-            np.log(rng.dirichlet([alpha]*V, size=L)), dtype=torch.float32)
+            np.log(rng.dirichlet([alpha]*V, size=L) + 1e-30), dtype=torch.float32)
 
     def log_prob(self, x):
         x = x.reshape(-1, L)
@@ -141,7 +215,8 @@ class GlobalSumConstraint(ToyDistribution):
 
 
 class MarkovPlusGlobal(ToyDistribution):
-    def __init__(self, beta=0.2, order=2, sparsity=0.3, seed=42):
+    """Markov local + global sum constraint. Both strong."""
+    def __init__(self, beta=1.5, order=2, sparsity=0.1, seed=42):
         super().__init__()
         self.markov = MarkovChain(order, sparsity, seed)
         self.beta, self.target = beta, (V-1)*L/2.0
@@ -316,38 +391,79 @@ def decode_parallel(model, n, k, policy='parallel_random'):
 # ── Metrics ─────────────────────────────────────────
 
 def compute_metrics(samples, scores, dist):
+    """
+    Compute TV, KL, mode coverage, path score correlation.
+    Includes bootstrap confidence intervals and ideal baseline TV.
+    """
     all_seqs, p_true = dist.full_distribution()
+    K = len(all_seqs)
     n = len(samples)
+
+    # Build empirical distribution
     counts = defaultdict(int)
     for s in samples:
         counts[tuple(s.tolist())] += 1
 
-    # TV
-    tv = sum(abs(p_true[i].item() -
-                 counts.get(tuple(all_seqs[i].tolist()), 0) / n)
-             for i in range(len(all_seqs))) / 2
+    q_emp = np.zeros(K)
+    for i in range(K):
+        q_emp[i] = counts.get(tuple(all_seqs[i].tolist()), 0) / n
+    p_np = p_true.numpy()
 
-    # KL(p || q)
-    kl = 0
-    for i in range(len(all_seqs)):
-        p = p_true[i].item()
-        if p < 1e-10: continue
-        q = counts.get(tuple(all_seqs[i].tolist()), 0) / n
-        kl += p * np.log(p / max(q, 1e-10))
+    # Point estimates
+    tv = np.sum(np.abs(p_np - q_emp)) / 2
+    kl = np.sum(p_np * np.log(p_np / np.maximum(q_emp, 1e-10) + 1e-30)
+                * (p_np > 1e-10))
 
-    # Mode coverage (top 100)
-    top_idx = p_true.topk(min(100, len(p_true))).indices
-    coverage = sum(1 for i in top_idx
-                   if tuple(all_seqs[i].tolist()) in counts) / len(top_idx)
+    # Mode coverage (top 100 modes)
+    top_idx = p_true.topk(min(100, K)).indices.numpy()
+    coverage = np.mean([q_emp[i] > 0 for i in top_idx])
 
     # Path score correlation
-    true_lp = dist.log_prob(samples)
-    valid = np.isfinite(scores.numpy()) & np.isfinite(true_lp.numpy())
-    sr = spearmanr(scores.numpy()[valid],
-                   true_lp.numpy()[valid])[0] if valid.sum() > 10 else 0
+    true_lp = dist.log_prob(samples).numpy()
+    scores_np = scores.numpy()
+    valid = np.isfinite(scores_np) & np.isfinite(true_lp)
+    sr = spearmanr(scores_np[valid], true_lp[valid])[0] if valid.sum() > 10 else 0
 
-    return {'tv': tv, 'kl': kl, 'mode_coverage': coverage,
-            'spearman_r': sr, 'mean_true_lp': true_lp.mean().item()}
+    # ── Bootstrap CI for TV ──
+    tv_boots = []
+    for _ in range(BOOTSTRAP_K):
+        idx = np.random.choice(n, size=n, replace=True)
+        boot_counts = defaultdict(int)
+        for i in idx:
+            boot_counts[tuple(samples[i].tolist())] += 1
+        q_boot = np.zeros(K)
+        for i in range(K):
+            q_boot[i] = boot_counts.get(tuple(all_seqs[i].tolist()), 0) / n
+        tv_boots.append(np.sum(np.abs(p_np - q_boot)) / 2)
+    tv_boots = np.array(tv_boots)
+
+    # ── Ideal baseline: TV from sampling p_true directly ──
+    # (This is the irreducible estimation noise)
+    ideal_tvs = []
+    for _ in range(5):
+        ideal_samples = dist.sample(n)
+        ideal_counts = defaultdict(int)
+        for s in ideal_samples:
+            ideal_counts[tuple(s.tolist())] += 1
+        q_ideal = np.zeros(K)
+        for i in range(K):
+            q_ideal[i] = ideal_counts.get(tuple(all_seqs[i].tolist()), 0) / n
+        ideal_tvs.append(np.sum(np.abs(p_np - q_ideal)) / 2)
+    baseline_tv = np.mean(ideal_tvs)
+
+    return {
+        'tv': float(tv),
+        'tv_ci_lo': float(np.percentile(tv_boots, 2.5)),
+        'tv_ci_hi': float(np.percentile(tv_boots, 97.5)),
+        'tv_baseline': float(baseline_tv),  # irreducible noise
+        'tv_excess': float(tv - baseline_tv),  # policy-induced error
+        'kl': float(kl),
+        'mode_coverage': float(coverage),
+        'spearman_r': float(sr),
+        'mean_true_lp': float(true_lp.mean()),
+        'n_unique': int(len(counts)),
+        'support_coverage': float(len(counts) / K),
+    }
 
 
 # ── Mutual information matrix ──────────────────────
@@ -385,13 +501,27 @@ def run():
     torch.manual_seed(42); np.random.seed(42)
 
     distributions = {
-        'A_Independent':   NearIndependent(alpha=3.0, seed=42),
-        'B_Markov2':       MarkovChain(order=2, sparsity=0.3, seed=42),
-        'C_GlobalSum':     GlobalSumConstraint(beta=0.3, alpha=3.0, seed=42),
-        'D_Markov+Global': MarkovPlusGlobal(beta=0.2, order=2, sparsity=0.3, seed=42),
+        'A_Independent':   NearIndependent(alpha=0.5, seed=42),
+        'B_Markov2':       MarkovChain(order=2, sparsity=0.1, seed=42),
+        'C_GlobalSum':     GlobalSumConstraint(beta=2.0, alpha=0.5, seed=42),
+        'D_Markov+Global': MarkovPlusGlobal(beta=1.5, order=2, sparsity=0.1, seed=42),
     }
     for name, dist in distributions.items():
         print(f"  {name}: H={dist.entropy():.2f} bits")
+
+    print(f"\n  Sampling stats: V^L={V**L:,}, N_SAMPLES={N_SAMPLES:,}, "
+          f"ratio={N_SAMPLES/V**L:.1f}x")
+    print(f"  Expected TV noise ≈ {np.sqrt(V**L / (2*np.pi*N_SAMPLES)):.4f}")
+    print(f"  Bootstrap resamples: {BOOTSTRAP_K}")
+
+    # Compute theoretical optimal loss for each distribution
+    print("\n  Computing Bayes-optimal masked loss (may take ~1min)...")
+    for name, dist in distributions.items():
+        opt_loss = dist.optimal_masked_loss(n_eval=2000)
+        uniform_loss = np.log(V)
+        print(f"    {name}: optimal_CE={opt_loss:.4f}, "
+              f"uniform_CE={uniform_loss:.4f}, "
+              f"gap={uniform_loss - opt_loss:.4f}")
 
     # MI matrices
     fig_mi, axes = plt.subplots(1, 4, figsize=(20, 4))
@@ -435,8 +565,10 @@ def run():
             m = compute_metrics(samples, scores, dist)
             m['nfe'] = L
             all_results[dist_name][pol] = m
-            print(f"    {pol:<20} TV={m['tv']:.4f} KL={m['kl']:.4f} "
-                  f"cov={m['mode_coverage']:.3f} ({time.time()-t0:.1f}s)")
+            print(f"    {pol:<20} TV={m['tv']:.4f} "
+                  f"[{m['tv_ci_lo']:.4f},{m['tv_ci_hi']:.4f}] "
+                  f"excess={m['tv_excess']:+.4f} "
+                  f"cov={m['support_coverage']:.2%} ({time.time()-t0:.1f}s)")
 
         for pol, k in par_configs:
             key = f"{pol}_k{k}"
@@ -450,8 +582,9 @@ def run():
             m = compute_metrics(samples, scores, dist)
             m['nfe'] = total_steps / max(1, N_SAMPLES // BATCH_SIZE)
             all_results[dist_name][key] = m
-            print(f"    {key:<20} TV={m['tv']:.4f} NFE={m['nfe']:.1f} "
-                  f"({time.time()-t0:.1f}s)")
+            print(f"    {key:<20} TV={m['tv']:.4f} "
+                  f"excess={m['tv_excess']:+.4f} "
+                  f"NFE={m['nfe']:.1f} ({time.time()-t0:.1f}s)")
 
     # ── Visualisation ──
     figs = {'mi_matrices': fig_mi}
@@ -466,30 +599,66 @@ def run():
     for ax in axes: ax.legend(fontsize=7); ax.grid(alpha=0.3)
     fig.tight_layout(); figs['training_curves'] = fig
 
-    # TV heatmap
     dist_names = list(distributions.keys())
     pol_names = seq_policies + [f"{p}_k{k}" for p, k in par_configs]
 
-    fig, ax = plt.subplots(figsize=(12, 7))
-    data = np.full((len(pol_names), len(dist_names)), np.nan)
+    # Print baseline TVs (irreducible noise)
+    print("\n  Baseline TV (from sampling p_true directly):")
+    for dn in dist_names:
+        first_pol = seq_policies[0]
+        bl = all_results[dn][first_pol]['tv_baseline']
+        print(f"    {dn}: {bl:.4f}")
+
+    # TV excess heatmap (raw TV minus baseline — shows actual policy error)
+    fig, axes = plt.subplots(1, 2, figsize=(22, 7))
+
+    # Left: raw TV
+    data_raw = np.full((len(pol_names), len(dist_names)), np.nan)
     for j, d in enumerate(dist_names):
         for i, p in enumerate(pol_names):
             if p in all_results.get(d, {}):
-                data[i, j] = all_results[d][p]['tv']
-    im = ax.imshow(data, cmap='RdYlGn_r', aspect='auto')
+                data_raw[i, j] = all_results[d][p]['tv']
+    ax = axes[0]
+    im = ax.imshow(data_raw, cmap='RdYlGn_r', aspect='auto')
     ax.set_xticks(range(len(dist_names)))
-    ax.set_xticklabels(dist_names, fontsize=8, rotation=20)
+    ax.set_xticklabels(dist_names, fontsize=7, rotation=20)
     ax.set_yticks(range(len(pol_names)))
     ax.set_yticklabels(pol_names, fontsize=8)
-    for i in range(data.shape[0]):
-        for j in range(data.shape[1]):
-            if not np.isnan(data[i, j]):
-                ax.text(j, i, f"{data[i,j]:.3f}", ha='center', va='center',
-                        fontsize=7,
-                        color='white' if data[i,j] > np.nanmedian(data) else 'black')
+    for i in range(data_raw.shape[0]):
+        for j in range(data_raw.shape[1]):
+            if not np.isnan(data_raw[i, j]):
+                ax.text(j, i, f"{data_raw[i,j]:.3f}", ha='center',
+                        va='center', fontsize=6,
+                        color='white' if data_raw[i,j] > np.nanmedian(data_raw)
+                        else 'black')
     ax.axhline(y=len(seq_policies)-0.5, color='blue', lw=2, ls='--')
     plt.colorbar(im, ax=ax, shrink=0.8)
-    ax.set_title('TV Distance by Policy × Distribution (↓ better)', fontsize=12)
+    ax.set_title('Raw TV Distance (includes estimation noise)', fontsize=10)
+
+    # Right: excess TV (= TV - baseline)
+    data_excess = np.full((len(pol_names), len(dist_names)), np.nan)
+    for j, d in enumerate(dist_names):
+        for i, p in enumerate(pol_names):
+            if p in all_results.get(d, {}):
+                data_excess[i, j] = all_results[d][p]['tv_excess']
+    ax = axes[1]
+    vmax = max(0.01, np.nanmax(np.abs(data_excess)))
+    im = ax.imshow(data_excess, cmap='RdYlGn_r', aspect='auto',
+                   vmin=-vmax*0.1, vmax=vmax)
+    ax.set_xticks(range(len(dist_names)))
+    ax.set_xticklabels(dist_names, fontsize=7, rotation=20)
+    ax.set_yticks(range(len(pol_names)))
+    ax.set_yticklabels(pol_names, fontsize=8)
+    for i in range(data_excess.shape[0]):
+        for j in range(data_excess.shape[1]):
+            if not np.isnan(data_excess[i, j]):
+                ax.text(j, i, f"{data_excess[i,j]:+.3f}", ha='center',
+                        va='center', fontsize=6,
+                        color='white' if data_excess[i,j] > np.nanmedian(
+                            data_excess[~np.isnan(data_excess)]) else 'black')
+    ax.axhline(y=len(seq_policies)-0.5, color='blue', lw=2, ls='--')
+    plt.colorbar(im, ax=ax, shrink=0.8)
+    ax.set_title('Excess TV (policy error above baseline ↓ better)', fontsize=10)
     fig.tight_layout(); figs['tv_heatmap'] = fig
 
     # Spearman correlation heatmap
@@ -554,15 +723,21 @@ def run():
 
     # Summary
     print("\n" + "=" * 70)
-    print("SUMMARY: Best Sequential Policy per Distribution (by TV)")
+    print("SUMMARY: Best Sequential Policy per Distribution")
+    print(f"  (N_SAMPLES={N_SAMPLES:,}, V^L={V**L:,}, "
+          f"bootstrap_k={BOOTSTRAP_K})")
     print("=" * 70)
     for dn in dist_names:
-        seq = {p: all_results[dn].get(p, {}).get('tv', 99)
+        bl = all_results[dn][seq_policies[0]]['tv_baseline']
+        seq = {p: all_results[dn].get(p, {}).get('tv_excess', 99)
                for p in seq_policies}
         best = min(seq, key=seq.get)
         worst = max(seq, key=seq.get)
-        print(f"  {dn}: best={best} (TV={seq[best]:.4f}), "
-              f"worst={worst} (TV={seq[worst]:.4f})")
+        print(f"  {dn}:")
+        print(f"    baseline TV = {bl:.4f} (irreducible estimation noise)")
+        print(f"    best  = {best:<15} excess TV = {seq[best]:+.4f}")
+        print(f"    worst = {worst:<15} excess TV = {seq[worst]:+.4f}")
+        print(f"    gap   = {seq[worst]-seq[best]:.4f}")
 
     plt.show()
     return all_results

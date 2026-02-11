@@ -126,8 +126,13 @@ def build_splits(fmt):
         'train':          gen_tree_data(DEPTH_TRAIN, N_TRAIN, LEAVES_TRAIN, fmt, 42),
         'test_id':        gen_tree_data(DEPTH_TRAIN, N_TEST,  LEAVES_TRAIN, fmt, 1042),
         'test_ood_digit': gen_tree_data(DEPTH_TRAIN, N_TEST,  LEAVES_TEST,  fmt, 2042),
-        'test_ood_depth': gen_tree_data(DEPTH_OOD,   N_TEST,  LEAVES_TEST,  fmt, 3042),
+        # Depth OOD with IN-distribution digits → isolates depth effect
+        'test_ood_depth': gen_tree_data(DEPTH_OOD,   N_TEST,  LEAVES_TRAIN, fmt, 3042),
+        # Both OOD (hardest)
+        'test_ood_both':  gen_tree_data(DEPTH_OOD,   N_TEST,  LEAVES_TEST,  fmt, 4042),
     }
+
+TEST_SPLITS = ['test_id', 'test_ood_digit', 'test_ood_depth', 'test_ood_both']
 
 def build_tok(fmt):
     chars = list('0123456789()+*=')
@@ -173,7 +178,7 @@ def run():
                 get_ans = lambda s, f=fmt: get_tree_answer(s, f)
                 all_results[key] = {}
 
-                for sp in ['test_id', 'test_ood_digit', 'test_ood_depth']:
+                for sp in TEST_SPLITS:
                     res = evaluate(
                         model, tok, splits[sp], objective, get_ans,
                         get_tree_full, policy='confidence', greedy=True,
@@ -224,9 +229,9 @@ def run():
     fig.tight_layout(); figs['training_curves'] = fig
 
     # Accuracy
-    split_order = ['test_id', 'test_ood_digit', 'test_ood_depth']
-    labels = ['ID (d2-3)', 'OOD Digit', 'OOD Depth (d4-5)']
-    fig, axes = plt.subplots(1, 3, figsize=(20, 6))
+    split_order = TEST_SPLITS
+    labels = ['ID (d2-3)', 'OOD Digit', 'OOD Depth (d4-5, 0-7)', 'OOD Both']
+    fig, axes = plt.subplots(1, 4, figsize=(24, 6))
     for idx, (sp, lb) in enumerate(zip(split_order, labels)):
         ax = axes[idx]
         vals = [all_results[k].get(sp, 0) for k in configs]
@@ -267,13 +272,14 @@ def run():
     print("\n" + "=" * 70)
     print("SUMMARY")
     print("=" * 70)
-    print(f"{'Config':<35} {'ID':>8} {'OOD-d':>8} {'OOD-D':>8} {'conv':>8}")
-    print("-" * 67)
+    print(f"{'Config':<35} {'ID':>8} {'OOD-d':>8} {'OOD-D':>8} {'Both':>8} {'conv':>8}")
+    print("-" * 75)
     for k in configs:
         r = all_results[k]
         print(f"{k:<35} {r.get('test_id',0):>8.4f} "
               f"{r.get('test_ood_digit',0):>8.4f} "
               f"{r.get('test_ood_depth',0):>8.4f} "
+              f"{r.get('test_ood_both',0):>8.4f} "
               f"{convergence_iters.get(k,'?'):>8}")
 
     if scratchpad_analysis:

@@ -405,6 +405,7 @@ def evaluate(model, tokenizer, test_samples, objective,
     correct, total = 0, 0
     examples = []
     all_orders = []
+    per_sample = []
 
     for start in range(0, len(test_samples), batch_size):
         batch = test_samples[start:start + batch_size]
@@ -451,6 +452,7 @@ def evaluate(model, tokenizer, test_samples, objective,
             ok = pred_final == gold_final[i]
             correct += int(ok)
             total += 1
+            per_sample.append(ok)
             if len(examples) < 10:
                 examples.append({
                     'prefix': prefixes[i], 'pred': pred_final,
@@ -460,6 +462,7 @@ def evaluate(model, tokenizer, test_samples, objective,
         'exact_match': correct / max(total, 1),
         'n_correct': correct, 'n_total': total,
         'examples': examples,
+        'per_sample_correct': per_sample,
     }
     if all_orders:
         result['decode_orders'] = torch.cat(all_orders, dim=0)

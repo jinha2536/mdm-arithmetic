@@ -93,16 +93,50 @@ def get_full_answer(s):
 
 def build_splits(fmt):
     return {
-        'train':           gen_addition(3, N_TRAIN, TRAIN_DIGITS, fmt, 42),
-        'test_id':         gen_addition(3, N_TEST,  TRAIN_DIGITS, fmt, 1042),
-        'test_ood_digit':  gen_addition(3, N_TEST,  ALL_DIGITS,   fmt, 2042),
-        'test_ood_length': gen_addition(4, N_TEST,  ALL_DIGITS,   fmt, 3042),
+        'train':              gen_addition(3, N_TRAIN, TRAIN_DIGITS, fmt, 42),
+        'test_id':            gen_addition(3, N_TEST,  TRAIN_DIGITS, fmt, 1042),
+        'test_ood_digit':     gen_addition(3, N_TEST,  ALL_DIGITS,   fmt, 2042),
+        # Length OOD with IN-distribution digits → isolates length effect
+        'test_ood_length':    gen_addition(4, N_TEST,  TRAIN_DIGITS, fmt, 3042),
+        # Both OOD (hardest)
+        'test_ood_both':      gen_addition(4, N_TEST,  ALL_DIGITS,   fmt, 4042),
     }
+
+TEST_SPLITS = ['test_id', 'test_ood_digit', 'test_ood_length', 'test_ood_both']
+
+
+def _has_ood_digit(s, train_digits=TRAIN_DIGITS):
+    """Check if a sample's operands contain out-of-distribution digits."""
+    prefix = s.split('=')[0]  # e.g. "123+456"
+    return any(int(c) not in train_digits for c in prefix if c.isdigit())
+
+
 
 def build_tok(fmt):
     chars = list('0123456789+=')
     if fmt == 'scratchpad': chars.extend(['C', 'S', '>'])
     return CharTokenizer(chars, {'mask': 'M', 'pad': 'P'})
+
+
+def breakdown_ood_digit_from_eval(test_samples, eval_result, get_ans_fn):
+    """
+    Break down OOD-digit eval into:
+      - samples where operands use only train digits (0-7)
+      - samples where operands contain OOD digits (8, 9)
+    """
+    per_correct = eval_result['per_sample_correct']
+    id_ok, ood_ok = [], []
+    for s, ok in zip(test_samples, per_correct):
+        if _has_ood_digit(s):
+            ood_ok.append(ok)
+        else:
+            id_ok.append(ok)
+    return {
+        'all_digit_id': sum(id_ok) / max(len(id_ok), 1),
+        'has_ood_digit': sum(ood_ok) / max(len(ood_ok), 1),
+        'n_id': len(id_ok),
+        'n_ood': len(ood_ok),
+    }
 
 
 # ── Main ────────────────────────────────────────────
@@ -143,7 +177,7 @@ def run():
                 get_ans = lambda s, f=fmt: get_answer(s, f)
                 all_results[key] = {}
 
-                for sp in ['test_id', 'test_ood_digit', 'test_ood_length']:
+                for sp in TEST_SPLITS:
                     res = evaluate(
                         model, tok, splits[sp], objective, get_ans,
                         get_full_answer, policy='confidence', greedy=True,
@@ -151,7 +185,18 @@ def run():
                     all_results[key][sp] = res['exact_match']
                     print(f"    {sp}: {res['exact_match']:.4f}")
 
-                    # scratchpad decode order analysis
+                    # Breakdown for digit OOD: what fraction of errors
+                    # are due to unseen digits vs genuine failure?
+                    if sp == 'test_ood_digit':
+                        bd = breakdown_ood_digit_from_eval(
+                            splits[sp], res, get_ans)
+                        all_results[key]['digit_breakdown'] = bd
+                        print(f"      → digits 0-7 only: {bd['all_digit_id']:.4f} "
+                              f"({bd['n_id']} samples)")
+                        print(f"      → has 8/9:         {bd['has_ood_digit']:.4f} "
+                              f"({bd['n_ood']} samples)")
+
+                    # Scratchpad decode order analysis
                     if objective == 'diffusion' and fmt == 'scratchpad' \
                             and sp == 'test_id' and 'decode_orders' in res:
                         ex = splits[sp][0]
@@ -162,8 +207,15 @@ def run():
                         sa = analyse_decode_order(
                             res['decode_orders'], ans_start_pos, sp_end, total)
                         scratchpad_analysis[key] = sa
-                        print(f"    scratchpad_first_ratio: "
+                        print(f"      scratchpad_first_ratio: "
                               f"{sa.get('scratchpad_first_ratio', 'N/A')}")
+
+                # Print diagnostic examples for first format
+                if fmt == FORMATS[0] and pos_enc == POS_ENCS[0]:
+                    print(f"    --- Diagnostic (first 3 test_id) ---")
+                    for i in range(min(3, len(splits['test_id']))):
+                        s = splits['test_id'][i]
+                        print(f"      {s}")
 
                 save_results(EXP_NAME, all_results, model=model, tag=key)
 
@@ -205,9 +257,10 @@ def run():
     fig.tight_layout(); figs['convergence'] = fig
 
     # 3) Accuracy: grouped by split
-    split_order = ['test_id', 'test_ood_digit', 'test_ood_length']
-    labels = ['ID (3d, 0-7)', 'OOD Digit (3d, 0-9)', 'OOD Length (4d)']
-    fig, axes = plt.subplots(1, 3, figsize=(20, 6))
+    split_order = TEST_SPLITS
+    labels = ['ID (3d, 0-7)', 'OOD Digit (3d, 0-9)',
+              'OOD Length (4d, 0-7)', 'OOD Both (4d, 0-9)']
+    fig, axes = plt.subplots(1, 4, figsize=(24, 6))
     for idx, (sp, lb) in enumerate(zip(split_order, labels)):
         ax = axes[idx]
         vals = [all_results[k].get(sp, 0) for k in configs]
@@ -237,9 +290,9 @@ def run():
             ax.annotate(f"{obj}_{fmt}", (abs_val, rope_val),
                         fontsize=6, textcoords="offset points", xytext=(3, 3))
     ax.plot([0, 1], [0, 1], 'k--', alpha=0.3)
-    ax.set_xlabel('Absolute PE (length OOD)')
-    ax.set_ylabel('RoPE (length OOD)')
-    ax.set_title('Length Generalisation: RoPE vs Absolute')
+    ax.set_xlabel('Absolute PE (4d, digits 0-7)')
+    ax.set_ylabel('RoPE (4d, digits 0-7)')
+    ax.set_title('Pure Length Generalisation: RoPE vs Absolute')
     ax.legend(fontsize=7); ax.grid(alpha=0.3)
     ax.set_xlim(-0.05, 1.05); ax.set_ylim(-0.05, 1.05)
     fig.tight_layout(); figs['rope_vs_abs'] = fig
@@ -250,14 +303,23 @@ def run():
     print("\n" + "=" * 70)
     print("SUMMARY")
     print("=" * 70)
-    print(f"{'Config':<35} {'ID':>8} {'OOD-d':>8} {'OOD-L':>8} {'conv_it':>8}")
-    print("-" * 67)
+    print(f"{'Config':<35} {'ID':>8} {'OOD-d':>8} {'OOD-L':>8} {'Both':>8} {'conv':>8}")
+    print("-" * 75)
     for k in configs:
         r = all_results[k]
         print(f"{k:<35} {r.get('test_id',0):>8.4f} "
               f"{r.get('test_ood_digit',0):>8.4f} "
               f"{r.get('test_ood_length',0):>8.4f} "
+              f"{r.get('test_ood_both',0):>8.4f} "
               f"{convergence_iters.get(k,'?'):>8}")
+
+    # Print digit breakdown
+    print("\nDigit OOD Breakdown:")
+    for k in configs:
+        bd = all_results[k].get('digit_breakdown')
+        if bd:
+            print(f"  {k}: digits_0-7={bd['all_digit_id']:.4f} ({bd['n_id']}), "
+                  f"has_8/9={bd['has_ood_digit']:.4f} ({bd['n_ood']})")
 
     if scratchpad_analysis:
         print("\nScratchpad Decode Order (diffusion):")
