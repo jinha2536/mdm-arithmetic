@@ -5,7 +5,7 @@
 
   Colab:  %run experiments/exp_addition.py
 
-  Multi-digit scaling: 3d, 5d, 7d to find difficulty frontier.
+  Multi-digit scaling: 3d, 5d to find difficulty frontier.
   Number-level OOD at 3d (paper comparison).
   Length OOD at each scale.
 
@@ -144,7 +144,7 @@ def build_splits_3d(fmt, n_train, n_test):
 
 
 def build_splits_nd(nd, fmt, n_train, n_test):
-    """nd with ID + length OOD only (for 5d, 7d)."""
+    """nd with ID + length OOD only (for 5d)."""
     return {
         'train':            _gen_any(nd,   n_train, fmt, 42),
         'test_id':          _gen_any(nd,   n_test,  fmt, 1042),
