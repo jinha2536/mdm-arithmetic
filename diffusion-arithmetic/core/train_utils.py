@@ -389,6 +389,10 @@ def evaluate(model, tokenizer, test_samples, objective,
     """
     Exact match evaluation.
 
+    Handles variable-length answers by grouping samples with the same
+    answer token length before batching. This is needed for tree
+    experiments where different depths produce different output lengths.
+
     Args:
         get_answer_fn: sample_str → final answer string
         get_full_answer_fn: sample_str → full string after '='
@@ -404,59 +408,67 @@ def evaluate(model, tokenizer, test_samples, objective,
     model.eval()
     correct, total = 0, 0
     examples = []
-    all_orders = []
+    all_orders = {}  # keyed by ans_len for safe concat
     per_sample = []
 
-    for start in range(0, len(test_samples), batch_size):
-        batch = test_samples[start:start + batch_size]
-        B = len(batch)
+    # Group samples by answer token length
+    groups = {}  # ans_len → list of (idx, sample)
+    for idx, s in enumerate(test_samples):
+        full = get_full_answer_fn(s)
+        al = len(tokenizer.encode(full))
+        groups.setdefault(al, []).append((idx, s))
 
-        prefixes = [s.split('=')[0] + '=' for s in batch]
-        gold_full = [get_full_answer_fn(s) for s in batch]
-        gold_final = [get_answer_fn(s) for s in batch]
+    for ans_len, items in groups.items():
+        samples_in_group = [s for _, s in items]
 
-        penc = [tokenizer.encode(p) for p in prefixes]
-        pmax = max(len(p) for p in penc)
-        pids = torch.full((B, pmax), tokenizer.special_ids['pad'], dtype=torch.long)
-        for i, e in enumerate(penc):
-            pids[i, :len(e)] = torch.tensor(e)
+        for start in range(0, len(samples_in_group), batch_size):
+            batch = samples_in_group[start:start + batch_size]
+            B = len(batch)
 
-        ans_len = len(tokenizer.encode(gold_full[0]))
+            prefixes = [s.split('=')[0] + '=' for s in batch]
+            gold_full = [get_full_answer_fn(s) for s in batch]
+            gold_final = [get_answer_fn(s) for s in batch]
 
-        if objective == 'ar':
-            gen = generate_ar(model, pids, ans_len, device)
-            pred_ids = gen[:, pmax:pmax + ans_len]
-            batch_orders = None
-        else:
-            gen, _, info = generate_diffusion(
-                model, pids, ans_len, mask_id,
-                policy=policy, greedy=greedy,
-                parallel_k=parallel_k, device=device)
-            pred_ids = gen[:, pmax:pmax + ans_len]
-            batch_orders = info.get('orders')  # (B, ans_len) or None
+            penc = [tokenizer.encode(p) for p in prefixes]
+            pmax = max(len(p) for p in penc)
+            pids = torch.full((B, pmax), tokenizer.special_ids['pad'],
+                              dtype=torch.long)
+            for i, e in enumerate(penc):
+                pids[i, :len(e)] = torch.tensor(e)
 
-        if batch_orders is not None:
-            all_orders.append(batch_orders)
-
-        for i in range(B):
-            pred_str = tokenizer.decode(pred_ids[i].cpu().tolist())
-            # extract final answer for scratchpad formats
-            if '>>' in gold_full[i]:
-                pred_final = pred_str.split('>>')[-1] if '>>' in pred_str \
-                    else pred_str[-len(gold_final[i]):]
-            elif '=>' in gold_full[i]:
-                pred_final = pred_str.split('=>')[-1] if '=>' in pred_str \
-                    else pred_str[-len(gold_final[i]):]
+            if objective == 'ar':
+                gen = generate_ar(model, pids, ans_len, device)
+                pred_ids = gen[:, pmax:pmax + ans_len]
+                batch_orders = None
             else:
-                pred_final = pred_str
-            ok = pred_final == gold_final[i]
-            correct += int(ok)
-            total += 1
-            per_sample.append(ok)
-            if len(examples) < 10:
-                examples.append({
-                    'prefix': prefixes[i], 'pred': pred_final,
-                    'gold': gold_final[i], 'correct': ok})
+                gen, _, info = generate_diffusion(
+                    model, pids, ans_len, mask_id,
+                    policy=policy, greedy=greedy,
+                    parallel_k=parallel_k, device=device)
+                pred_ids = gen[:, pmax:pmax + ans_len]
+                batch_orders = info.get('orders')
+
+            if batch_orders is not None:
+                all_orders.setdefault(ans_len, []).append(batch_orders)
+
+            for i in range(B):
+                pred_str = tokenizer.decode(pred_ids[i].cpu().tolist())
+                if '>>' in gold_full[i]:
+                    pred_final = pred_str.split('>>')[-1] if '>>' in pred_str \
+                        else pred_str[-len(gold_final[i]):]
+                elif '=>' in gold_full[i]:
+                    pred_final = pred_str.split('=>')[-1] if '=>' in pred_str \
+                        else pred_str[-len(gold_final[i]):]
+                else:
+                    pred_final = pred_str
+                ok = pred_final == gold_final[i]
+                correct += int(ok)
+                total += 1
+                per_sample.append(ok)
+                if len(examples) < 10:
+                    examples.append({
+                        'prefix': prefixes[i], 'pred': pred_final,
+                        'gold': gold_final[i], 'correct': ok})
 
     result = {
         'exact_match': correct / max(total, 1),
@@ -464,8 +476,13 @@ def evaluate(model, tokenizer, test_samples, objective,
         'examples': examples,
         'per_sample_correct': per_sample,
     }
+    # Concat decode_orders per answer-length group
     if all_orders:
-        result['decode_orders'] = torch.cat(all_orders, dim=0)
+        # Use the most common answer length for backwards compatibility
+        biggest_group = max(all_orders.keys(), key=lambda k: sum(
+            o.shape[0] for o in all_orders[k]))
+        result['decode_orders'] = torch.cat(
+            all_orders[biggest_group], dim=0)
     return result
 
 

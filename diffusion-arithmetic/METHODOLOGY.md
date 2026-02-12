@@ -216,58 +216,71 @@ Accuracy 차이가 5% 이상이면 통계적으로 유의하다.
 
 ---
 
-## 모듈 2: Tree Expression (exp_tree.py)
+## 모듈 2: Parallel Independent Additions (exp_tree.py)
 
-이진 트리 수식을 통해 병렬 계산 구조에서의 추론 능력을 테스트한다.
+독립적인 output segment들을 diffusion이 **병렬로 decode**할 수 있는지를 테스트한다.
+
+### 동기
+
+모듈 1(Addition)에서 carry chain은 본질적으로 순차적이어서 diffusion의 병렬 decode 이점이 제한적이다. 이 모듈은 **출력의 각 segment가 완전히 독립적**인 과제를 설계하여, diffusion이 실제로 병렬 생성 능력을 활용하는지 직접 측정한다.
 
 ### 데이터 구성
 
-**트리 구조**: 깊이 $d$의 perfect binary tree. 각 leaf는 단일 digit, 각 내부 node는 `+` 또는 `*` 연산자이다. 깊이 $d$에서 leaf 수는 $2^d$개.
+$k$개의 독립적인 2-digit 덧셈을 하나의 시퀀스에 묶는다:
 
-예시 (depth 2):
 ```
-((3+5)*(2+7))
-= (8 * 9)
-= 72
-→ 출력: 072 (mod 1000, 3자리 zero-pad)
+23+45|67+89|12+34=068|156|046
 ```
 
-**Plain format**:
-```
-((3+5)*(2+7))=072
-```
+- 각 operand: 10–99 (2-digit)
+- 각 answer: 3자리 zero-pad (max 99+99=198)
+- `|`로 problem/answer segment 구분
 
-**Scratchpad format**: Level-wise intermediate 값을 명시한다.
-```
-((3+5)*(2+7))=[L1:8,9][L2:72]=>072
-```
-`[L1:8,9]`는 depth 1에서의 중간 결과(8=3+5, 9=2+7), `[L2:72]`는 depth 2에서의 최종 결과. `=>` 뒤에 최종 답이 온다.
-
-**왜 tree인가**: 덧셈의 carry chain은 본질적으로 순차적이다(이전 자릿수의 carry를 알아야 다음 자릿수를 계산). 반면 tree의 하위 subtree들은 독립적으로 계산 가능하므로 병렬 구조를 가진다. Diffusion 모델이 이 병렬성을 활용할 수 있는지 테스트한다.
-
-**mod 1000**: 답의 길이를 3자리로 고정하여 output length가 변수가 되지 않게 한다.
+**핵심 구조**: Answer의 segment `068`, `156`, `046`은 서로 완전히 독립적이다. AR은 반드시 `068` → `|` → `156` → `|` → `046` 순서로 왼쪽부터 decode해야 하지만, diffusion은 세 segment를 동시에 채울 수 있다.
 
 ### 데이터 분할
 
-| Split | 깊이 | Leaf digits | N | 테스트 대상 |
-|-------|------|------------|---|-----------|
-| train | {2, 3} | {0,...,9} | 10,000 | — |
-| test_id | {2, 3} | {0,...,9} | 2,000 | In-distribution |
-| test_ood_depth | {4, 5} | {0,...,9} | 2,000 | 순수 depth 일반화 |
+| Split | k | N | 테스트 대상 |
+|-------|---|---|-----------|
+| train | {2, 4} 혼합 | 10,000 | — |
+| test_k2 | 2 | 2,000 | ID (적은 병렬 task) |
+| test_k4 | 4 | 2,000 | ID (많은 병렬 task) |
+| test_k8 | 8 | 2,000 | OOD (학습 시 미경험 k) |
 
-Tree의 leaf는 단일 digit(0-9)이므로 number-level OOD가 적용되지 않는다. OOD는 depth generalization만 테스트한다.
+$k$가 커질수록 output이 길어지고 (k=4: 15 tokens, k=8: 31 tokens), AR의 순차적 한계가 부각된다.
 
 ### 실험 조건
 
-2(objective) × 2(format) × 2(pos_enc) = **8 configurations**:
+2(objective) × 2(pos_enc) = **4 configurations**:
 
-{ar, diffusion} × {plain, scratchpad} × {absolute, rope}
+{ar, diffusion} × {absolute, rope}
+
+Scratchpad은 사용하지 않는다 — 각 sub-problem이 단순 2-digit 덧셈이므로 chain-of-thought이 불필요하며, 병렬성 테스트에 집중한다.
 
 ### 평가 지표
 
-모듈 1과 동일한 Exact Match Accuracy를 사용한다. Scratchpad format에서는 `=>` 뒤의 최종 답(3자리)만 비교한다. Scratchpad decode order analysis도 동일하게 적용한다.
+**Whole-sequence Exact Match**: 전체 answer string이 정답과 일치하는 비율.
 
-Number-level OOD breakdown은 없다 (leaf가 단일 digit이므로 적용 불가).
+**Per-segment Accuracy**: 각 segment 위치별 정답률. AR에서 later segment의 정답률이 lower segment보다 낮다면 왼쪽 segment의 오류가 전파됨을 시사한다. Diffusion에서 segment 간 정답률이 균일하다면 독립적 decode를 시사한다.
+
+**Parallelism Index (Kendall's τ)**: Diffusion의 decode order에서 segment 간 순서 편향을 측정한다.
+
+1. 각 sample에서 segment별 **mean decode rank** 계산 (segment 내 digit position들의 평균 decode step)
+2. Segment index `[0, 1, ..., k-1]`와 mean decode rank 사이의 Kendall's τ 계산
+3. 전체 test set에서 평균
+
+| τ 값 | 해석 |
+|-------|------|
+| ≈ 0 | 병렬: segment 순서와 decode 순서 무관 |
+| ≈ 1 | 순차 (L→R): AR과 동일한 순서로 decode |
+| ≈ -1 | 순차 (R→L): 역방향 |
+
+### Visualisation
+
+- **Accuracy vs k**: k=2,4,8에서 AR/diffusion × PE 별 정확도 추이. k=4 뒤에 점선으로 OOD 경계 표시.
+- **Segment Accuracy (k=4)**: 4개 segment 별 정답률 비교. AR의 position bias vs diffusion의 균일성.
+- **Parallelism τ**: k=4, k=8에서 diffusion의 τ 분포. 0에 가까울수록 병렬 decode.
+- **Segment Decode Rank Profile**: k=4에서 segment별 mean decode step. 평평하면 병렬, 계단 형태면 순차.
 
 ---
 
@@ -277,7 +290,7 @@ Diffusion의 **sampling mechanism**을 controlled 환경에서 분석한다. Gro
 
 ### 모듈 1-2와의 관계
 
-모듈 1-2는 conditional generation (question → answer) + exact match로 **reasoning 능력**을 측정한다. 모듈 3은 unconditional generation + distributional metrics로 **sampling mechanism 자체**를 분석한다. 결과는 "policy가 어떤 dependency 구조에서 어떻게 행동하는가"를 설명하지만, 이를 직접 arithmetic/tree 성능 예측에 사용해서는 안 된다 (dependency 구조가 다르기 때문).
+모듈 1-2는 conditional generation (question → answer) + exact match로 **reasoning 능력**을 측정한다. 모듈 3은 unconditional generation + distributional metrics로 **sampling mechanism 자체**를 분석한다. 결과는 "policy가 어떤 dependency 구조에서 어떻게 행동하는가"를 설명하지만, 이를 직접 addition/parallel 성능 예측에 사용해서는 안 된다 (dependency 구조가 다르기 때문).
 
 ### 왜 sampling인가 (greedy가 아닌)
 
@@ -486,9 +499,10 @@ $$I(X_i; X_j) = \sum_{v_i, v_j} p(X_i=v_i, X_j=v_j) \log \frac{p(X_i=v_i, X_j=v_
 
 ### 모듈 2
 
-- **Training Curves**: Position encoding별 loss 곡선.
-- **Accuracy by Split**: ID + depth OOD bar chart.
-- **RoPE vs Absolute Scatter**: Depth OOD에서 absolute vs RoPE 비교.
+- **Accuracy vs k**: k=2,4,8에서 AR/diffusion × PE 별 정확도 추이. OOD 경계(k=4) 표시.
+- **Segment Accuracy (k=4)**: Segment 위치별 정답률. AR의 position bias vs diffusion 균일성.
+- **Parallelism τ**: k=4, k=8에서 diffusion의 Kendall's τ 분포.
+- **Segment Decode Rank Profile**: k=4에서 segment별 mean decode step.
 
 ### 모듈 3
 
