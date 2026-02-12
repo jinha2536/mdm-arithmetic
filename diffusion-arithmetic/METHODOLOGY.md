@@ -226,44 +226,59 @@ Accuracy 차이가 5% 이상이면 통계적으로 유의하다.
 
 ### 데이터 구성
 
-$k$개의 독립적인 2-digit 덧셈을 하나의 시퀀스에 묶는다:
+$k$개의 독립적인 **3-digit 덧셈**을 하나의 시퀀스에 묶는다:
 
 ```
-23+45|67+89|12+34=068|156|046
+328+242|854+204=0570|1058
 ```
 
-- 각 operand: 10–99 (2-digit)
-- 각 answer: 3자리 zero-pad (max 99+99=198)
+- 각 operand: 100–999 (3-digit)
+- 각 answer: 4자리 zero-pad (max 999+999=1998)
 - `|`로 problem/answer segment 구분
 
-**핵심 구조**: Answer의 segment `068`, `156`, `046`은 서로 완전히 독립적이다. AR은 반드시 `068` → `|` → `156` → `|` → `046` 순서로 왼쪽부터 decode해야 하지만, diffusion은 세 segment를 동시에 채울 수 있다.
+**왜 3-digit인가**: 2-digit 덧셈은 carry가 최대 1번이라 AR과 diffusion 모두 거의 100% 정답률을 보여 의미 있는 비교가 불가능하다. 3-digit 덧셈은 carry chain이 있어서 모듈 1(Addition)과 동일한 수준의 난이도를 가진다. k=1은 exp_addition 3d와 중복이므로 제외한다.
+
+**핵심 구조**: Answer의 각 segment (`0570`, `1058`)는 서로 완전히 독립적이다. AR은 모든 segment를 왼쪽부터 순차적으로 decode해야 하지만, diffusion은 모든 segment를 동시에 채울 수 있다.
 
 ### 데이터 분할
 
-| Split | k | N | 테스트 대상 |
-|-------|---|---|-----------|
-| train | {2, 4} 혼합 | 10,000 | — |
-| test_k2 | 2 | 2,000 | ID (적은 병렬 task) |
-| test_k4 | 4 | 2,000 | ID (많은 병렬 task) |
-| test_k8 | 8 | 2,000 | OOD (학습 시 미경험 k) |
+| Split | k | ans tokens | total tokens | 비고 |
+|-------|---|-----------|-------------|------|
+| train | {2, 4, 6, 8} 혼합 | 9–39 | 25–71 | — |
+| test_k2 | 2 | 9 | 25 | |
+| test_k4 | 4 | 19 | 51 | |
+| test_k6 | 6 | 29 | 61 | |
+| test_k8 | 8 | 39 | 71 | 최대 병렬 task |
 
-$k$가 커질수록 output이 길어지고 (k=4: 15 tokens, k=8: 31 tokens), AR의 순차적 한계가 부각된다.
+**모든 k가 학습에 포함된다** (OOD 없음). $k$를 OOD 축으로 사용하면 length generalization과 confound되어 해석이 불가능하다 (unseen position embedding으로 인해 모델이 완전히 붕괴).
 
 ### 실험 조건
 
-2(objective) × 2(pos_enc) = **4 configurations**:
+**학습**: 2(objective) × 2(pos_enc) = 4 모델
 
 {ar, diffusion} × {absolute, rope}
 
-Scratchpad은 사용하지 않는다 — 각 sub-problem이 단순 2-digit 덧셈이므로 chain-of-thought이 불필요하며, 병렬성 테스트에 집중한다.
+**평가**: 동일한 diffusion 모델에서 **decode 전략을 바꿔** 3가지 조건을 비교한다:
+
+| 전략 | policy | parallel_k | 동작 | 예상 NFE (k=4) |
+|------|--------|-----------|------|---------------|
+| seq | confidence | 1 | 1 token/step | 19 |
+| par_seg | parallel_confidence | 4 (=ANS_WIDTH) | 1 segment/step | ~5 |
+| par_all | parallel_confidence | ans_len | 전부 한번에 | 1 |
+
+AR은 항상 sequential (NFE = ans_len). 총 **5 평가 조건** × 4 k값 = 20 evaluations per PE.
+
+Scratchpad은 사용하지 않는다 — 병렬성 테스트에 집중한다.
 
 ### 평가 지표
 
 **Whole-sequence Exact Match**: 전체 answer string이 정답과 일치하는 비율.
 
-**Per-segment Accuracy**: 각 segment 위치별 정답률. AR에서 later segment의 정답률이 lower segment보다 낮다면 왼쪽 segment의 오류가 전파됨을 시사한다. Diffusion에서 segment 간 정답률이 균일하다면 독립적 decode를 시사한다.
+**Per-segment Accuracy**: 각 segment 위치별 정답률. AR에서 later segment의 정답률이 떨어진다면 순차 decode의 누적 오류를 시사한다. Diffusion에서 segment 간 정답률이 균일하다면 독립적 병렬 decode를 시사한다.
 
-**Parallelism Index (Kendall's τ)**: Diffusion의 decode order에서 segment 간 순서 편향을 측정한다.
+**NFE (Number of Forward Evaluations)**: Decode에 사용된 forward pass 수. Parallel decode의 효율성을 직접 측정한다.
+
+**Parallelism Index (Kendall's τ)**: Sequential confidence 전략에서 decode order의 segment 간 순서 편향을 측정한다.
 
 1. 각 sample에서 segment별 **mean decode rank** 계산 (segment 내 digit position들의 평균 decode step)
 2. Segment index `[0, 1, ..., k-1]`와 mean decode rank 사이의 Kendall's τ 계산
@@ -275,12 +290,18 @@ Scratchpad은 사용하지 않는다 — 각 sub-problem이 단순 2-digit 덧�
 | ≈ 1 | 순차 (L→R): AR과 동일한 순서로 decode |
 | ≈ -1 | 순차 (R→L): 역방향 |
 
+### 핵심 가설
+
+1. **Accuracy preservation**: par_seg와 par_all이 seq 대비 accuracy 손실이 작다면, diffusion이 독립 segment를 실제로 병렬 처리할 수 있음을 입증한다.
+2. **NFE 절감**: 독립 구조에서는 par_seg가 seq 대비 ~k배 적은 NFE로 동일 accuracy를 달성해야 한다.
+3. **Scaling**: k가 커질수록 AR의 정확도가 하락하는 반면, diffusion(특히 par_seg)은 segment 독립성 덕분에 정확도를 유지해야 한다.
+
 ### Visualisation
 
-- **Accuracy vs k**: k=2,4,8에서 AR/diffusion × PE 별 정확도 추이. k=4 뒤에 점선으로 OOD 경계 표시.
-- **Segment Accuracy (k=4)**: 4개 segment 별 정답률 비교. AR의 position bias vs diffusion의 균일성.
-- **Parallelism τ**: k=4, k=8에서 diffusion의 τ 분포. 0에 가까울수록 병렬 decode.
-- **Segment Decode Rank Profile**: k=4에서 segment별 mean decode step. 평평하면 병렬, 계단 형태면 순차.
+- **Accuracy vs k** (PE별): k=2,4,6,8에서 AR / Diff(seq) / Diff(par_seg) / Diff(par_all) 정확도 비교.
+- **Segment Accuracy (k=8)**: 8개 segment 별 정답률. AR position decay vs diffusion 균일성.
+- **NFE vs Accuracy scatter**: 모든 조건의 효율성-정확도 trade-off. Size ∝ k.
+- **Parallelism τ**: Sequential decode에서 k별 τ 변화.
 
 ---
 
@@ -499,10 +520,10 @@ $$I(X_i; X_j) = \sum_{v_i, v_j} p(X_i=v_i, X_j=v_j) \log \frac{p(X_i=v_i, X_j=v_
 
 ### 모듈 2
 
-- **Accuracy vs k**: k=2,4,8에서 AR/diffusion × PE 별 정확도 추이. OOD 경계(k=4) 표시.
-- **Segment Accuracy (k=4)**: Segment 위치별 정답률. AR의 position bias vs diffusion 균일성.
-- **Parallelism τ**: k=4, k=8에서 diffusion의 Kendall's τ 분포.
-- **Segment Decode Rank Profile**: k=4에서 segment별 mean decode step.
+- **Accuracy vs k** (PE별): AR / Diff(seq) / Diff(par_seg) / Diff(par_all) 정확도 비교.
+- **Segment Accuracy (k=8)**: segment별 정답률. AR position decay vs diffusion 균일성.
+- **NFE vs Accuracy scatter**: 효율성-정확도 trade-off.
+- **Parallelism τ**: Sequential decode에서 k별 τ 변화.
 
 ### 모듈 3
 

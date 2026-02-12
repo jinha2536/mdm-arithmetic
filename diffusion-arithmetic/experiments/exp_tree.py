@@ -5,27 +5,22 @@
 
   Colab:  %run experiments/exp_tree.py
 
-  Tests whether diffusion models decode independent output segments
-  in parallel, and whether this yields accuracy or generalisation
-  advantages over AR.
+  Tests whether diffusion models can decode independent output
+  segments in parallel without accuracy loss.
 
   Format:  a1+b1|a2+b2|...|ak+bk=r1|r2|...|rk
-  Example (k=3):  23+45|67+89|12+34=068|156|046
+  Example: 328+242|854+204=0570|1058
 
-  Key insight:
-    AR decodes the answer left-to-right across ALL segments.
-    Diffusion can potentially fill all k segments simultaneously.
+  3-digit operands → carry chains make each segment non-trivial.
+  k=1 baseline is redundant with exp_addition and omitted.
 
-  Test splits (per model):
-    test_k2   (k=2, in-distribution)
-    test_k4   (k=4, in-distribution)
-    test_k8   (k=8, out-of-distribution — more tasks than training)
+  Decode strategies tested (same trained model):
+    seq       — sequential confidence (1 token/step, fair vs AR)
+    par_seg   — parallel_confidence, k=ANS_WIDTH (1 segment/step)
+    par_all   — parallel_confidence, k=ans_len (all at once)
 
-  Analysis:
-    - Accuracy scaling with k
-    - Per-segment accuracy (position bias?)
-    - Parallelism index (Kendall's τ on segment decode order)
-    - k generalisation (train k∈{2,4} → test k=8)
+  Core question: if segments are independent, par_seg and par_all
+  should match seq accuracy while using fewer forward passes.
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 """
 import sys, os
@@ -47,15 +42,23 @@ from core.train_utils import (
 EXP_NAME = 'exp_parallel'
 
 # ── Config ──────────────────────────────────────────
-ND          = 2           # digits per operand (10–99)
-ANS_WIDTH   = 3           # digits per answer (zero-padded; max 99+99=198)
-K_TRAIN     = [2, 4]      # parallel tasks seen during training
-K_TEST_OOD  = 8           # OOD: unseen number of parallel tasks
-N_TRAIN     = 10_000
+ND          = 3           # digits per operand (100–999)
+ANS_WIDTH   = 4           # digits per answer (zero-padded; max 1998)
+KS          = [2, 4, 6, 8]  # parallel tasks (all in training)
+N_TRAIN     = 20_000
 N_TEST      = 2_000
 MAX_ITERS   = 15_000
 PATIENCE    = 2_000
 POS_ENCS    = ['absolute', 'rope']
+
+# Diffusion decode strategies to compare
+# (policy, parallel_k_fn, label)
+#   parallel_k_fn takes ans_len and returns parallel_k
+DIFF_STRATEGIES = [
+    ('confidence',          lambda al: 1,          'seq'),
+    ('parallel_confidence', lambda al: ANS_WIDTH,  'par_seg'),
+    ('parallel_confidence', lambda al: al,         'par_all'),
+]
 
 
 # ── Data generation ─────────────────────────────────
@@ -72,7 +75,7 @@ def gen_sample(k, nd, rng):
 
 
 def gen_data_mixed(ks, n, seed=42):
-    """Generate n samples with k chosen randomly from ks per sample."""
+    """Generate n samples with k chosen randomly from ks."""
     rng = random.Random(seed)
     return [gen_sample(rng.choice(ks), ND, rng) for _ in range(n)]
 
@@ -84,7 +87,6 @@ def gen_data_fixed_k(k, n, seed=42):
 
 
 def get_answer(s):
-    """Full answer string after '='."""
     return s.split('=', 1)[1]
 
 
@@ -93,10 +95,10 @@ def build_tok():
     return CharTokenizer(chars, {'mask': 'M', 'pad': 'P'})
 
 
-# ── Segment-level analysis helpers ──────────────────
+# ── Analysis helpers ────────────────────────────────
 
 def _kendall_tau(x, y):
-    """Kendall's τ for small arrays (no scipy dependency)."""
+    """Kendall's τ for small arrays."""
     n = len(x)
     con, dis = 0, 0
     for i in range(n):
@@ -111,7 +113,7 @@ def _kendall_tau(x, y):
 
 
 def segment_accuracy(pred_str, gold_str, k):
-    """Per-segment exact match.  Returns list of k booleans."""
+    """Per-segment exact match."""
     pred_segs = pred_str.split('|')
     gold_segs = gold_str.split('|')
     if len(pred_segs) != k:
@@ -121,55 +123,36 @@ def segment_accuracy(pred_str, gold_str, k):
 
 def analyse_parallel_decode(decode_orders, ans_start, k,
                             seg_width=ANS_WIDTH):
-    """
-    Compute parallelism metrics from diffusion decode orders.
-
-    Args
-        decode_orders : (N, ans_tokens) — orders[b, step] = abs position
-        ans_start     : index of first answer token
-        k             : number of answer segments
-        seg_width     : digits per segment
-
-    Returns dict
-        segment_mean_ranks : (k,) mean decode step per segment
-        parallelism_tau    : mean Kendall's τ across samples
-            ≈ 0  → parallel (no order preference among segments)
-            ≈ 1  → sequential left-to-right
-    """
+    """Parallelism metrics from sequential decode orders."""
     if decode_orders is None or len(decode_orders) == 0:
         return {}
 
     N, S = decode_orders.shape
 
-    # Segment digit positions (relative to ans_start, excluding '|')
-    # Answer layout:  seg0 | seg1 | ... | seg_{k-1}
-    # Segment i starts at relative position i * (seg_width + 1)
     seg_positions = []
     for i in range(k):
         start = i * (seg_width + 1)
         seg_positions.append(list(range(start, start + seg_width)))
 
-    # Invert step→position to position→rank (vectorised)
     rel_orders = (decode_orders - ans_start).long().clamp(0, S - 1)
     steps = torch.arange(S).unsqueeze(0).expand(N, S).float()
     pos_rank = torch.zeros(N, S)
     pos_rank.scatter_(1, rel_orders, steps)
 
-    # Mean rank per segment (across all samples)
     seg_mean = np.zeros(k)
     for i, positions in enumerate(seg_positions):
         valid = [p for p in positions if p < S]
         if valid:
             seg_mean[i] = pos_rank[:, valid].mean().item()
 
-    # Per-sample Kendall's τ
     taus = []
     seg_idx = list(range(k))
     for b in range(N):
         ranks = []
         for ps in seg_positions:
             valid = [p for p in ps if p < S]
-            ranks.append(pos_rank[b, valid].mean().item() if valid else 0)
+            ranks.append(
+                pos_rank[b, valid].mean().item() if valid else 0)
         taus.append(_kendall_tau(seg_idx, ranks))
 
     return {
@@ -183,30 +166,31 @@ def analyse_parallel_decode(decode_orders, ans_start, k,
 # ── Evaluation ──────────────────────────────────────
 
 def evaluate_parallel(model, tokenizer, test_samples, objective, k,
+                      policy='confidence', parallel_k=1,
                       batch_size=128):
     """
-    Full evaluation for parallel additions:
-      • whole-sequence exact match
-      • per-segment exact match
-      • decode-order parallelism analysis (diffusion only)
+    Evaluate with configurable decode strategy.
+    Returns exact_match, segment_accuracy, n_steps, parallelism.
     """
     mask_id = tokenizer.special_ids['mask']
     model.eval()
 
-    # All samples share the same k, so answer length is constant
     ex = test_samples[0]
     ans_len = len(tokenizer.encode(get_answer(ex)))
     ans_start = len(tokenizer.encode(ex.split('=')[0] + '='))
 
     all_correct, all_orders = [], []
     seg_correct = [[] for _ in range(k)]
+    total_steps = 0
+    n_batches = 0
 
     for start in range(0, len(test_samples), batch_size):
         batch = test_samples[start:start + batch_size]
         B = len(batch)
         golds = [get_answer(s) for s in batch]
 
-        penc = [tokenizer.encode(s.split('=')[0] + '=') for s in batch]
+        penc = [tokenizer.encode(s.split('=')[0] + '=')
+                for s in batch]
         pmax = max(len(p) for p in penc)
         pids = torch.full((B, pmax), tokenizer.special_ids['pad'],
                           dtype=torch.long)
@@ -218,12 +202,18 @@ def evaluate_parallel(model, tokenizer, test_samples, objective, k,
                 gen = generate_ar(model, pids, ans_len, DEVICE)
                 pred_ids = gen[:, pmax:pmax + ans_len]
                 batch_orders = None
+                batch_steps = ans_len
             else:
                 gen, _, info = generate_diffusion(
                     model, pids, ans_len, mask_id,
-                    policy='confidence', greedy=True, device=DEVICE)
+                    policy=policy, greedy=True,
+                    parallel_k=parallel_k, device=DEVICE)
                 pred_ids = gen[:, pmax:pmax + ans_len]
                 batch_orders = info.get('orders')
+                batch_steps = info.get('n_steps', ans_len)
+
+        total_steps += batch_steps
+        n_batches += 1
 
         if batch_orders is not None:
             all_orders.append(batch_orders)
@@ -240,6 +230,7 @@ def evaluate_parallel(model, tokenizer, test_samples, objective, k,
         'exact_match': sum(all_correct) / max(len(all_correct), 1),
         'segment_accuracy': [
             sum(sc) / max(len(sc), 1) for sc in seg_correct],
+        'avg_steps': total_steps / max(n_batches, 1),
     }
 
     if all_orders:
@@ -262,18 +253,16 @@ def run():
     tok = build_tok()
 
     # ── Data ──
-    train_data = gen_data_mixed(K_TRAIN, N_TRAIN, seed=42)
+    train_data = gen_data_mixed(KS, N_TRAIN, seed=42)
     test_splits = {}
-    for k in K_TRAIN:
-        test_splits[f'test_k{k}'] = gen_data_fixed_k(k, N_TEST,
-                                                       seed=1000 + k)
-    test_splits[f'test_k{K_TEST_OOD}'] = gen_data_fixed_k(
-        K_TEST_OOD, N_TEST, seed=1000 + K_TEST_OOD)
+    for k in KS:
+        test_splits[f'test_k{k}'] = gen_data_fixed_k(
+            k, N_TEST, seed=1000 + k)
 
     all_s = train_data + [s for v in test_splits.values() for s in v]
     max_len = max(len(tok.encode(s)) for s in all_s) + 1
 
-    print(f"\n  Config: ND={ND}, K_TRAIN={K_TRAIN}, K_OOD={K_TEST_OOD}")
+    print(f"\n  Config: ND={ND}, KS={KS}")
     print(f"  Train: {len(train_data)} samples (mixed k)")
     for name, data in test_splits.items():
         print(f"  {name}: {len(data)} samples  ex: {data[0]}")
@@ -285,41 +274,63 @@ def run():
 
     for pos_enc in POS_ENCS:
         for objective in ['ar', 'diffusion']:
-            key = f"{objective}_{pos_enc}"
-            print(f"\n▶ {key}")
+            base_key = f"{objective}_{pos_enc}"
+            print(f"\n▶ Training: {base_key}")
 
             model, hist, ml, conv_it = train_model(
                 objective, tok, train_data, max_len=max_len,
                 max_iters=MAX_ITERS, patience=PATIENCE,
                 pos_enc=pos_enc, log_interval=500,
             )
-            all_histories[key] = hist
-            convergence_iters[key] = conv_it
-            all_results[key] = {}
+            all_histories[base_key] = hist
+            convergence_iters[base_key] = conv_it
 
-            for split_name, test_data in test_splits.items():
-                k_val = int(split_name.split('k')[1])
-                res = evaluate_parallel(
-                    model, tok, test_data, objective, k_val)
+            # Determine which decode strategies to test
+            if objective == 'ar':
+                strategies = [('confidence', lambda al: 1, 'ar')]
+            else:
+                strategies = DIFF_STRATEGIES
 
-                all_results[key][split_name] = res['exact_match']
-                all_results[key][f'{split_name}_seg'] = \
-                    res['segment_accuracy']
+            for policy, pk_fn, strat_label in strategies:
+                key = f"{objective}_{strat_label}_{pos_enc}"
+                print(f"\n  ▸ Evaluating: {key}")
+                all_results[key] = {}
 
-                seg_str = ' '.join(
-                    f's{i}={a:.3f}'
-                    for i, a in enumerate(res['segment_accuracy']))
-                print(f"    {split_name}: "
-                      f"{res['exact_match']:.4f}  [{seg_str}]")
+                for split_name, test_data in test_splits.items():
+                    k_val = int(split_name.split('k')[1])
+                    ex = test_data[0]
+                    ans_len = len(tok.encode(get_answer(ex)))
+                    pk = pk_fn(ans_len)
 
-                if 'parallelism' in res:
-                    par = res['parallelism']
-                    all_results[key][f'{split_name}_par'] = par
-                    print(f"      τ={par['parallelism_tau']:.3f} "
-                          f"(±{par['tau_std']:.3f})  "
-                          f"ranks={[f'{r:.1f}' for r in par['segment_mean_ranks']]}")
+                    res = evaluate_parallel(
+                        model, tok, test_data, objective,
+                        k_val, policy=policy, parallel_k=pk)
 
-            save_results(EXP_NAME, all_results, model=model, tag=key)
+                    all_results[key][split_name] = \
+                        res['exact_match']
+                    all_results[key][f'{split_name}_seg'] = \
+                        res['segment_accuracy']
+                    all_results[key][f'{split_name}_nfe'] = \
+                        res['avg_steps']
+
+                    seg_str = ' '.join(
+                        f's{i}={a:.3f}'
+                        for i, a in enumerate(
+                            res['segment_accuracy']))
+                    print(f"    {split_name}: "
+                          f"{res['exact_match']:.4f}  "
+                          f"NFE={res['avg_steps']:.0f}  "
+                          f"[{seg_str}]")
+
+                    if 'parallelism' in res:
+                        par = res['parallelism']
+                        all_results[key][f'{split_name}_par'] = par
+                        print(
+                            f"      τ={par['parallelism_tau']:.3f}"
+                            f" (±{par['tau_std']:.3f})")
+
+            save_results(EXP_NAME, all_results, model=model,
+                         tag=base_key)
 
     all_results['convergence_iters'] = convergence_iters
 
@@ -331,96 +342,128 @@ def run():
                if isinstance(all_results[k], dict)
                and 'test_k2' in all_results[k]]
 
-    obj_color = {'ar': '#e74c3c', 'diffusion': '#3498db'}
-    pe_style  = {'absolute': '-o', 'rope': '--s'}
+    # Colour/style by strategy
+    STYLE = {
+        'ar_ar':           ('#e74c3c', '-o',  'AR'),
+        'diffusion_seq':   ('#3498db', '-o',  'Diff (seq)'),
+        'diffusion_par_seg': ('#2ecc71', '-s',  'Diff (par_seg)'),
+        'diffusion_par_all': ('#9b59b6', '-^',  'Diff (par_all)'),
+    }
 
-    # 1) Accuracy vs k  ─────────────────────────────
-    ks = sorted(set(K_TRAIN + [K_TEST_OOD]))
+    def _style(cfg):
+        """Extract style key from config name like diffusion_seq_absolute."""
+        parts = cfg.rsplit('_', 1)   # split off pos_enc
+        return parts[0], parts[1]    # strategy_part, pos_enc
+
+    # 1) Accuracy vs k — main result ────────────────
+    for pe in POS_ENCS:
+        fig, ax = plt.subplots(figsize=(8, 5))
+        for cfg in configs:
+            strat, cfg_pe = _style(cfg)
+            if cfg_pe != pe:
+                continue
+            color, ls, label = STYLE.get(strat,
+                                          ('#888', '-x', strat))
+            accs = [all_results[cfg].get(f'test_k{k}', 0)
+                    for k in KS]
+            ax.plot(KS, accs, ls, color=color,
+                    label=label, markersize=6)
+        ax.set_xlabel('k (parallel tasks)')
+        ax.set_ylabel('Exact Match')
+        ax.set_xticks(KS); ax.set_ylim(-0.05, 1.05)
+        ax.legend(fontsize=9); ax.grid(alpha=0.3)
+        ax.set_title(f'Accuracy vs k — {pe}')
+        fig.tight_layout()
+        figs[f'accuracy_vs_k_{pe}'] = fig
+
+    # 2) Per-segment accuracy at k=8  ───────────────
+    k_main = max(KS)
+    for pe in POS_ENCS:
+        pe_cfgs = [c for c in configs if _style(c)[1] == pe]
+        if not pe_cfgs:
+            continue
+        fig, ax = plt.subplots(figsize=(10, 5))
+        x = np.arange(k_main)
+        w = 0.8 / max(len(pe_cfgs), 1)
+        for i, cfg in enumerate(pe_cfgs):
+            strat, _ = _style(cfg)
+            color, _, label = STYLE.get(strat,
+                                         ('#888', '', strat))
+            segs = all_results[cfg].get(
+                f'test_k{k_main}_seg', [0] * k_main)
+            ax.bar(x + i * w, segs[:k_main], w,
+                   label=label, color=color, alpha=0.8)
+        ax.set_xlabel('Segment Position')
+        ax.set_ylabel('Segment Accuracy')
+        ax.set_xticks(x + w * (len(pe_cfgs) - 1) / 2)
+        ax.set_xticklabels([f'seg {i}' for i in range(k_main)])
+        ax.set_ylim(0, 1.05)
+        ax.legend(fontsize=8); ax.grid(axis='y', alpha=0.3)
+        ax.set_title(f'Per-Segment Accuracy (k={k_main}) — {pe}')
+        fig.tight_layout()
+        figs[f'segment_accuracy_k{k_main}_{pe}'] = fig
+
+    # 3) NFE vs Accuracy scatter ────────────────────
     fig, ax = plt.subplots(figsize=(8, 5))
     for cfg in configs:
-        obj = 'ar' if 'ar' in cfg else 'diffusion'
-        pe  = 'rope' if 'rope' in cfg else 'absolute'
-        accs = [all_results[cfg].get(f'test_k{k}', 0) for k in ks]
-        ax.plot(ks, accs, pe_style[pe], color=obj_color[obj],
-                label=f'{obj}/{pe}', markersize=6)
-    ax.axvline(x=max(K_TRAIN), color='gray', ls=':', alpha=0.5,
-               label='train max k')
-    ax.set_xlabel('k (parallel tasks)'); ax.set_ylabel('Exact Match')
-    ax.set_xticks(ks); ax.set_ylim(-0.05, 1.05)
-    ax.legend(fontsize=8); ax.grid(alpha=0.3)
-    ax.set_title('Accuracy Scaling with Parallel Tasks')
-    fig.tight_layout(); figs['accuracy_vs_k'] = fig
+        strat, pe = _style(cfg)
+        color, _, label = STYLE.get(strat,
+                                     ('#888', '', strat))
+        marker = 'o' if pe == 'absolute' else 's'
+        for k_val in KS:
+            acc = all_results[cfg].get(f'test_k{k_val}', 0)
+            nfe = all_results[cfg].get(
+                f'test_k{k_val}_nfe', 0)
+            ax.scatter(nfe, acc, color=color, marker=marker,
+                       s=40 + k_val * 8, alpha=0.7)
+    # Manual legend
+    from matplotlib.lines import Line2D
+    handles = []
+    for skey, (color, _, label) in STYLE.items():
+        handles.append(Line2D([0], [0], marker='o', color='w',
+                              markerfacecolor=color, label=label,
+                              markersize=8))
+    handles.append(Line2D([0], [0], marker='o', color='w',
+                          markerfacecolor='gray', label='absolute',
+                          markersize=8))
+    handles.append(Line2D([0], [0], marker='s', color='w',
+                          markerfacecolor='gray', label='rope',
+                          markersize=8))
+    ax.legend(handles=handles, fontsize=8)
+    ax.set_xlabel('NFE (forward passes)')
+    ax.set_ylabel('Exact Match')
+    ax.grid(alpha=0.3)
+    ax.set_title('NFE vs Accuracy (size ∝ k)')
+    fig.tight_layout(); figs['nfe_vs_accuracy'] = fig
 
-    # 2) Per-segment accuracy at k=4  ───────────────
-    fig, ax = plt.subplots(figsize=(8, 5))
-    x = np.arange(4)
-    w = 0.8 / max(len(configs), 1)
-    for i, cfg in enumerate(configs):
-        segs = all_results[cfg].get('test_k4_seg', [0] * 4)
-        obj = 'ar' if 'ar' in cfg else 'diffusion'
-        pe  = 'rope' if 'rope' in cfg else 'absolute'
-        ax.bar(x + i * w, segs[:4], w, label=f'{obj}/{pe}',
-               color=obj_color[obj],
-               alpha=0.9 if pe == 'absolute' else 0.5,
-               edgecolor='black' if pe == 'rope' else 'none',
-               linewidth=0.5)
-    ax.set_xlabel('Segment Position'); ax.set_ylabel('Segment Accuracy')
-    ax.set_xticks(x + w * (len(configs) - 1) / 2)
-    ax.set_xticklabels([f'seg {i}' for i in range(4)])
-    ax.set_ylim(0, 1.05)
-    ax.legend(fontsize=8); ax.grid(axis='y', alpha=0.3)
-    ax.set_title('Per-Segment Accuracy (k=4, ID)')
-    fig.tight_layout(); figs['segment_accuracy_k4'] = fig
-
-    # 3) Parallelism τ  ─────────────────────────────
-    diff_cfgs = [c for c in configs if 'diffusion' in c]
-    if diff_cfgs:
-        test_keys = [f'test_k{k}' for k in ks if k > 2]
+    # 4) Parallelism τ (sequential only) ────────────
+    seq_cfgs = [c for c in configs if 'seq' in c]
+    if seq_cfgs:
         fig, ax = plt.subplots(figsize=(8, 5))
-        x = np.arange(len(test_keys))
-        w = 0.8 / max(len(diff_cfgs), 1)
-        for i, cfg in enumerate(diff_cfgs):
-            pe = 'rope' if 'rope' in cfg else 'absolute'
-            vals = [all_results[cfg].get(f'{tk}_par', {})
-                    .get('parallelism_tau', 0) for tk in test_keys]
-            errs = [all_results[cfg].get(f'{tk}_par', {})
-                    .get('tau_std', 0) for tk in test_keys]
+        x = np.arange(len(KS))
+        w = 0.8 / max(len(seq_cfgs), 1)
+        for i, cfg in enumerate(seq_cfgs):
+            _, pe = _style(cfg)
+            vals = [all_results[cfg].get(f'test_k{k}_par', {})
+                    .get('parallelism_tau', 0) for k in KS]
+            errs = [all_results[cfg].get(f'test_k{k}_par', {})
+                    .get('tau_std', 0) for k in KS]
             ax.bar(x + i * w, vals, w, yerr=errs,
                    label=f'diffusion/{pe}',
-                   color=obj_color['diffusion'],
+                   color='#3498db',
                    alpha=0.9 if pe == 'absolute' else 0.5,
                    capsize=3)
         ax.axhline(y=0, color='green', ls='--', alpha=0.5,
                    label='parallel (τ=0)')
         ax.axhline(y=1, color='red', ls='--', alpha=0.5,
                    label='sequential (τ=1)')
-        ax.set_xlabel('Test Split'); ax.set_ylabel("Kendall's τ")
-        ax.set_xticks(x + w * (len(diff_cfgs) - 1) / 2)
-        ax.set_xticklabels(test_keys)
+        ax.set_xlabel('k'); ax.set_ylabel("Kendall's τ")
+        ax.set_xticks(x + w * (len(seq_cfgs) - 1) / 2)
+        ax.set_xticklabels([f'k={k}' for k in KS])
         ax.set_ylim(-0.3, 1.2)
         ax.legend(fontsize=8); ax.grid(axis='y', alpha=0.3)
-        ax.set_title('Parallelism Index (lower = more parallel)')
+        ax.set_title('Parallelism Index — Sequential Confidence')
         fig.tight_layout(); figs['parallelism_tau'] = fig
-
-    # 4) Segment decode-rank profile (k=4, diffusion)
-    for cfg in diff_cfgs:
-        par = all_results[cfg].get('test_k4_par')
-        if par and 'segment_mean_ranks' in par:
-            ranks = par['segment_mean_ranks']
-            fig, ax = plt.subplots(figsize=(6, 4))
-            ax.bar(range(len(ranks)), ranks,
-                   color='#3498db', alpha=0.7)
-            for bi, v in enumerate(ranks):
-                ax.text(bi, v + 0.3, f'{v:.1f}', ha='center',
-                        fontsize=9)
-            ax.set_xlabel('Segment Index')
-            ax.set_ylabel('Mean Decode Step')
-            pe = 'rope' if 'rope' in cfg else 'absolute'
-            ax.set_title(
-                f'Segment Decode Order (k=4) — diffusion/{pe}')
-            ax.grid(axis='y', alpha=0.3)
-            fig.tight_layout()
-            figs[f'decode_rank_{cfg}'] = fig
 
     save_results(EXP_NAME, all_results, figures=figs)
 
@@ -428,31 +471,28 @@ def run():
     print("\n" + "=" * 70)
     print("SUMMARY")
     print("=" * 70)
-    header = f"{'Config':<25}"
-    for k in ks:
+    header = f"{'Config':<30}"
+    for k in KS:
         header += f"  {'k='+str(k):>7}"
-    header += f"  {'τ(k4)':>7}  {'τ(k'+str(K_TEST_OOD)+')':>7}"
+    header += f"  {'NFE(k'+str(max(KS))+')':>9}"
     print(header)
     print("-" * len(header))
 
-    for cfg in configs:
+    for cfg in sorted(configs):
         r = all_results[cfg]
-        vals = ''.join(f"  {r.get(f'test_k{k}', 0):>7.4f}"
-                       for k in ks)
-        tau4 = r.get('test_k4_par', {}).get('parallelism_tau')
-        tau8 = r.get(f'test_k{K_TEST_OOD}_par', {}).get(
-            'parallelism_tau')
-        t4 = f"{tau4:.3f}" if tau4 is not None else "    —"
-        t8 = f"{tau8:.3f}" if tau8 is not None else "    —"
-        print(f"{cfg:<25}{vals}  {t4:>7}  {t8:>7}")
+        vals = ''.join(
+            f"  {r.get(f'test_k{k}', 0):>7.4f}" for k in KS)
+        nfe = r.get(f'test_k{max(KS)}_nfe', 0)
+        print(f"{cfg:<30}{vals}  {nfe:>9.0f}")
 
-    # Segment detail for k=4
-    print("\nSEGMENT ACCURACY (k=4):")
-    for cfg in configs:
-        segs = all_results[cfg].get('test_k4_seg', [])
-        seg_str = '  '.join(f's{i}={v:.3f}'
-                            for i, v in enumerate(segs))
-        print(f"  {cfg:<25} {seg_str}")
+    # Segment detail for k=max
+    print(f"\nSEGMENT ACCURACY (k={k_main}):")
+    for cfg in sorted(configs):
+        segs = all_results[cfg].get(
+            f'test_k{k_main}_seg', [])
+        seg_str = '  '.join(
+            f's{i}={v:.3f}' for i, v in enumerate(segs))
+        print(f"  {cfg:<30} {seg_str}")
 
     plt.show()
     return all_results
