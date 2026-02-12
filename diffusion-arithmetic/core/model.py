@@ -11,7 +11,7 @@ Shared Transformer backbone.
 RoPE helps length generalisation because relative positions remain
 meaningful at unseen absolute positions.
 """
-import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -120,6 +120,16 @@ class Transformer(nn.Module):
     """
     Args:
         pos_enc: 'absolute' | 'rope' | 'none'
+
+    Note on RoPE + bidirectional (diffusion):
+        RoPE provides position info only through Q·K attention rotation,
+        not through token embeddings. MASK tokens at different positions
+        share the same embedding entering the first layer, but attention
+        weights still depend on position via RoPE. This matches LLaDA's
+        architecture (LLaMA3 with causal mask removed, pure RoPE).
+        If RoPE+diffusion underperforms absolute PE at small scale,
+        that is itself an interesting finding about positional encoding
+        requirements for masked diffusion models.
     """
     def __init__(self, vocab_size, block_size=256,
                  n_layer=6, n_head=6, n_embd=384, dropout=0.2,

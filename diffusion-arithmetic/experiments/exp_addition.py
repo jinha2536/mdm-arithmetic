@@ -34,14 +34,15 @@ from core.train_utils import (
 EXP_NAME = 'exp_addition'
 
 # ── Config ──────────────────────────────────────────
-MAX_ITERS    = 15_000
-PATIENCE     = 2_000
+MAX_ITERS    = 20_000
+PATIENCE     = 3_000
 
 # Multi-digit configs: (n_digits, n_train, n_test)
+# 3d: number-level OOD (paper comparison), easy baseline
+# 5d: difficulty frontier — where AR vs diffusion diverge
 DIGIT_CONFIGS = [
     (3,  10_000, 2_000),
-    (5,  30_000, 2_000),
-    (7,  50_000, 2_000),
+    (5,  50_000, 2_000),
 ]
 
 # Number-level OOD only for 3d (paper comparison)
@@ -226,7 +227,7 @@ def analyse_fixation_order(test_samples, eval_result, nd, fmt, tok):
         # Map decode order to answer positions
         pos_to_rank = {}
         for rank, pos in enumerate(order):
-            pos_to_rank[pos] = rank
+            pos_to_rank[int(pos.item()) if hasattr(pos, 'item') else int(pos)] = rank
 
         for digit_idx in range(ans_len):
             tok_pos = ans_start + digit_idx
@@ -276,7 +277,7 @@ def _compute_carries(a, b, nd):
 
 # ── Main ────────────────────────────────────────────
 
-def run():
+def run(include_digit_position=True):
     print("=" * 70)
     print("  EXP 1: Addition — Multi-Digit Scaling + Fixation Order")
     print("=" * 70)
@@ -308,7 +309,15 @@ def run():
                         test_splits = ['test_id', 'test_ood_length']
 
                     tok = build_tok(fmt)
-                    print(f"  ex: {splits['train'][0]}")
+
+                    # ── Diagnostic: verify data format ──
+                    ex = splits['train'][0]
+                    ex_enc = tok.encode(ex)
+                    ans_start_pos = ex.index('=') + 1
+                    ans_str = get_answer(ex, fmt)
+                    print(f"  ex: {ex}")
+                    print(f"  tokens: {len(ex_enc)}, ans_start: {ans_start_pos}, "
+                          f"ans: '{ans_str}' ({len(ans_str)} chars)")
 
                     all_s = [s for v in splits.values() for s in v]
                     max_len = max(len(tok.encode(s)) for s in all_s) + 1
@@ -503,6 +512,12 @@ def run():
             print(f"  {k}: [{rank_str}] {cc_str}")
 
     plt.show()
+
+    # ── Optional: Digit-position exclusion analysis ──
+    if include_digit_position:
+        dp_results = run_digit_position_analysis()
+        all_results['digit_position'] = dp_results
+
     return all_results
 
 
@@ -635,4 +650,5 @@ def run_digit_position_analysis():
 
 
 if __name__ == '__main__':
-    run()
+    # Runs main multi-digit experiment + digit-position exclusion analysis
+    run(include_digit_position=True)

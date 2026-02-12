@@ -42,7 +42,6 @@ from torch.utils.data import DataLoader
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib; matplotlib.use('Agg')
-from collections import defaultdict
 from itertools import product as iter_product
 from scipy.stats import spearmanr
 
@@ -181,21 +180,29 @@ class MarkovChain(ToyDistribution):
         super().__init__()
         self.k = order
         rng = np.random.RandomState(seed)
-        self.trans = {}
-        for ctx in iter_product(range(V), repeat=order):
+        # Build transition tensor: (V^order, V) log-probs
+        n_ctx = V ** order
+        self.trans_logp = torch.zeros(n_ctx, V, dtype=torch.float32)
+        for idx, ctx in enumerate(iter_product(range(V), repeat=order)):
             alpha = rng.uniform(sparsity * 0.5, sparsity, size=V)
-            alpha[rng.randint(V)] += 3.0  # stronger peak
-            self.trans[ctx] = torch.tensor(rng.dirichlet(alpha),
-                                           dtype=torch.float32)
-        self.init_lp = np.log(1.0 / (V ** order))
+            alpha[rng.randint(V)] += 3.0
+            probs = rng.dirichlet(alpha)
+            self.trans_logp[idx] = torch.tensor(np.log(probs + 1e-30),
+                                                 dtype=torch.float32)
+        self.init_lp = np.log(1.0 / n_ctx)
+        # Powers for context encoding: ctx_idx = sum(x[t-k+i] * V^i)
+        self._ctx_powers = V ** torch.arange(order)
+
+    def _ctx_index(self, x_ctx):
+        """x_ctx: (..., order) -> (...) integer index into trans table."""
+        return (x_ctx * self._ctx_powers).sum(-1)
 
     def log_prob(self, x):
         x = x.reshape(-1, L); n = x.shape[0]
         lp = torch.full((n,), self.init_lp, dtype=torch.float32)
         for t in range(self.k, L):
-            for i in range(n):
-                ctx = tuple(x[i, t-self.k:t].tolist())
-                lp[i] += self.trans[ctx][x[i, t].item()].log()
+            ctx_idx = self._ctx_index(x[:, t-self.k:t])  # (n,)
+            lp += self.trans_logp[ctx_idx, x[:, t]]       # (n,)
         return lp
 
 
@@ -334,10 +341,10 @@ def decode_sequential(model, n, policy='confidence', track_order=False):
             t2 = probs.topk(2, dim=-1).values
             mg = t2[:,:,0]-t2[:,:,1]; mg[unmasked] = -1; pos = mg.argmax(-1)
         elif policy == 'random':
-            pos = torch.zeros(n, dtype=torch.long, device=DEVICE)
-            for b in range(n):
-                mp = (~unmasked[b]).nonzero(as_tuple=True)[0]
-                pos[b] = mp[torch.randint(len(mp), (1,))]
+            # Assign random scores to unmasked positions, -inf to masked
+            rand_sc = torch.rand(n, L, device=DEVICE)
+            rand_sc[unmasked] = -1
+            pos = rand_sc.argmax(-1)
         elif policy == 'l2r':
             pos = torch.full((n,), t, dtype=torch.long, device=DEVICE)
         elif policy == 'r2l':
@@ -363,40 +370,45 @@ def decode_adaptive_threshold(model, n, tau=0.7):
     Adaptive parallel: at each step, decode ALL positions whose max
     softmax probability ≥ τ.  If none qualify, fall back to the single
     most confident position (so it always makes progress).
-
-    Naturally adapts: easy distributions → large batches → few NFE.
-    Hard distributions → τ rarely exceeded → ~sequential → more NFE.
     """
     x = torch.full((n, L), MASK_ID, dtype=torch.long, device=DEVICE)
     unmasked = torch.zeros(n, L, dtype=torch.bool, device=DEVICE)
     scores = torch.zeros(n, device=DEVICE)
     n_steps = 0
+    arange_n = torch.arange(n, device=DEVICE)
+    arange_L = torch.arange(L, device=DEVICE)
 
     while not unmasked.all():
         logits = model(x)
         logits[:, :, MASK_ID] = -float('inf')
-        probs = F.softmax(logits, dim=-1)
-        conf = probs.max(-1).values  # (n, L)
+        probs = F.softmax(logits, dim=-1)          # (n, L, V) — computed ONCE
+        conf = probs.max(-1).values                 # (n, L)
         conf[unmasked] = -1
 
-        for b in range(n):
-            mp = (~unmasked[b]).nonzero(as_tuple=True)[0]
-            if len(mp) == 0:
-                continue
-            # Select positions above threshold
-            above = conf[b, mp] >= tau
-            if above.any():
-                sel = mp[above]
-            else:
-                # Fallback: single most confident
-                sel = mp[conf[b, mp].argmax().unsqueeze(0)]
-            for pos in sel:
-                pos_logits = logits[b, pos]
-                tok = torch.multinomial(
-                    F.softmax(pos_logits.unsqueeze(0), dim=-1), 1).item()
-                scores[b] += F.log_softmax(pos_logits, dim=-1)[tok]
-                x[b, pos] = tok
-                unmasked[b, pos] = True
+        # Which positions are above threshold?
+        above_tau = (conf >= tau) & (~unmasked)
+        # Fallback: samples with no position above tau → pick most confident
+        has_any = above_tau.any(dim=1)
+        if not has_any.all():
+            best_pos = conf.argmax(dim=1)
+            no_above = ~has_any
+            above_tau[arange_n[no_above], best_pos[no_above]] = True
+
+        # Sample tokens ONLY for selected positions (via masked multinomial)
+        # Flatten selected positions, sample, scatter back
+        sel_idx = above_tau.nonzero(as_tuple=False)          # (M, 2) — [sample, pos]
+        if sel_idx.shape[0] == 0:
+            break
+        sel_logits = logits[sel_idx[:, 0], sel_idx[:, 1]]    # (M, V)
+        sel_probs = F.softmax(sel_logits, dim=-1)             # reuse would need gather
+        sel_tok = torch.multinomial(sel_probs, 1).squeeze(-1) # (M,)
+        sel_lp = F.log_softmax(sel_logits, dim=-1)[
+            torch.arange(sel_idx.shape[0], device=DEVICE), sel_tok]  # (M,)
+
+        # Scatter back
+        x[sel_idx[:, 0], sel_idx[:, 1]] = sel_tok
+        unmasked[sel_idx[:, 0], sel_idx[:, 1]] = True
+        scores.scatter_add_(0, sel_idx[:, 0], sel_lp)
         n_steps += 1
 
     return x.cpu(), scores.cpu(), n_steps
@@ -405,72 +417,87 @@ def decode_adaptive_threshold(model, n, tau=0.7):
 @torch.no_grad()
 def decode_jacobi(model, n, max_iter=20):
     """
-    Jacobi-style iteration: predict ALL masked positions at once,
-    then re-predict with updated context, repeat until no position
-    changes (fixed point) or max_iter reached.
-
-    At convergence, the result is a fixed point of the model's
-    conditional predictions — similar quality to sequential confidence
-    but potentially much fewer forward passes.
+    Jacobi-style iteration: predict ALL positions at once,
+    then re-predict with updated context, repeat until convergence
+    (no tokens change) or max_iter reached.
     """
-    # Initialize with single-pass prediction (all positions at once)
+    # Initialize: predict all positions from all-MASK input
     x = torch.full((n, L), MASK_ID, dtype=torch.long, device=DEVICE)
-
     logits = model(x)
     logits[:, :, MASK_ID] = -float('inf')
-    # Sample initial tokens
-    for pos in range(L):
-        tok = torch.multinomial(F.softmax(logits[:, pos], dim=-1), 1).squeeze(-1)
-        x[:, pos] = tok
+    # Vectorized sampling: reshape (n, L, V) → (n*L, V), sample, reshape back
+    flat_probs = F.softmax(logits.view(-1, logits.size(-1)), dim=-1)
+    x = torch.multinomial(flat_probs, 1).squeeze(-1).view(n, L)
 
-    n_steps = 1  # first pass
-    scores = torch.zeros(n, device=DEVICE)
+    n_steps = 1
+    active = torch.ones(n, dtype=torch.bool, device=DEVICE)  # per-sample convergence
 
     for it in range(max_iter - 1):
         x_prev = x.clone()
-        logits = model(x)
-        logits[:, :, MASK_ID] = -float('inf')
 
-        # Re-sample all positions
-        for pos in range(L):
-            tok = torch.multinomial(F.softmax(logits[:, pos], dim=-1), 1).squeeze(-1)
-            x[:, pos] = tok
+        # Only compute for active (non-converged) samples
+        if not active.any():
+            break
+        active_idx = active.nonzero(as_tuple=True)[0]
+        x_active = x[active_idx]
+
+        logits_a = model(x_active)
+        logits_a[:, :, MASK_ID] = -float('inf')
+        flat_probs_a = F.softmax(logits_a.view(-1, logits_a.size(-1)), dim=-1)
+        new_tok = torch.multinomial(flat_probs_a, 1).squeeze(-1).view(-1, L)
+        x[active_idx] = new_tok
 
         n_steps += 1
-        # Check convergence: if no tokens changed across batch
-        if (x == x_prev).all():
-            break
+        # Mark converged samples as inactive
+        converged = (x[active_idx] == x_prev[active_idx]).all(dim=1)
+        active[active_idx[converged]] = False
 
-    # Compute final scores
+    # Compute final scores (all samples)
     logits = model(x)
     logits[:, :, MASK_ID] = -float('inf')
-    for pos in range(L):
-        scores += F.log_softmax(logits[:, pos], dim=-1)[
-            torch.arange(n, device=DEVICE), x[:, pos]]
+    lp = F.log_softmax(logits, dim=-1)  # (n, L, V)
+    scores = lp[
+        torch.arange(n, device=DEVICE).unsqueeze(1).expand(n, L),
+        torch.arange(L, device=DEVICE).unsqueeze(0).expand(n, L),
+        x
+    ].sum(dim=1)  # (n,)
 
     return x.cpu(), scores.cpu(), n_steps
 
 
 # ── Metrics ─────────────────────────────────────────
 
+def _seq_to_idx(seqs):
+    """
+    Encode sequences of shape (n, L) with values in [0, V) into
+    unique integer indices in [0, V^L).  Fully vectorized.
+    """
+    if isinstance(seqs, torch.Tensor):
+        seqs = seqs.numpy() if seqs.device.type == 'cpu' else seqs.cpu().numpy()
+    # powers[i] = V^i
+    powers = V ** np.arange(L)
+    return (seqs * powers).sum(axis=1).astype(np.int64)
+
+
 def compute_metrics(samples, scores, dist):
     """
     Compute TV, KL, mode coverage, path score correlation.
     Includes bootstrap confidence intervals and ideal baseline TV.
+    Fully vectorized — no Python loops over samples.
     """
     all_seqs, p_true = dist.full_distribution()
     K = len(all_seqs)
     n = len(samples)
-
-    # Build empirical distribution
-    counts = defaultdict(int)
-    for s in samples:
-        counts[tuple(s.tolist())] += 1
-
-    q_emp = np.zeros(K)
-    for i in range(K):
-        q_emp[i] = counts.get(tuple(all_seqs[i].tolist()), 0) / n
     p_np = p_true.numpy()
+
+    # Pre-compute canonical index for all sequences
+    all_idx = _seq_to_idx(all_seqs)       # (K,) — canonical ordering
+    sample_idx = _seq_to_idx(samples)      # (n,)
+
+    # Build empirical distribution via bincount (vectorized)
+    raw_counts = np.bincount(sample_idx, minlength=V**L)
+    # Map from raw index space to canonical ordering
+    q_emp = raw_counts[all_idx] / n
 
     # Point estimates
     tv = np.sum(np.abs(p_np - q_emp)) / 2
@@ -488,44 +515,36 @@ def compute_metrics(samples, scores, dist):
     sr = spearmanr(scores_np[valid], true_lp[valid])[0] if valid.sum() > 10 else 0
 
     # ── Bootstrap CI for TV ──
-    tv_boots = []
-    for _ in range(BOOTSTRAP_K):
+    # Vectorized: multinomial resampling of counts
+    tv_boots = np.empty(BOOTSTRAP_K)
+    for b in range(BOOTSTRAP_K):
         idx = np.random.choice(n, size=n, replace=True)
-        boot_counts = defaultdict(int)
-        for i in idx:
-            boot_counts[tuple(samples[i].tolist())] += 1
-        q_boot = np.zeros(K)
-        for i in range(K):
-            q_boot[i] = boot_counts.get(tuple(all_seqs[i].tolist()), 0) / n
-        tv_boots.append(np.sum(np.abs(p_np - q_boot)) / 2)
-    tv_boots = np.array(tv_boots)
+        boot_counts = np.bincount(sample_idx[idx], minlength=V**L)
+        q_boot = boot_counts[all_idx] / n
+        tv_boots[b] = np.sum(np.abs(p_np - q_boot)) / 2
 
     # ── Ideal baseline: TV from sampling p_true directly ──
-    # (This is the irreducible estimation noise)
-    ideal_tvs = []
-    for _ in range(5):
+    ideal_tvs = np.empty(5)
+    for t in range(5):
         ideal_samples = dist.sample(n)
-        ideal_counts = defaultdict(int)
-        for s in ideal_samples:
-            ideal_counts[tuple(s.tolist())] += 1
-        q_ideal = np.zeros(K)
-        for i in range(K):
-            q_ideal[i] = ideal_counts.get(tuple(all_seqs[i].tolist()), 0) / n
-        ideal_tvs.append(np.sum(np.abs(p_np - q_ideal)) / 2)
-    baseline_tv = np.mean(ideal_tvs)
+        ideal_idx = _seq_to_idx(ideal_samples)
+        ideal_counts = np.bincount(ideal_idx, minlength=V**L)
+        q_ideal = ideal_counts[all_idx] / n
+        ideal_tvs[t] = np.sum(np.abs(p_np - q_ideal)) / 2
+    baseline_tv = ideal_tvs.mean()
 
     return {
         'tv': float(tv),
         'tv_ci_lo': float(np.percentile(tv_boots, 2.5)),
         'tv_ci_hi': float(np.percentile(tv_boots, 97.5)),
-        'tv_baseline': float(baseline_tv),  # irreducible noise
-        'tv_excess': float(tv - baseline_tv),  # policy-induced error
+        'tv_baseline': float(baseline_tv),
+        'tv_excess': float(tv - baseline_tv),
         'kl': float(kl),
         'mode_coverage': float(coverage),
         'spearman_r': float(sr),
         'mean_true_lp': float(true_lp.mean()),
-        'n_unique': int(len(counts)),
-        'support_coverage': float(len(counts) / K),
+        'n_unique': int(len(np.unique(sample_idx))),
+        'support_coverage': float(len(np.unique(sample_idx)) / K),
     }
 
 
@@ -559,15 +578,15 @@ def compute_mean_decode_order(orders_list):
     From decode orders (n_samples × L), compute mean rank for each position.
     orders[i, t] = position decoded at step t for sample i.
     Returns: array of shape (L,) where entry j = mean step at which position j was decoded.
+    Fully vectorized using scatter.
     """
     all_orders = torch.cat(orders_list, dim=0)  # (N, L)
     N = all_orders.shape[0]
     # Convert from "step→position" to "position→step"
+    # pos_ranks[b, pos] = step  where all_orders[b, step] = pos
     pos_ranks = torch.zeros(N, L)
-    for b in range(N):
-        for step in range(L):
-            pos = all_orders[b, step].item()
-            pos_ranks[b, pos] = step
+    steps = torch.arange(L).unsqueeze(0).expand(N, -1).float()  # (N, L)
+    pos_ranks.scatter_(1, all_orders.long(), steps)
     return pos_ranks.mean(dim=0).numpy()  # (L,)
 
 

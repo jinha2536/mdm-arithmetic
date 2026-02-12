@@ -30,7 +30,9 @@ Discrete Diffusion vs Autoregressive Models on Arithmetic Reasoning
 
 $$\theta_i = 10000^{-2i/d_{\text{head}}}$$
 
-position $t$에서 $(q_{2i}, q_{2i+1})$을 $\theta_i \cdot t$만큼 회전시킨다.
+position $t$에서 $(q_{2i}, q_{2i+1})$을 $\theta_i \cdot t$만큼 회전시킨다. LLaDA와 동일하게, causal mask만 제거하고 순수 RoPE를 사용한다 (추가 position embedding 없음).
+
+**RoPE + Diffusion 특성**: RoPE는 Q·K attention에만 위치 정보를 제공하며, token embedding 자체에는 위치를 부여하지 않는다. AR에서는 causal mask가 암묵적 위치 신호를 제공하지만, bidirectional diffusion에서는 이 신호가 없다. MASK 토큰들은 첫 번째 layer 입력에서 동일한 embedding을 가지며, attention weight의 상대 위치 정보만으로 구분되어야 한다. LLaDA (8B)에서는 이것이 충분히 작동하지만, 소규모 모델에서는 absolute PE 대비 성능 차이가 나타날 수 있으며, 이 자체가 분석 대상이다.
 
 **왜 둘 다 테스트하는가**: Absolute PE를 사용하면 "length generalisation failure"가 position encoding 한계인지 모델의 알고리즘적 한계인지 구분할 수 없다. RoPE를 병렬 테스트함으로써 이 confound를 분리한다.
 
@@ -46,8 +48,8 @@ position $t$에서 $(q_{2i}, q_{2i+1})$을 $\theta_i \cdot t$만큼 회전시킨
 
 | 파라미터 | 모듈 1-2 | 모듈 3 |
 |----------|---------|--------|
-| Max iterations/epochs | 15,000 iter | 60 epoch |
-| Patience | 2,000 iter | 8 epoch |
+| Max iterations/epochs | 20,000 iter | 60 epoch |
+| Patience | 3,000 iter | 8 epoch |
 | Min delta | 1e-4 | 1e-4 |
 | 중단 시 | best 시점의 weight로 복원 | best 시점의 weight로 복원 |
 
@@ -109,13 +111,12 @@ Seed를 고정(0)하여 held-out set의 재현성을 보장한다. 중복 operan
 
 ### 데이터 분할
 
-**Multi-digit scaling**: 3가지 자릿수에서 실험한다. 3자리에서 accuracy가 ~1.0에 포화되므로, 5자리/7자리로 난이도를 올려 AR과 diffusion의 차이가 드러나는 경계를 찾는다.
+**Multi-digit scaling**: 2가지 자릿수에서 실험한다. 3자리에서 accuracy가 ~1.0에 포화되므로, 5자리로 난이도를 올려 AR과 diffusion의 차이가 드러나는 경계를 찾는다. (7자리 실험 결과, 5자리와 동일한 경향을 보여 제외.)
 
 | nd | N_train | N_test | OOD 종류 | 비고 |
 |----|---------|--------|---------|------|
 | 3  | 10,000  | 2,000  | Number-level + Length | 논문 비교용 |
-| 5  | 30,000  | 2,000  | Length only | 난이도 확장 |
-| 7  | 50,000  | 2,000  | Length only | 가장 어려운 조건 |
+| 5  | 50,000  | 2,000  | Length only | 난이도 확장 |
 
 **3자리 splits** (Lee et al. 2023 비교):
 
@@ -126,19 +127,19 @@ Seed를 고정(0)하여 held-out set의 재현성을 보장한다. 중복 operan
 | test_ood_number | 3 | ≥1개가 HELD_OUT (100개) | 2,000 | Number-level 일반화 |
 | test_ood_length | 4 | 제약 없음 (0-9999) | 2,000 | Length 일반화 |
 
-**5자리/7자리 splits**: Operand space가 너무 커서 number-level holdout이 의미 없으므로, uniform random sampling + length OOD만 테스트.
+**5자리 splits**: Operand space가 너무 커서 (10^5) number-level holdout이 의미 없으므로, uniform random sampling + length OOD만 테스트.
 
 | Split | 자릿수 | N | 테스트 대상 |
 |-------|--------|---|-----------|
-| train | nd | 위 표 참조 | — |
-| test_id | nd | 2,000 | ID 정확도 |
-| test_ood_length | nd+2 | 2,000 | Length 일반화 |
+| train | 5 | 50,000 | — |
+| test_id | 5 | 2,000 | ID 정확도 |
+| test_ood_length | 7 | 2,000 | Length 일반화 |
 
 ### 실험 조건
 
-3(digit_config) × 2(objective) × 3(format) × 2(pos_enc) = **36 configurations**
+2(digit_config) × 2(objective) × 3(format) × 2(pos_enc) = **24 configurations**
 
-{3d, 5d, 7d} × {ar, diffusion} × {plain, reverse, scratchpad} × {absolute, rope}
+{3d, 5d} × {ar, diffusion} × {plain, reverse, scratchpad} × {absolute, rope}
 
 ### 평가 지표
 
@@ -175,7 +176,7 @@ Diffusion의 scratchpad이 AR의 chain-of-thought과 기능적으로 동일한�
 - 만약 carry 위치를 늦게 확정하면 → carry 전파를 인식하고 있다는 증거
 - 만약 format (plain/reverse/scratchpad)에 따라 fixation order가 달라지면 → format이 학습된 알고리즘에 영향을 줌
 
-이 분석은 각 digit 설정 (3d/5d/7d)에서 독립적으로 수행되며, 자릿수가 늘어남에 따라 패턴이 어떻게 변하는지도 관찰한다.
+이 분석은 각 digit 설정 (3d/5d)에서 독립적으로 수행되며, 자릿수가 늘어남에 따라 패턴이 어떻게 변하는지도 관찰한다.
 
 **Convergence Iteration**: 각 configuration이 수렴한 iteration. Training budget의 공정성을 확인한다.
 
@@ -477,10 +478,11 @@ $$I(X_i; X_j) = \sum_{v_i, v_j} p(X_i=v_i, X_j=v_j) \log \frac{p(X_i=v_i, X_j=v_
 
 ### 모듈 1
 
-- **Difficulty Curve**: nd별 ID accuracy 곡선. AR vs diffusion이 갈라지는 지점.
+- **Difficulty Curve**: nd별 (3d, 5d) ID accuracy 곡선. AR vs diffusion이 갈라지는 지점.
 - **Accuracy by Split (per nd)**: 각 자릿수별 bar chart. AR(빨강) vs diffusion(파랑), hatched=RoPE.
 - **Fixation Order**: Diffusion이 답의 각 자릿수를 확정하는 순서. MSB부터인지 LSB부터인지.
 - **Fixation × Format 비교**: plain/reverse/scratchpad에서 fixation order가 어떻게 달라지는지.
+- **Digit-Position Exclusion**: LSB/tens/MSB 위치별로 digit 5를 제외했을 때 AR vs diffusion 비교.
 
 ### 모듈 2
 
