@@ -173,7 +173,11 @@ def train_model(
 
             else:  # diffusion
                 pos = torch.arange(T, device=device).unsqueeze(0)
-                ans_mask = (pos >= ans_starts.unsqueeze(1)) & (ids != pad_id)
+                # Include ALL positions after ans_start (including PAD)
+                # so the model learns to predict PAD tokens at the right positions.
+                # This is critical for variable-length outputs: the model must learn
+                # "answer content goes here, PAD goes there".
+                ans_mask = pos >= ans_starts.unsqueeze(1)
                 # random mask ratio per sample
                 t_ratio = torch.rand(B, device=device)
                 m_probs = t_ratio.unsqueeze(1) * ans_mask.float()
@@ -249,7 +253,8 @@ def generate_ar(model, prefix_ids, n_tokens, device=None):
 @torch.no_grad()
 def generate_diffusion(model, prefix_ids, n_tokens, mask_id,
                        policy='confidence', greedy=True,
-                       parallel_k=1, device=None):
+                       parallel_k=1, pad_to=None, pad_id=None,
+                       device=None):
     """
     Masked diffusion generation.
 
@@ -258,6 +263,10 @@ def generate_diffusion(model, prefix_ids, n_tokens, mask_id,
                 if False, sample from softmax.
         policy: position selection strategy.
         parallel_k: tokens per step for parallel_* policies.
+        pad_to: if given, pad sequence to this total length with pad_id
+                to match training-time sequence length (critical for
+                bidirectional attention).
+        pad_id: token id used for padding.
 
     Returns: (sequences, log_probs, decode_info)
         decode_info['orders']: (B, n_tokens) position indices in decode order
@@ -268,12 +277,26 @@ def generate_diffusion(model, prefix_ids, n_tokens, mask_id,
     model.eval()
     B = prefix_ids.shape[0]
     T_pre = prefix_ids.shape[1]
-    T = T_pre + n_tokens
+    T_ans = n_tokens
+    T = T_pre + T_ans
 
     x = torch.full((B, T), mask_id, dtype=torch.long, device=device)
     x[:, :T_pre] = prefix_ids.to(device)
     unmasked = torch.zeros(B, T, dtype=torch.bool, device=device)
     unmasked[:, :T_pre] = True
+
+    # Pad to training length for consistent bidirectional attention
+    if pad_to is not None and pad_to > T:
+        assert pad_id is not None, "pad_id required when pad_to is set"
+        n_pad = pad_to - T
+        pad_block = torch.full((B, n_pad), pad_id,
+                               dtype=torch.long, device=device)
+        x = torch.cat([x, pad_block], dim=1)
+        pad_mask = torch.ones(B, n_pad, dtype=torch.bool, device=device)
+        unmasked = torch.cat([unmasked, pad_mask], dim=1)
+        T_total = pad_to
+    else:
+        T_total = T
 
     scores = torch.zeros(B, device=device)
     orders = []

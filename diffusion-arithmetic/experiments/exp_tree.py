@@ -52,12 +52,12 @@ PATIENCE    = 2_000
 POS_ENCS    = ['absolute', 'rope']
 
 # Diffusion decode strategies to compare
-# (policy, parallel_k_fn, label)
-#   parallel_k_fn takes ans_len and returns parallel_k
+# (policy, parallel_k, label)
+#   parallel_k: tokens per step (clamped to actual decode length)
 DIFF_STRATEGIES = [
-    ('confidence',          lambda al: 1,          'seq'),
-    ('parallel_confidence', lambda al: ANS_WIDTH,  'par_seg'),
-    ('parallel_confidence', lambda al: al,         'par_all'),
+    ('confidence',          1,          'seq'),
+    ('parallel_confidence', ANS_WIDTH,  'par_seg'),
+    ('parallel_confidence', 9999,       'par_all'),   # clamped to n_decode
 ]
 
 
@@ -167,12 +167,19 @@ def analyse_parallel_decode(decode_orders, ans_start, k,
 
 def evaluate_parallel(model, tokenizer, test_samples, objective, k,
                       policy='confidence', parallel_k=1,
-                      batch_size=128):
+                      max_len=None, batch_size=128):
     """
     Evaluate with configurable decode strategy.
-    Returns exact_match, segment_accuracy, n_steps, parallelism.
+
+    For diffusion: masks the ENTIRE region after prefix (not just ans_len).
+    The model must decode both answer tokens AND PAD tokens, proving it
+    has learned the correct output length. This matches training where
+    PAD positions are included in the diffusion loss.
+
+    max_len: training-time total sequence length.
     """
     mask_id = tokenizer.special_ids['mask']
+    pad_id = tokenizer.special_ids['pad']
     model.eval()
 
     ex = test_samples[0]
@@ -192,8 +199,7 @@ def evaluate_parallel(model, tokenizer, test_samples, objective, k,
         penc = [tokenizer.encode(s.split('=')[0] + '=')
                 for s in batch]
         pmax = max(len(p) for p in penc)
-        pids = torch.full((B, pmax), tokenizer.special_ids['pad'],
-                          dtype=torch.long)
+        pids = torch.full((B, pmax), pad_id, dtype=torch.long)
         for i, e in enumerate(penc):
             pids[i, :len(e)] = torch.tensor(e)
 
@@ -204,13 +210,18 @@ def evaluate_parallel(model, tokenizer, test_samples, objective, k,
                 batch_orders = None
                 batch_steps = ans_len
             else:
+                # Decode ENTIRE remaining region (answer + PAD)
+                n_decode = max_len - pmax if max_len else ans_len
+                # Adjust parallel_k for par_all: decode all at once
+                pk = min(parallel_k, n_decode)
                 gen, _, info = generate_diffusion(
-                    model, pids, ans_len, mask_id,
+                    model, pids, n_decode, mask_id,
                     policy=policy, greedy=True,
-                    parallel_k=parallel_k, device=DEVICE)
+                    parallel_k=pk, device=DEVICE)
+                # Extract only the answer portion
                 pred_ids = gen[:, pmax:pmax + ans_len]
                 batch_orders = info.get('orders')
-                batch_steps = info.get('n_steps', ans_len)
+                batch_steps = info.get('n_steps', n_decode)
 
         total_steps += batch_steps
         n_batches += 1
@@ -287,24 +298,22 @@ def run():
 
             # Determine which decode strategies to test
             if objective == 'ar':
-                strategies = [('confidence', lambda al: 1, 'ar')]
+                strategies = [('confidence', 1, 'ar')]
             else:
                 strategies = DIFF_STRATEGIES
 
-            for policy, pk_fn, strat_label in strategies:
+            for policy, pk, strat_label in strategies:
                 key = f"{objective}_{strat_label}_{pos_enc}"
                 print(f"\n  ▸ Evaluating: {key}")
                 all_results[key] = {}
 
                 for split_name, test_data in test_splits.items():
                     k_val = int(split_name.split('k')[1])
-                    ex = test_data[0]
-                    ans_len = len(tok.encode(get_answer(ex)))
-                    pk = pk_fn(ans_len)
 
                     res = evaluate_parallel(
                         model, tok, test_data, objective,
-                        k_val, policy=policy, parallel_k=pk)
+                        k_val, policy=policy, parallel_k=pk,
+                        max_len=max_len)
 
                     all_results[key][split_name] = \
                         res['exact_match']
