@@ -449,17 +449,11 @@ def decode_sequential(model, n, policy='confidence', track_order=False):
 @torch.no_grad()
 def decode_low_var_oracle(model, n, dist, track_order=True):
     """
-    Oracle policy: at each step, decode the position whose conditional
-    probability has the LOWEST epistemic variance — meaning its prediction
-    is most stable regardless of what other positions turn out to be.
-
-    Uses ground-truth p_true (oracle) to compute exact variance,
-    but still uses the MODEL to generate actual tokens.
-
-    epistemic_var[t] = (1/|R|) Σ_{j∈R} Σ_w p(x_j=w|C) ×
-                       Σ_v (p(x_t=v|C,x_j=w) - p(x_t=v|C))²
-
-    Low variance → prediction stable → safe to decode now.
+    Oracle policy: lowest epistemic variance position first.
+    OPTIMISED: groups samples by unique decoded context,
+    computes variance once per group instead of per sample.
+    At step 0 all samples share one context → 1 computation.
+    At step k, at most V^k unique contexts.
     """
     all_seqs, p_true = dist.full_distribution()
     all_seqs_np = all_seqs.numpy()
@@ -470,81 +464,93 @@ def decode_low_var_oracle(model, n, dist, track_order=True):
     scores = torch.zeros(n, device=DEVICE)
     orders = torch.zeros(n, L, dtype=torch.long, device=DEVICE) if track_order else None
 
+    # Track decoded values per sample
+    decoded = np.full((n, L), -1, dtype=np.int64)
+
+    def _oracle_best_pos(obs_mask, obs_vals):
+        """Compute lowest-variance position for a single context."""
+        masked_pos = np.where(~obs_mask)[0]
+        if len(masked_pos) <= 1:
+            return int(masked_pos[0]) if len(masked_pos) == 1 else 0
+
+        # Filter sequences consistent with observed values
+        match = np.ones(len(p_np), dtype=bool)
+        for j in np.where(obs_mask)[0]:
+            match &= (all_seqs_np[:, j] == obs_vals[j])
+        p_ctx = p_np[match]
+        if p_ctx.sum() < 1e-20:
+            return int(masked_pos[0])
+        seqs_ctx = all_seqs_np[match]
+        p_ctx_norm = p_ctx / p_ctx.sum()
+
+        # Marginals
+        marginals = {}
+        for t in masked_pos:
+            m = np.zeros(V)
+            for v in range(V):
+                m[v] = p_ctx_norm[seqs_ctx[:, t] == v].sum()
+            marginals[t] = m
+
+        # Epistemic variance
+        best_t, best_var = masked_pos[0], float('inf')
+        for t in masked_pos:
+            total_var = 0.0
+            n_other = 0
+            for j in masked_pos:
+                if j == t:
+                    continue
+                for w in range(V):
+                    cond_mask = seqs_ctx[:, j] == w
+                    p_jw = p_ctx_norm[cond_mask].sum()
+                    if p_jw < 1e-15:
+                        continue
+                    cond_t = np.zeros(V)
+                    for v in range(V):
+                        cond_t[v] = p_ctx_norm[
+                            cond_mask & (seqs_ctx[:, t] == v)].sum()
+                    cond_t /= p_jw
+                    total_var += p_jw * ((cond_t - marginals[t]) ** 2).sum()
+                n_other += 1
+            evar = total_var / max(n_other, 1)
+            if evar < best_var:
+                best_var = evar
+                best_t = t
+        return int(best_t)
+
     for step in range(L):
         logits = model(x)
         logits[:, :, MASK_ID] = -float('inf')
 
-        # For each sample, compute oracle order
-        # (batch: same order for all samples at each step? No — context differs)
-        # For efficiency, compute per-sample using their specific decoded values
-        best_pos = torch.zeros(n, dtype=torch.long, device=DEVICE)
-
+        # Group samples by unique context (decoded positions + values)
+        # Key = tuple of (position, value) pairs for decoded positions
+        context_groups = {}  # key → list of sample indices
         for b in range(n):
-            decoded_mask = unmasked[b].cpu().numpy()
-            decoded_vals = x[b].cpu().numpy()
-            masked_pos = np.where(~decoded_mask)[0]
+            obs_mask = decoded[b] >= 0
+            key = tuple(decoded[b, j] for j in range(L) if obs_mask[j])
+            if key not in context_groups:
+                context_groups[key] = []
+            context_groups[key].append(b)
 
-            if len(masked_pos) == 1:
-                best_pos[b] = int(masked_pos[0])
-                continue
+        # Compute oracle order ONCE per unique context
+        best_pos = np.zeros(n, dtype=np.int64)
+        for key, indices in context_groups.items():
+            rep = indices[0]  # representative sample
+            obs_mask = decoded[rep] >= 0
+            bp = _oracle_best_pos(obs_mask, decoded[rep])
+            for b in indices:
+                best_pos[b] = bp
 
-            # Filter sequences matching decoded context
-            match = np.ones(len(p_np), dtype=bool)
-            for pos in np.where(decoded_mask)[0]:
-                match &= (all_seqs_np[:, pos] == decoded_vals[pos])
-            p_ctx = p_np[match]
-            seqs_ctx = all_seqs_np[match]
-
-            if p_ctx.sum() < 1e-20:
-                best_pos[b] = int(masked_pos[0])
-                continue
-            p_ctx_norm = p_ctx / p_ctx.sum()
-
-            # Marginal for each masked position
-            marginals = {}
-            for t in masked_pos:
-                m = np.zeros(V)
-                for v in range(V):
-                    m[v] = p_ctx_norm[seqs_ctx[:, t] == v].sum()
-                marginals[t] = m
-
-            # Epistemic variance for each masked position t
-            evar = {}
-            for t in masked_pos:
-                total_var = 0.0
-                n_other = 0
-                for j in masked_pos:
-                    if j == t:
-                        continue
-                    # p(x_t | C, x_j=w) for each w
-                    for w in range(V):
-                        cond_mask = seqs_ctx[:, j] == w
-                        p_jw = p_ctx_norm[cond_mask].sum()
-                        if p_jw < 1e-15:
-                            continue
-                        # p(x_t = v | C, x_j=w)
-                        cond_t = np.zeros(V)
-                        for v in range(V):
-                            cond_t[v] = p_ctx_norm[cond_mask & (seqs_ctx[:, t] == v)].sum()
-                        cond_t /= p_jw
-                        # Squared deviation from marginal
-                        diff_sq = ((cond_t - marginals[t]) ** 2).sum()
-                        total_var += p_jw * diff_sq
-                    n_other += 1
-                evar[t] = total_var / max(n_other, 1)
-
-            # Choose position with lowest epistemic variance
-            best_t = min(masked_pos, key=lambda t: evar[t])
-            best_pos[b] = int(best_t)
-
+        pos = torch.tensor(best_pos, dtype=torch.long, device=DEVICE)
         if track_order:
-            orders[:, step] = best_pos
+            orders[:, step] = pos
 
-        lp = logits[torch.arange(n, device=DEVICE), best_pos]
+        lp = logits[torch.arange(n, device=DEVICE), pos]
         tok = torch.multinomial(F.softmax(lp, dim=-1), 1).squeeze(-1)
-        scores += F.log_softmax(lp, dim=-1)[torch.arange(n, device=DEVICE), tok]
-        x[torch.arange(n, device=DEVICE), best_pos] = tok
-        unmasked[torch.arange(n, device=DEVICE), best_pos] = True
+        scores += F.log_softmax(lp, dim=-1)[
+            torch.arange(n, device=DEVICE), tok]
+        x[torch.arange(n, device=DEVICE), pos] = tok
+        unmasked[torch.arange(n, device=DEVICE), pos] = True
+        decoded[np.arange(n), best_pos] = tok.cpu().numpy()
 
     return x.cpu(), scores.cpu(), (orders.cpu() if track_order else None)
 
@@ -552,33 +558,23 @@ def decode_low_var_oracle(model, n, dist, track_order=True):
 @torch.no_grad()
 def decode_low_var_model(model, n, track_order=True):
     """
-    Model-based epistemic variance policy. At each step:
-
-    1. Forward pass → p(x_t | current_x) for all masked t
-    2. For each masked t, perturb each OTHER masked position j:
-       set x_j = w for each w ∈ {0,...,V-1}, forward pass,
-       get p(x_t | current_x with x_j=w)
-    3. epistemic_var[t] = Σ_j Σ_w p(j=w) * ||p(t|x,j=w) - p(t|x)||²
-    4. Decode position with lowest epistemic_var
-
-    Requires V × |masked_other| extra forward passes per step.
-    For toy setting: max 4 × 7 = 28 per candidate = feasible.
+    Model-based epistemic variance policy.
+    OPTIMISED: uses small sub-batch (32) for perturbation variance
+    estimation, then applies determined order to full batch.
     """
+    N_PERT = min(n, 32)  # only need small batch for variance estimation
+
     x = torch.full((n, L), MASK_ID, dtype=torch.long, device=DEVICE)
     unmasked = torch.zeros(n, L, dtype=torch.bool, device=DEVICE)
     scores = torch.zeros(n, device=DEVICE)
     orders = torch.zeros(n, L, dtype=torch.long, device=DEVICE) if track_order else None
 
     for step in range(L):
-        logits_base = model(x)                        # (n, L, V+1)
+        logits_base = model(x)
         logits_base[:, :, MASK_ID] = -float('inf')
-        probs_base = F.softmax(logits_base, dim=-1)   # (n, L, V)
+        probs_base = F.softmax(logits_base, dim=-1)
 
-        # masked positions (same for all samples in batch)
-        # Actually positions can differ per sample. For efficiency,
-        # use a common mask (they start the same and diverge).
-        # Process sample 0 to determine order, apply to all.
-        # (Approximation: batch shares order. Fine for 500K samples.)
+        # Use sample 0's mask to determine positions (batch shares order)
         b0_unmasked = unmasked[0]
         masked_pos = (~b0_unmasked).nonzero(as_tuple=True)[0].cpu().tolist()
 
@@ -586,35 +582,28 @@ def decode_low_var_model(model, n, track_order=True):
             pos = torch.tensor(masked_pos[0] if masked_pos else 0,
                                device=DEVICE).expand(n)
         else:
-            # Base predictions for masked positions: (n, |masked|, V)
-            base_preds = probs_base[:, masked_pos, :V]  # exclude MASK dim
+            # Small sub-batch for perturbation variance estimation
+            x_small = x[:N_PERT]
+            probs_small = probs_base[:N_PERT]
 
-            # Epistemic variance for each masked position t
             evar = torch.zeros(len(masked_pos), device=DEVICE)
-
             for i, t in enumerate(masked_pos):
-                var_accum = torch.zeros(n, device=DEVICE)
+                var_accum = torch.zeros(N_PERT, device=DEVICE)
                 n_other = 0
-                for j_idx, j in enumerate(masked_pos):
+                for j in masked_pos:
                     if j == t:
                         continue
-                    # p(x_j = w) from base model
-                    p_j = probs_base[0, j, :V]  # (V,) — use sample 0
-
+                    p_j = probs_small[0, j, :V]
                     for w in range(V):
                         if p_j[w] < 1e-6:
                             continue
-                        # Perturb: set position j to value w
-                        x_pert = x.clone()
+                        x_pert = x_small.clone()
                         x_pert[:, j] = w
                         logits_pert = model(x_pert)
                         logits_pert[:, :, MASK_ID] = -float('inf')
                         probs_pert = F.softmax(logits_pert, dim=-1)
-
-                        # p(x_t | perturbed) vs p(x_t | base)
-                        diff = probs_pert[:, t, :V] - probs_base[:, t, :V]
-                        diff_sq = (diff ** 2).sum(-1)  # (n,)
-                        var_accum += p_j[w] * diff_sq
+                        diff = probs_pert[:, t, :V] - probs_small[:, t, :V]
+                        var_accum += p_j[w] * (diff ** 2).sum(-1)
                     n_other += 1
                 evar[i] = var_accum.mean() / max(n_other, 1)
 
@@ -1555,7 +1544,7 @@ def run():
         # Oracle: uses ground truth distribution for exact variance
         print(f"\n    -- Epistemic Variance Policies --")
         # Use fewer samples for oracle (expensive per-sample computation)
-        N_VAR_SAMPLES = min(N_SAMPLES, 10_000)
+        N_VAR_SAMPLES = min(N_SAMPLES, 2_000)  # reduced from 10K — oracle+model too slow
         t0 = time.time()
         samples, scores, orders_list = [], [], []
         for start in range(0, N_VAR_SAMPLES, BATCH_SIZE):
