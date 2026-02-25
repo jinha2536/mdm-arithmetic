@@ -403,6 +403,34 @@ def decode_sequential(model, n, policy='confidence', track_order=False):
             pos = torch.full((n,), t, dtype=torch.long, device=DEVICE)
         elif policy == 'r2l':
             pos = torch.full((n,), L-1-t, dtype=torch.long, device=DEVICE)
+        elif policy == 'entropy_adj':
+            # Zero-cost proxy: confidence penalised by entropy
+            # High confidence + low entropy = genuinely easy (decode first)
+            # High confidence + high entropy = misleading (defer)
+            max_p = probs.max(-1).values.clone()
+            ent = -(probs*(probs+1e-10).log()).sum(-1)
+            sc = max_p * (1.0 - ent / math.log(V))  # ∈ [0, 1]
+            sc[unmasked] = -1
+            pos = sc.argmax(-1)
+        elif policy == 'single_perturb':
+            # 1-extra-forward-pass variance estimate
+            # Fill all masked positions with samples, re-forward,
+            # compare → positions that change are unstable
+            max_p_base = probs.max(-1).values.clone()  # (n, L)
+            x_pert = x.clone()
+            masked = ~unmasked
+            for j in range(L):
+                m_j = masked[:, j]
+                if m_j.any():
+                    toks = torch.multinomial(probs[m_j, j], 1).squeeze(-1)
+                    x_pert[m_j, j] = toks
+            logits_pert = model(x_pert)
+            logits_pert[:, :, MASK_ID] = -float('inf')
+            max_p_pert = F.softmax(logits_pert, dim=-1).max(-1).values
+            # Instability = |confidence_base - confidence_perturbed|
+            instab = (max_p_base - max_p_pert).abs()
+            instab[unmasked] = float('inf')
+            pos = instab.argmin(-1)  # most stable = least change
         else:
             raise ValueError(policy)
 
@@ -410,6 +438,194 @@ def decode_sequential(model, n, policy='confidence', track_order=False):
             orders[:, t] = pos
 
         lp = logits[torch.arange(n, device=DEVICE), pos]
+        tok = torch.multinomial(F.softmax(lp, dim=-1), 1).squeeze(-1)
+        scores += F.log_softmax(lp, dim=-1)[torch.arange(n, device=DEVICE), tok]
+        x[torch.arange(n, device=DEVICE), pos] = tok
+        unmasked[torch.arange(n, device=DEVICE), pos] = True
+
+    return x.cpu(), scores.cpu(), (orders.cpu() if track_order else None)
+
+
+@torch.no_grad()
+def decode_low_var_oracle(model, n, dist, track_order=True):
+    """
+    Oracle policy: at each step, decode the position whose conditional
+    probability has the LOWEST epistemic variance — meaning its prediction
+    is most stable regardless of what other positions turn out to be.
+
+    Uses ground-truth p_true (oracle) to compute exact variance,
+    but still uses the MODEL to generate actual tokens.
+
+    epistemic_var[t] = (1/|R|) Σ_{j∈R} Σ_w p(x_j=w|C) ×
+                       Σ_v (p(x_t=v|C,x_j=w) - p(x_t=v|C))²
+
+    Low variance → prediction stable → safe to decode now.
+    """
+    all_seqs, p_true = dist.full_distribution()
+    all_seqs_np = all_seqs.numpy()
+    p_np = p_true.numpy()
+
+    x = torch.full((n, L), MASK_ID, dtype=torch.long, device=DEVICE)
+    unmasked = torch.zeros(n, L, dtype=torch.bool, device=DEVICE)
+    scores = torch.zeros(n, device=DEVICE)
+    orders = torch.zeros(n, L, dtype=torch.long, device=DEVICE) if track_order else None
+
+    for step in range(L):
+        logits = model(x)
+        logits[:, :, MASK_ID] = -float('inf')
+
+        # For each sample, compute oracle order
+        # (batch: same order for all samples at each step? No — context differs)
+        # For efficiency, compute per-sample using their specific decoded values
+        best_pos = torch.zeros(n, dtype=torch.long, device=DEVICE)
+
+        for b in range(n):
+            decoded_mask = unmasked[b].cpu().numpy()
+            decoded_vals = x[b].cpu().numpy()
+            masked_pos = np.where(~decoded_mask)[0]
+
+            if len(masked_pos) == 1:
+                best_pos[b] = int(masked_pos[0])
+                continue
+
+            # Filter sequences matching decoded context
+            match = np.ones(len(p_np), dtype=bool)
+            for pos in np.where(decoded_mask)[0]:
+                match &= (all_seqs_np[:, pos] == decoded_vals[pos])
+            p_ctx = p_np[match]
+            seqs_ctx = all_seqs_np[match]
+
+            if p_ctx.sum() < 1e-20:
+                best_pos[b] = int(masked_pos[0])
+                continue
+            p_ctx_norm = p_ctx / p_ctx.sum()
+
+            # Marginal for each masked position
+            marginals = {}
+            for t in masked_pos:
+                m = np.zeros(V)
+                for v in range(V):
+                    m[v] = p_ctx_norm[seqs_ctx[:, t] == v].sum()
+                marginals[t] = m
+
+            # Epistemic variance for each masked position t
+            evar = {}
+            for t in masked_pos:
+                total_var = 0.0
+                n_other = 0
+                for j in masked_pos:
+                    if j == t:
+                        continue
+                    # p(x_t | C, x_j=w) for each w
+                    for w in range(V):
+                        cond_mask = seqs_ctx[:, j] == w
+                        p_jw = p_ctx_norm[cond_mask].sum()
+                        if p_jw < 1e-15:
+                            continue
+                        # p(x_t = v | C, x_j=w)
+                        cond_t = np.zeros(V)
+                        for v in range(V):
+                            cond_t[v] = p_ctx_norm[cond_mask & (seqs_ctx[:, t] == v)].sum()
+                        cond_t /= p_jw
+                        # Squared deviation from marginal
+                        diff_sq = ((cond_t - marginals[t]) ** 2).sum()
+                        total_var += p_jw * diff_sq
+                    n_other += 1
+                evar[t] = total_var / max(n_other, 1)
+
+            # Choose position with lowest epistemic variance
+            best_t = min(masked_pos, key=lambda t: evar[t])
+            best_pos[b] = int(best_t)
+
+        if track_order:
+            orders[:, step] = best_pos
+
+        lp = logits[torch.arange(n, device=DEVICE), best_pos]
+        tok = torch.multinomial(F.softmax(lp, dim=-1), 1).squeeze(-1)
+        scores += F.log_softmax(lp, dim=-1)[torch.arange(n, device=DEVICE), tok]
+        x[torch.arange(n, device=DEVICE), best_pos] = tok
+        unmasked[torch.arange(n, device=DEVICE), best_pos] = True
+
+    return x.cpu(), scores.cpu(), (orders.cpu() if track_order else None)
+
+
+@torch.no_grad()
+def decode_low_var_model(model, n, track_order=True):
+    """
+    Model-based epistemic variance policy. At each step:
+
+    1. Forward pass → p(x_t | current_x) for all masked t
+    2. For each masked t, perturb each OTHER masked position j:
+       set x_j = w for each w ∈ {0,...,V-1}, forward pass,
+       get p(x_t | current_x with x_j=w)
+    3. epistemic_var[t] = Σ_j Σ_w p(j=w) * ||p(t|x,j=w) - p(t|x)||²
+    4. Decode position with lowest epistemic_var
+
+    Requires V × |masked_other| extra forward passes per step.
+    For toy setting: max 4 × 7 = 28 per candidate = feasible.
+    """
+    x = torch.full((n, L), MASK_ID, dtype=torch.long, device=DEVICE)
+    unmasked = torch.zeros(n, L, dtype=torch.bool, device=DEVICE)
+    scores = torch.zeros(n, device=DEVICE)
+    orders = torch.zeros(n, L, dtype=torch.long, device=DEVICE) if track_order else None
+
+    for step in range(L):
+        logits_base = model(x)                        # (n, L, V+1)
+        logits_base[:, :, MASK_ID] = -float('inf')
+        probs_base = F.softmax(logits_base, dim=-1)   # (n, L, V)
+
+        # masked positions (same for all samples in batch)
+        # Actually positions can differ per sample. For efficiency,
+        # use a common mask (they start the same and diverge).
+        # Process sample 0 to determine order, apply to all.
+        # (Approximation: batch shares order. Fine for 500K samples.)
+        b0_unmasked = unmasked[0]
+        masked_pos = (~b0_unmasked).nonzero(as_tuple=True)[0].cpu().tolist()
+
+        if len(masked_pos) <= 1:
+            pos = torch.tensor(masked_pos[0] if masked_pos else 0,
+                               device=DEVICE).expand(n)
+        else:
+            # Base predictions for masked positions: (n, |masked|, V)
+            base_preds = probs_base[:, masked_pos, :V]  # exclude MASK dim
+
+            # Epistemic variance for each masked position t
+            evar = torch.zeros(len(masked_pos), device=DEVICE)
+
+            for i, t in enumerate(masked_pos):
+                var_accum = torch.zeros(n, device=DEVICE)
+                n_other = 0
+                for j_idx, j in enumerate(masked_pos):
+                    if j == t:
+                        continue
+                    # p(x_j = w) from base model
+                    p_j = probs_base[0, j, :V]  # (V,) — use sample 0
+
+                    for w in range(V):
+                        if p_j[w] < 1e-6:
+                            continue
+                        # Perturb: set position j to value w
+                        x_pert = x.clone()
+                        x_pert[:, j] = w
+                        logits_pert = model(x_pert)
+                        logits_pert[:, :, MASK_ID] = -float('inf')
+                        probs_pert = F.softmax(logits_pert, dim=-1)
+
+                        # p(x_t | perturbed) vs p(x_t | base)
+                        diff = probs_pert[:, t, :V] - probs_base[:, t, :V]
+                        diff_sq = (diff ** 2).sum(-1)  # (n,)
+                        var_accum += p_j[w] * diff_sq
+                    n_other += 1
+                evar[i] = var_accum.mean() / max(n_other, 1)
+
+            best_idx = evar.argmin().item()
+            pos = torch.tensor(masked_pos[best_idx],
+                               device=DEVICE).expand(n)
+
+        if track_order:
+            orders[:, step] = pos
+
+        lp = logits_base[torch.arange(n, device=DEVICE), pos]
         tok = torch.multinomial(F.softmax(lp, dim=-1), 1).squeeze(-1)
         scores += F.log_softmax(lp, dim=-1)[torch.arange(n, device=DEVICE), tok]
         x[torch.arange(n, device=DEVICE), pos] = tok
@@ -855,7 +1071,280 @@ def compute_detailed_analysis(samples, dist):
     return result
 
 
-# ── Main ────────────────────────────────────────────
+@torch.no_grad()
+def compute_initial_confidence_profile(model):
+    """
+    Forward pass with ALL positions masked → model's "prior" confidence.
+
+    Returns per-position: max_prob, entropy, predicted_mode.
+    This reveals what confidence policy "sees" at step 0:
+    if a position has peaked marginal → high confidence even without context.
+    """
+    x = torch.full((1, L), MASK_ID, dtype=torch.long, device=DEVICE)
+    logits = model(x)
+    logits[:, :, MASK_ID] = -float('inf')
+    probs = F.softmax(logits, dim=-1).squeeze(0)   # (L, V)
+
+    max_prob = probs.max(-1).values.cpu().numpy()   # confidence score
+    entropy = -(probs * (probs + 1e-10).log()).sum(-1).cpu().numpy()
+    mode = probs.argmax(-1).cpu().numpy()
+
+    # Rank: which position would confidence decode first?
+    confidence_rank = np.argsort(-max_prob)  # positions sorted by confidence
+    return {
+        'max_prob': max_prob.tolist(),
+        'entropy': entropy.tolist(),
+        'mode': mode.tolist(),
+        'confidence_order': confidence_rank.tolist(),  # position decoded 1st, 2nd, ...
+    }
+
+
+def compute_true_conditional_entropy_profile(dist):
+    """
+    For each position t, compute:
+    - H(X_t) = marginal entropy (decode without any context)
+    - H(X_t | X_{<t}) = average conditional entropy in l2r order
+
+    The gap H(X_t) - H(X_t | X_{<t}) measures how much context helps.
+    If confidence tracks H(X_t), it may choose "peaked marginal" positions
+    first, even when H(X_t | context) is much lower elsewhere.
+    """
+    all_seqs, p_true = dist.full_distribution()
+    p_np = p_true.numpy()
+    S = all_seqs.numpy()
+    eps = 1e-30
+
+    # Marginal entropy per position
+    marginal_H = []
+    for i in range(L):
+        m = np.zeros(V)
+        for v in range(V):
+            m[v] = p_np[S[:, i] == v].sum()
+        h = -sum(m[v] * np.log(m[v] + eps) for v in range(V) if m[v] > eps)
+        marginal_H.append(float(h))
+
+    # Conditional entropy H(X_t | X_0, ..., X_{t-1}) in l2r order
+    # = E_{x_{<t}} [ H(X_t | x_{<t}) ]
+    cond_H_l2r = [marginal_H[0]]  # position 0 has no context
+    for t in range(1, L):
+        # Group sequences by their prefix x_0..x_{t-1}
+        # For each prefix, compute conditional entropy of x_t
+        # Weight by prefix probability
+        prefix_to_probs = {}
+        for idx in range(len(S)):
+            prefix = tuple(S[idx, :t])
+            if prefix not in prefix_to_probs:
+                prefix_to_probs[prefix] = np.zeros(V)
+            prefix_to_probs[prefix][S[idx, t]] += p_np[idx]
+
+        total_h = 0.0
+        for prefix, cond_dist in prefix_to_probs.items():
+            p_prefix = cond_dist.sum()
+            if p_prefix < eps:
+                continue
+            cond_norm = cond_dist / p_prefix
+            h = -sum(cond_norm[v] * np.log(cond_norm[v] + eps)
+                     for v in range(V) if cond_norm[v] > eps)
+            total_h += p_prefix * h
+        cond_H_l2r.append(float(total_h))
+
+    # Also compute for r2l order
+    cond_H_r2l = [marginal_H[L - 1]]
+    for step in range(1, L):
+        t = L - 1 - step  # position being decoded
+        # Context = positions t+1, t+2, ..., L-1
+        ctx_positions = list(range(t + 1, L))
+        prefix_to_probs = {}
+        for idx in range(len(S)):
+            ctx = tuple(S[idx, p] for p in ctx_positions)
+            if ctx not in prefix_to_probs:
+                prefix_to_probs[ctx] = np.zeros(V)
+            prefix_to_probs[ctx][S[idx, t]] += p_np[idx]
+
+        total_h = 0.0
+        for ctx, cond_dist in prefix_to_probs.items():
+            p_ctx = cond_dist.sum()
+            if p_ctx < eps:
+                continue
+            cond_norm = cond_dist / p_ctx
+            h = -sum(cond_norm[v] * np.log(cond_norm[v] + eps)
+                     for v in range(V) if cond_norm[v] > eps)
+            total_h += p_ctx * h
+        cond_H_r2l.append(float(total_h))
+    cond_H_r2l.reverse()  # now indexed by position
+
+    # Context benefit: how much does l2r context reduce entropy?
+    context_benefit = [marginal_H[t] - cond_H_l2r[t] for t in range(L)]
+
+    return {
+        'marginal_H': marginal_H,
+        'cond_H_l2r': cond_H_l2r,
+        'cond_H_r2l': cond_H_r2l,
+        'context_benefit_l2r': context_benefit,
+    }
+
+
+def compute_stepwise_cond_entropy(dist, orders_list, samples):
+    """
+    For each decode policy's tracked orders, compute the TRUE conditional
+    entropy at each decode step.
+
+    Step t: position p=order[t] is being decoded.
+    Context: positions {order[0], ..., order[t-1]} with their actual values.
+    H_step[t] = E_samples[ H(X_p | X_{context} = x_{context}) ]
+
+    For l2r, H_step should be low and flat (good context every step).
+    For confidence, H_step may start low (peaked marginals) but spike
+    at later steps where context is fragmentary.
+    """
+    all_seqs, p_true = dist.full_distribution()
+    p_np = p_true.numpy()
+    S_all = all_seqs.numpy()
+    eps = 1e-30
+
+    if not orders_list:
+        return {}
+
+    orders = torch.cat(orders_list, dim=0)     # (N_track, L)
+    # Use corresponding samples (first N_track from 500K)
+    N_track = orders.shape[0]
+    samp = samples[:N_track].numpy() if isinstance(samples, torch.Tensor) \
+        else np.array(samples[:N_track])
+
+    step_entropies = np.zeros(L)
+    step_counts = np.zeros(L)
+
+    # For efficiency: precompute lookup table seq→index
+    seq_to_idx = {}
+    for idx in range(len(S_all)):
+        seq_to_idx[tuple(S_all[idx])] = idx
+
+    # Process in mini-batches for memory
+    n_analysis = min(N_track, 2000)  # limit for computational cost
+    for i in range(n_analysis):
+        order = orders[i].numpy()
+        sample = samp[i]
+
+        for step in range(L):
+            pos = order[step]
+            if step == 0:
+                # No context — use marginal
+                marg = np.zeros(V)
+                for v in range(V):
+                    marg[v] = p_np[S_all[:, pos] == v].sum()
+                h = -sum(marg[v] * np.log(marg[v] + eps)
+                         for v in range(V) if marg[v] > eps)
+            else:
+                # Context: positions order[0..step-1] with sample values
+                ctx_positions = order[:step]
+                ctx_values = sample[ctx_positions]
+
+                # Filter sequences matching context
+                mask = np.ones(len(S_all), dtype=bool)
+                for cp, cv in zip(ctx_positions, ctx_values):
+                    mask &= (S_all[:, cp] == cv)
+
+                matching_p = p_np[mask]
+                if matching_p.sum() < eps:
+                    h = np.log(V)  # uniform fallback
+                else:
+                    cond = np.zeros(V)
+                    for v in range(V):
+                        cond[v] = p_np[mask & (S_all[:, pos] == v)].sum()
+                    cond /= cond.sum() + eps
+                    h = -sum(cond[v] * np.log(cond[v] + eps)
+                             for v in range(V) if cond[v] > eps)
+
+            step_entropies[step] += h
+            step_counts[step] += 1
+
+    mean_H = (step_entropies / np.maximum(step_counts, 1)).tolist()
+    return {'step_cond_entropy': mean_H, 'n_samples_analysed': n_analysis}
+
+
+def compute_error_cascade(samples, dist):
+    """
+    From the SAME 500K samples, measure error correlation between
+    adjacent positions. For Markov distributions, confidence policy
+    may cause correlated errors (wrong context → wrong next token).
+
+    Returns:
+      p_err[t]: P(error at position t)
+      p_err_given_prev_err[t]: P(error at t | error at t-1)
+      cascade_ratio[t]: p_err_given_prev_err[t] / p_err[t]
+        > 1 means errors cascade, = 1 means independent
+    """
+    all_seqs, p_true = dist.full_distribution()
+    p_np = p_true.numpy()
+    S_all = all_seqs.numpy()
+
+    if isinstance(samples, torch.Tensor):
+        S = samples.numpy()
+    else:
+        S = np.array(samples)
+    N = len(S)
+
+    # "Correct" = matches the mode of conditional distribution
+    # For position t, the mode depends on context.
+    # For tractability, use marginal mode (policy-independent baseline)
+    # AND Markov conditional mode (if applicable)
+
+    # 1. Marginal mode error
+    marginal_mode = np.zeros(L, dtype=np.int64)
+    for i in range(L):
+        m = np.zeros(V)
+        for v in range(V):
+            m[v] = p_np[S_all[:, i] == v].sum()
+        marginal_mode[i] = m.argmax()
+
+    marg_err = (S != marginal_mode[None, :])  # (N, L)
+    p_err_marginal = marg_err.mean(axis=0).tolist()
+
+    result = {'p_err_marginal': p_err_marginal}
+
+    # 2. Conditional mode error (for Markov distributions)
+    if isinstance(dist, (MarkovChain, MarkovPlusGlobal, HardMarkov)):
+        markov = dist if isinstance(dist, (MarkovChain, HardMarkov)) \
+            else dist.markov
+        order = markov.k
+        trans = np.exp(markov.trans_logp.numpy())  # (n_ctx, V)
+
+        # For each position t >= order, check if sample matches
+        # conditional mode given actual context
+        cond_err = np.zeros((N, L), dtype=bool)
+        # First `order` positions: use marginal mode
+        for t in range(order):
+            cond_err[:, t] = S[:, t] != marginal_mode[t]
+
+        for t in range(order, L):
+            ctx_idx = np.zeros(N, dtype=np.int64)
+            for o in range(order):
+                ctx_idx += S[:, t - order + o] * (V ** o)
+            cond_mode = trans[ctx_idx].argmax(axis=1)
+            cond_err[:, t] = S[:, t] != cond_mode
+
+        p_err_cond = cond_err.mean(axis=0).tolist()
+
+        # Cascade: P(err at t | err at t-1)
+        cascade_ratio = []
+        p_err_given_prev = []
+        for t in range(1, L):
+            prev_err_mask = cond_err[:, t - 1]
+            n_prev_err = prev_err_mask.sum()
+            if n_prev_err > 0:
+                p_e_given = cond_err[prev_err_mask, t].mean()
+            else:
+                p_e_given = 0.0
+            p_e = cond_err[:, t].mean()
+            p_err_given_prev.append(float(p_e_given))
+            ratio = float(p_e_given / (p_e + 1e-10))
+            cascade_ratio.append(ratio)
+
+        result['p_err_conditional'] = p_err_cond
+        result['p_err_given_prev_err'] = p_err_given_prev
+        result['cascade_ratio'] = cascade_ratio
+
+    return result
 
 def run():
     print("=" * 70)
@@ -912,9 +1401,30 @@ def run():
         models[name] = model
         train_hists[name] = hist
 
+    # ── Confidence diagnostic: what does the model "see" at step 0? ──
+    print("\n  Computing confidence diagnostics & true conditional entropy...")
+    confidence_profiles = {}
+    cond_entropy_profiles = {}
+    for name, dist in distributions.items():
+        model = models[name]
+        confidence_profiles[name] = compute_initial_confidence_profile(model)
+        cond_entropy_profiles[name] = compute_true_conditional_entropy_profile(dist)
+
+        cp = confidence_profiles[name]
+        ce = cond_entropy_profiles[name]
+        print(f"    {name}:")
+        print(f"      model conf order: {cp['confidence_order']}")
+        print(f"      marginal H:       "
+              + ' '.join(f"p{i}={h:.3f}" for i, h in enumerate(ce['marginal_H'])))
+        print(f"      cond H (l2r):     "
+              + ' '.join(f"p{i}={h:.3f}" for i, h in enumerate(ce['cond_H_l2r'])))
+        print(f"      context benefit:  "
+              + ' '.join(f"p{i}={b:.3f}" for i, b in enumerate(ce['context_benefit_l2r'])))
+
     # Evaluate policies (sampling only — greedy is deterministic, TV/KL meaningless)
     seq_policies = ['confidence', 'low_entropy', 'high_entropy', 'margin',
-                    'random', 'l2r', 'r2l']
+                    'random', 'l2r', 'r2l',
+                    'entropy_adj', 'single_perturb']
     # New parallel configs: adaptive threshold + jacobi iteration
     adaptive_taus = [0.5, 0.7, 0.9]
     jacobi_iters  = [5, 10, 20]
@@ -922,9 +1432,11 @@ def run():
     all_results = {}
     all_orders = {}  # dist_name → policy → list of order tensors
     all_detailed = {}  # dist_name → policy → detailed analysis
+    saved_samples_for_stepwise = {}  # dist → pol → first N_ORDER samples
 
     # Policies to run detailed per-sample analysis on (same 500K samples)
-    DETAILED_POLICIES = {'confidence', 'l2r', 'r2l', 'random'}
+    DETAILED_POLICIES = {'confidence', 'l2r', 'r2l', 'random',
+                         'entropy_adj', 'single_perturb'}
 
     for dist_name, dist in distributions.items():
         model = models[dist_name]
@@ -932,6 +1444,7 @@ def run():
         all_results[dist_name] = {}
         all_orders[dist_name] = {}
         all_detailed[dist_name] = {}
+        saved_samples_for_stepwise[dist_name] = {}
 
         # ── Sequential policies ──
         for pol in seq_policies:
@@ -949,14 +1462,23 @@ def run():
                 n_generated += bs
             samples = torch.cat(samples); scores = torch.cat(scores)
             m = compute_metrics(samples, scores, dist)
-            m['nfe'] = L
+            m['nfe'] = 2*L if pol == 'single_perturb' else L
             all_results[dist_name][pol] = m
             all_orders[dist_name][pol] = orders_list
 
             # Detailed analysis on the SAME samples
             if pol in DETAILED_POLICIES:
                 det = compute_detailed_analysis(samples, dist)
+                # Error cascade from SAME samples
+                det['error_cascade'] = compute_error_cascade(samples, dist)
                 all_detailed[dist_name][pol] = det
+
+                # Save subset for stepwise conditional entropy
+                if orders_list:
+                    n_tracked = sum(o.shape[0] for o in orders_list)
+                    saved_samples_for_stepwise[dist_name][pol] = \
+                        samples[:n_tracked].clone()
+
                 # Print key details
                 mkl = det['per_position_marginal_kl']
                 print(f"    {pol:<20} KL_f={m['kl_forward']:.4f} "
@@ -965,6 +1487,12 @@ def run():
                       f"lp_gap={det['lp_gap']:+.3f}")
                 print(f"      pos_marginal_KL: "
                       + ' '.join(f"p{i}={k:.4f}" for i, k in enumerate(mkl)))
+                # Error cascade summary
+                ec = det['error_cascade']
+                if 'cascade_ratio' in ec:
+                    cr = ec['cascade_ratio']
+                    print(f"      cascade ratio: "
+                          + ' '.join(f"t{i+1}={r:.2f}" for i, r in enumerate(cr)))
                 if 'context_analysis' in det:
                     ca = det['context_analysis']
                     print(f"      ctx: mean_KL={ca['mean_ctx_kl']:.4f} "
@@ -1023,14 +1551,103 @@ def run():
                   f"KL_r={m['kl_reverse']:.4f} "
                   f"NFE={m['nfe']:.1f} ({time.time()-t0:.1f}s)")
 
+        # ── Low-variance policies (epistemic uncertainty) ──
+        # Oracle: uses ground truth distribution for exact variance
+        print(f"\n    -- Epistemic Variance Policies --")
+        # Use fewer samples for oracle (expensive per-sample computation)
+        N_VAR_SAMPLES = min(N_SAMPLES, 10_000)
+        t0 = time.time()
+        samples, scores, orders_list = [], [], []
+        for start in range(0, N_VAR_SAMPLES, BATCH_SIZE):
+            bs = min(BATCH_SIZE, N_VAR_SAMPLES - start)
+            s, sc, ords = decode_low_var_oracle(model, bs, dist,
+                                                 track_order=True)
+            samples.append(s); scores.append(sc)
+            if ords is not None:
+                orders_list.append(ords)
+        samples = torch.cat(samples); scores = torch.cat(scores)
+        m = compute_metrics(samples, scores, dist)
+        m['nfe'] = L
+        key = 'low_var_oracle'
+        all_results[dist_name][key] = m
+        all_orders[dist_name][key] = orders_list
+        # Save samples for stepwise analysis
+        saved_samples_for_stepwise[dist_name][key] = samples.clone()
+        # Decode order analysis
+        if orders_list:
+            mean_ranks = compute_mean_decode_order(orders_list)
+            order_str = ' '.join(f"p{i}={r:.1f}" for i, r in enumerate(mean_ranks))
+        else:
+            order_str = 'N/A'
+        print(f"    {key:<20} KL_f={m['kl_forward']:.4f} "
+              f"KL_r={m['kl_reverse']:.4f} "
+              f"JS={m['js']:.4f} ({time.time()-t0:.1f}s)")
+        print(f"      decode order: {order_str}")
+
+        # Model-based: uses perturbation forward passes
+        t0 = time.time()
+        samples, scores, orders_list = [], [], []
+        for start in range(0, N_VAR_SAMPLES, BATCH_SIZE):
+            bs = min(BATCH_SIZE, N_VAR_SAMPLES - start)
+            s, sc, ords = decode_low_var_model(model, bs,
+                                                track_order=True)
+            samples.append(s); scores.append(sc)
+            if ords is not None:
+                orders_list.append(ords)
+        samples = torch.cat(samples); scores = torch.cat(scores)
+        m = compute_metrics(samples, scores, dist)
+        m['nfe'] = L
+        key = 'low_var_model'
+        all_results[dist_name][key] = m
+        all_orders[dist_name][key] = orders_list
+        saved_samples_for_stepwise[dist_name][key] = samples.clone()
+        if orders_list:
+            mean_ranks = compute_mean_decode_order(orders_list)
+            order_str = ' '.join(f"p{i}={r:.1f}" for i, r in enumerate(mean_ranks))
+        else:
+            order_str = 'N/A'
+        print(f"    {key:<20} KL_f={m['kl_forward']:.4f} "
+              f"KL_r={m['kl_reverse']:.4f} "
+              f"JS={m['js']:.4f} ({time.time()-t0:.1f}s)")
+        print(f"      decode order: {order_str}")
+
+    # ── Stepwise conditional entropy: l2r vs confidence vs low_var ──
+    print("\n  Computing stepwise conditional entropy (may take a few min)...")
+    all_stepwise = {}
+    STEPWISE_POLICIES = {'confidence', 'l2r', 'low_var_oracle', 'low_var_model',
+                         'entropy_adj', 'single_perturb'}
+    for dist_name, dist in distributions.items():
+        all_stepwise[dist_name] = {}
+        for pol in STEPWISE_POLICIES:
+            ords = all_orders.get(dist_name, {}).get(pol, [])
+            samps = saved_samples_for_stepwise.get(dist_name, {}).get(pol)
+            if ords and samps is not None:
+                sw = compute_stepwise_cond_entropy(dist, ords, samps)
+                all_stepwise[dist_name][pol] = sw
+                hh = sw['step_cond_entropy']
+                print(f"    {dist_name} / {pol}: "
+                      + ' '.join(f"s{i}={h:.3f}" for i, h in enumerate(hh)))
+                if pol in all_detailed.get(dist_name, {}):
+                    all_detailed[dist_name][pol]['stepwise_cond_entropy'] = hh
+                # Store in JSON
+                if pol not in all_detailed.get(dist_name, {}):
+                    if dist_name not in all_detailed:
+                        all_detailed[dist_name] = {}
+                    all_detailed[dist_name][pol] = {}
+                all_detailed[dist_name].setdefault(pol, {})
+                all_detailed[dist_name][pol]['stepwise_cond_entropy'] = hh
+
     # ── Compute MI matrices and alignment scores ──
     mi_matrices = {}
     mi_alignments = {}
+    # Include low_var policies in MI alignment
+    all_ordered_policies = (seq_policies
+                            + ['low_var_oracle', 'low_var_model'])
     for dist_name, dist in distributions.items():
         MI = compute_mi(dist)
         mi_matrices[dist_name] = MI
         mi_alignments[dist_name] = {}
-        for pol in seq_policies:
+        for pol in all_ordered_policies:
             if pol in all_orders[dist_name] and all_orders[dist_name][pol]:
                 mean_ranks = compute_mean_decode_order(all_orders[dist_name][pol])
                 alignment = compute_mi_order_alignment(mean_ranks, MI)
@@ -1039,7 +1656,8 @@ def run():
     # ── Collect all policy names ──
     all_pol_names = (seq_policies
                      + [f"adaptive_τ{t}" for t in adaptive_taus]
-                     + [f"jacobi_i{m}" for m in jacobi_iters])
+                     + [f"jacobi_i{m}" for m in jacobi_iters]
+                     + ['low_var_oracle', 'low_var_model'])
 
     # ── Visualisation ──
     figs = {'mi_matrices': fig_mi}
@@ -1346,6 +1964,117 @@ def run():
         ax.set_title('HardMarkov: Preferred Token Compliance by Position')
         fig.tight_layout(); figs['hard_markov_compliance'] = fig
 
+    # ── FIG 11: Confidence vs True Conditional Entropy ──
+    # Key figure: shows WHY confidence policy fails
+    if confidence_profiles and cond_entropy_profiles:
+        markov_dists = [dn for dn in dist_names
+                        if dn in ('B_Markov2', 'E_HardMarkov',
+                                  'D_Markov+Global')]
+        if markov_dists:
+            fig, axes = plt.subplots(1, len(markov_dists),
+                                      figsize=(6*len(markov_dists), 5))
+            if len(markov_dists) == 1: axes = [axes]
+            for col, dn in enumerate(markov_dists):
+                ax = axes[col]
+                cp = confidence_profiles[dn]
+                ce = cond_entropy_profiles[dn]
+                positions = range(L)
+
+                # Model's initial confidence (step 0, all masked)
+                ax.bar(positions, cp['max_prob'], alpha=0.4,
+                       color='#e74c3c', label='Model confidence (step 0)')
+                # True marginal entropy (normalized to [0,1])
+                max_h = max(ce['marginal_H'])
+                norm_mH = [h / max_h for h in ce['marginal_H']]
+                ax.plot(positions, norm_mH, 's-', color='#7f8c8d',
+                        label='Marginal H (norm)', markersize=5)
+                # True conditional entropy in l2r (normalized)
+                norm_cH = [h / max_h for h in ce['cond_H_l2r']]
+                ax.plot(positions, norm_cH, 'o-', color='#2ecc71',
+                        label='Cond H|l2r context (norm)', markersize=5)
+                # Mark confidence decode order (1st, 2nd, ...)
+                order = cp['confidence_order']
+                for rank, pos in enumerate(order[:3]):
+                    ax.annotate(f'{rank+1}st', (pos, cp['max_prob'][pos]),
+                                fontsize=8, ha='center', va='bottom',
+                                color='#e74c3c', fontweight='bold')
+                ax.set_xlabel('Position')
+                ax.set_ylabel('Score')
+                ax.set_title(f'{dn}', fontsize=10)
+                ax.legend(fontsize=7); ax.grid(alpha=0.3)
+            fig.suptitle('Why Confidence Fails: Model Confidence vs '
+                         'True Information Content',
+                         fontsize=12, y=1.02)
+            fig.tight_layout(); figs['confidence_diagnostic'] = fig
+
+    # ── FIG 12: Stepwise Conditional Entropy (l2r vs confidence vs low_var) ──
+    if all_stepwise:
+        n_dists_with_sw = sum(1 for dn in dist_names
+                              if dn in all_stepwise
+                              and all_stepwise[dn])
+        if n_dists_with_sw > 0:
+            sw_dists = [dn for dn in dist_names
+                        if dn in all_stepwise and all_stepwise[dn]]
+            fig, axes = plt.subplots(1, len(sw_dists),
+                                      figsize=(5*len(sw_dists), 4))
+            if len(sw_dists) == 1: axes = [axes]
+            sw_pol_colors = {
+                'l2r': '#27ae60', 'confidence': '#3498db',
+                'low_var_oracle': '#8e44ad', 'low_var_model': '#e67e22',
+                'entropy_adj': '#e74c3c', 'single_perturb': '#1abc9c',
+            }
+            for col, dn in enumerate(sw_dists):
+                ax = axes[col]
+                for pol in ['l2r', 'confidence',
+                            'low_var_oracle', 'low_var_model',
+                            'entropy_adj', 'single_perturb']:
+                    sw = all_stepwise.get(dn, {}).get(pol)
+                    if sw:
+                        hh = sw['step_cond_entropy']
+                        ax.plot(range(L), hh, '-o', markersize=5,
+                                color=sw_pol_colors.get(pol, '#888'),
+                                label=f'{pol} (mean={np.mean(hh):.3f})')
+                # Uniform entropy baseline
+                ax.axhline(y=np.log(V), color='gray', ls=':',
+                           alpha=0.3, label=f'H(uniform)={np.log(V):.2f}')
+                ax.set_xlabel('Decode Step')
+                ax.set_ylabel('True H(X_pos | decoded context)')
+                ax.set_title(dn, fontsize=9)
+                ax.legend(fontsize=7); ax.grid(alpha=0.3)
+            fig.suptitle('Stepwise Conditional Entropy: '
+                         'l2r vs Confidence vs Stability Policies',
+                         fontsize=12, y=1.02)
+            fig.tight_layout(); figs['stepwise_cond_entropy'] = fig
+
+    # ── FIG 13: Error Cascade (Markov distributions) ──
+    cascade_dists = [dn for dn in dist_names
+                     if any(all_detailed.get(dn, {}).get(p, {})
+                            .get('error_cascade', {}).get('cascade_ratio')
+                            for p in det_pols)]
+    if cascade_dists:
+        fig, axes = plt.subplots(1, len(cascade_dists),
+                                  figsize=(6*len(cascade_dists), 4))
+        if len(cascade_dists) == 1: axes = [axes]
+        for col, dn in enumerate(cascade_dists):
+            ax = axes[col]
+            for pol in det_pols:
+                ec = all_detailed.get(dn, {}).get(pol, {}).get(
+                    'error_cascade', {})
+                cr = ec.get('cascade_ratio')
+                if cr:
+                    ax.plot(range(1, L), cr, '-o', markersize=4,
+                            color=pol_colors.get(pol, '#888'),
+                            label=f'{pol} (mean={np.mean(cr):.2f})')
+            ax.axhline(y=1.0, color='black', ls=':', alpha=0.5,
+                       label='no cascade (ratio=1)')
+            ax.set_xlabel('Position t')
+            ax.set_ylabel('P(err_t | err_{t-1}) / P(err_t)')
+            ax.set_title(dn, fontsize=9)
+            ax.legend(fontsize=7); ax.grid(alpha=0.3)
+        fig.suptitle('Error Cascade: Do Errors Propagate to Neighbors?',
+                     fontsize=12, y=1.02)
+        fig.tight_layout(); figs['error_cascade'] = fig
+
     # JSON-safe results
     json_results = {}
     for d in all_results:
@@ -1359,7 +2088,16 @@ def run():
         for pol in mi_alignments[dn]:
             a = mi_alignments[dn][pol]
             json_results['mi_alignments'][dn][pol] = {
-                'rho': a['rho'], 'p_value': a['p_value']}
+                'rho': a['rho'], 'p_value': a['p_value'],
+                'mean_ranks': a['mean_ranks'],  # NEW: full position ranks
+            }
+    # Confidence diagnostic profiles
+    json_results['confidence_profiles'] = {}
+    for dn in confidence_profiles:
+        json_results['confidence_profiles'][dn] = confidence_profiles[dn]
+    json_results['cond_entropy_profiles'] = {}
+    for dn in cond_entropy_profiles:
+        json_results['cond_entropy_profiles'][dn] = cond_entropy_profiles[dn]
     # Include detailed analysis (serializable parts only)
     json_results['detailed'] = {}
     for dn in all_detailed:
@@ -1385,6 +2123,22 @@ def run():
             if 'hard_markov' in det:
                 json_results['detailed'][dn][pol]['hard_markov'] = \
                     det['hard_markov']
+            # NEW: error cascade
+            if 'error_cascade' in det:
+                ec = det['error_cascade']
+                json_results['detailed'][dn][pol]['error_cascade'] = {
+                    'p_err_marginal': ec['p_err_marginal'],
+                }
+                if 'cascade_ratio' in ec:
+                    json_results['detailed'][dn][pol]['error_cascade'].update({
+                        'p_err_conditional': ec['p_err_conditional'],
+                        'p_err_given_prev_err': ec['p_err_given_prev_err'],
+                        'cascade_ratio': ec['cascade_ratio'],
+                    })
+            # NEW: stepwise conditional entropy
+            if 'stepwise_cond_entropy' in det:
+                json_results['detailed'][dn][pol]['stepwise_cond_entropy'] = \
+                    det['stepwise_cond_entropy']
 
     save_results(EXP_NAME, json_results, figures=figs)
 
@@ -1532,6 +2286,45 @@ def run():
                       f"margKL_max={mkl_max:.5f} "
                       f"modes_ok={mode_ok}/{L} "
                       f"lp_gap={det['lp_gap']:+.3f}")
+
+    # ── Confidence failure diagnostic ──
+    print(f"\n{'='*60}")
+    print(f"  WHY CONFIDENCE FAILS: DIAGNOSTIC SUMMARY")
+    print(f"{'='*60}")
+    for dn in dist_names:
+        cp = confidence_profiles.get(dn, {})
+        ce = cond_entropy_profiles.get(dn, {})
+        if not cp or not ce:
+            continue
+        print(f"\n  {dn}:")
+        print(f"    Confidence decode order (step 0): {cp['confidence_order']}")
+        print(f"    Model conf:  "
+              + ' '.join(f"p{i}={c:.3f}" for i, c in enumerate(cp['max_prob'])))
+        print(f"    Marginal H:  "
+              + ' '.join(f"p{i}={h:.3f}" for i, h in enumerate(ce['marginal_H'])))
+        print(f"    Cond H|l2r:  "
+              + ' '.join(f"p{i}={h:.3f}" for i, h in enumerate(ce['cond_H_l2r'])))
+        print(f"    Ctx benefit: "
+              + ' '.join(f"p{i}={b:.3f}" for i, b in enumerate(ce['context_benefit_l2r'])))
+
+        # Key insight: correlation between model confidence and conditional entropy
+        rho_marg, _ = spearmanr(cp['max_prob'], ce['marginal_H'])
+        rho_cond, _ = spearmanr(cp['max_prob'], ce['cond_H_l2r'])
+        print(f"    Corr(conf, marginal_H): ρ={rho_marg:+.3f}  "
+              f"(negative = conf tracks peaked marginals)")
+        print(f"    Corr(conf, cond_H|l2r): ρ={rho_cond:+.3f}  "
+              f"(negative = conf tracks easy conditionals)")
+        # Ideal: confidence should correlate with cond_H, not marginal_H
+
+        # Stepwise summary
+        sw_conf = all_stepwise.get(dn, {}).get('confidence', {})
+        sw_l2r = all_stepwise.get(dn, {}).get('l2r', {})
+        if sw_conf and sw_l2r:
+            h_conf = sw_conf['step_cond_entropy']
+            h_l2r = sw_l2r['step_cond_entropy']
+            print(f"    Stepwise H: confidence avg={np.mean(h_conf):.4f}  "
+                  f"l2r avg={np.mean(h_l2r):.4f}  "
+                  f"gap={np.mean(h_conf)-np.mean(h_l2r):+.4f}")
 
     plt.show()
     return all_results
