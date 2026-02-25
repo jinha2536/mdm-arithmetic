@@ -427,7 +427,7 @@ def analyse_results(detailed, fmt):
                     and j < len(r['gold_ans'])
                     and j < len(r['pred_ans'])):
                 gd, pd = r['gold_ans'][j], r['pred_ans'][j]
-                conf[(gd, pd)] += 1
+                conf[f"{gd}>{pd}"] += 1
         if conf:
             digit_confusion[j] = dict(conf)
 
@@ -503,7 +503,8 @@ def print_analysis(analysis, nd):
     if a.get('digit_confusion'):
         top_conf = []
         for pos, conf in a['digit_confusion'].items():
-            for (g, p), cnt in conf.items():
+            for key, cnt in conf.items():
+                g, p = key.split('>')
                 top_conf.append((cnt, pos, g, p))
         top_conf.sort(reverse=True)
         if top_conf:
