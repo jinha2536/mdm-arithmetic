@@ -1887,7 +1887,7 @@ def run():
             ax = axes[col]
             for pol in det_pols:
                 det = all_detailed.get(dn, {}).get(pol)
-                if det is None:
+                if det is None or 'per_position_marginal_kl' not in det:
                     continue
                 mkl = det['per_position_marginal_kl']
                 ax.plot(range(L), mkl, '-o', markersize=4,
@@ -1911,14 +1911,15 @@ def run():
             ax = axes[col]
             for pol in ['confidence', 'l2r', 'r2l']:
                 det = all_detailed.get(dn, {}).get(pol)
-                if det is None:
+                if det is None or 'hist_centers' not in det:
                     continue
                 ax.plot(det['hist_centers'], det['hist_counts'],
                         color=pol_colors.get(pol, '#888'),
                         label=f"{pol} (μ={det['true_lp_mean']:.1f})",
                         alpha=0.7)
             # Mark true expected log-prob
-            det0 = next(iter(all_detailed.get(dn, {}).values()), None)
+            det0 = next((v for v in all_detailed.get(dn, {}).values()
+                         if 'true_expected_lp' in v), None)
             if det0:
                 ax.axvline(det0['true_expected_lp'], color='black',
                            ls=':', alpha=0.5, label='E_p[log p]')
@@ -2125,15 +2126,16 @@ def run():
         json_results['detailed'][dn] = {}
         for pol in all_detailed[dn]:
             det = all_detailed[dn][pol]
-            # Keep scalar/list fields, skip large arrays
-            json_results['detailed'][dn][pol] = {
-                'per_position_marginal_kl': det['per_position_marginal_kl'],
-                'per_position_mode_correct': det['per_position_mode_correct'],
-                'true_lp_percentiles': det['true_lp_percentiles'],
-                'true_lp_mean': det['true_lp_mean'],
-                'true_expected_lp': det['true_expected_lp'],
-                'lp_gap': det['lp_gap'],
-            }
+            entry = {}
+            # Full detailed fields (only present for DETAILED_POLICIES)
+            if 'per_position_marginal_kl' in det:
+                entry['per_position_marginal_kl'] = det['per_position_marginal_kl']
+                entry['per_position_mode_correct'] = det['per_position_mode_correct']
+                entry['true_lp_percentiles'] = det['true_lp_percentiles']
+                entry['true_lp_mean'] = det['true_lp_mean']
+                entry['true_expected_lp'] = det['true_expected_lp']
+                entry['lp_gap'] = det['lp_gap']
+            json_results['detailed'][dn][pol] = entry
             if 'context_analysis' in det:
                 ca = det['context_analysis']
                 json_results['detailed'][dn][pol]['context'] = {
@@ -2297,7 +2299,7 @@ def run():
             print(f"\n  {dn}:")
             for pol in det_pols:
                 det = dd.get(pol)
-                if det is None:
+                if det is None or 'per_position_marginal_kl' not in det:
                     continue
                 mkl_max = max(det['per_position_marginal_kl'])
                 mkl_mean = np.mean(det['per_position_marginal_kl'])
