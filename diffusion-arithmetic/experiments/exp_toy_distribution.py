@@ -369,6 +369,17 @@ def train_toy_model(dist, print_every=5):
 
 N_ORDER_SAMPLES = 10_000  # only track decode order for this many
 
+
+def _sanitize_decode_output(x, label=''):
+    """Clamp any leaked MASK tokens. Returns sanitized tensor."""
+    result = x.cpu() if x.is_cuda else x
+    n_mask = (result >= V).sum().item()
+    if n_mask > 0:
+        print(f"    WARNING {label}: {n_mask} tokens >= V, clamping to V-1")
+        result = result.clamp(max=V-1)
+    return result
+
+
 @torch.no_grad()
 def decode_sequential(model, n, policy='confidence', track_order=False):
     """Sequential decode. track_order=True records position chosen at each step."""
@@ -443,7 +454,7 @@ def decode_sequential(model, n, policy='confidence', track_order=False):
         x[torch.arange(n, device=DEVICE), pos] = tok
         unmasked[torch.arange(n, device=DEVICE), pos] = True
 
-    return x.cpu(), scores.cpu(), (orders.cpu() if track_order else None)
+    return _sanitize_decode_output(x, 'decode_seq'), scores.cpu(), (orders.cpu() if track_order else None)
 
 
 @torch.no_grad()
@@ -522,11 +533,13 @@ def decode_low_var_oracle(model, n, dist, track_order=True):
         logits[:, :, MASK_ID] = -float('inf')
 
         # Group samples by unique context (decoded positions + values)
-        # Key = tuple of (position, value) pairs for decoded positions
+        # Key MUST include WHICH positions are decoded AND their values,
+        # otherwise samples with different positions but same values collide.
         context_groups = {}  # key → list of sample indices
         for b in range(n):
             obs_mask = decoded[b] >= 0
-            key = tuple(decoded[b, j] for j in range(L) if obs_mask[j])
+            key = tuple((j, int(decoded[b, j]))
+                        for j in range(L) if obs_mask[j])
             if key not in context_groups:
                 context_groups[key] = []
             context_groups[key].append(b)
@@ -537,8 +550,21 @@ def decode_low_var_oracle(model, n, dist, track_order=True):
             rep = indices[0]  # representative sample
             obs_mask = decoded[rep] >= 0
             bp = _oracle_best_pos(obs_mask, decoded[rep])
+            # Safety: ensure bp is actually a still-masked position
+            if obs_mask[bp]:
+                # Fallback: pick first still-masked position
+                remaining = np.where(~obs_mask)[0]
+                bp = int(remaining[0]) if len(remaining) > 0 else 0
             for b in indices:
                 best_pos[b] = bp
+
+        # Safety: if oracle picked an already-decoded position for
+        # any sample (shouldn't happen with correct key), fallback
+        for b in range(n):
+            if decoded[b, best_pos[b]] >= 0:
+                candidates = np.where(decoded[b] < 0)[0]
+                if len(candidates) > 0:
+                    best_pos[b] = candidates[0]
 
         pos = torch.tensor(best_pos, dtype=torch.long, device=DEVICE)
         if track_order:
@@ -552,7 +578,7 @@ def decode_low_var_oracle(model, n, dist, track_order=True):
         unmasked[torch.arange(n, device=DEVICE), pos] = True
         decoded[np.arange(n), best_pos] = tok.cpu().numpy()
 
-    return x.cpu(), scores.cpu(), (orders.cpu() if track_order else None)
+    return _sanitize_decode_output(x, 'low_var_oracle'), scores.cpu(), (orders.cpu() if track_order else None)
 
 
 @torch.no_grad()
@@ -620,7 +646,7 @@ def decode_low_var_model(model, n, track_order=True):
         x[torch.arange(n, device=DEVICE), pos] = tok
         unmasked[torch.arange(n, device=DEVICE), pos] = True
 
-    return x.cpu(), scores.cpu(), (orders.cpu() if track_order else None)
+    return _sanitize_decode_output(x, 'low_var_model'), scores.cpu(), (orders.cpu() if track_order else None)
 
 
 @torch.no_grad()
@@ -670,7 +696,7 @@ def decode_adaptive_threshold(model, n, tau=0.7):
         scores.scatter_add_(0, sel_idx[:, 0], sel_lp)
         n_steps += 1
 
-    return x.cpu(), scores.cpu(), n_steps
+    return _sanitize_decode_output(x, 'parallel'), scores.cpu(), n_steps
 
 
 @torch.no_grad()
@@ -721,7 +747,7 @@ def decode_jacobi(model, n, max_iter=20):
         x
     ].sum(dim=1)  # (n,)
 
-    return x.cpu(), scores.cpu(), n_steps
+    return _sanitize_decode_output(x, 'parallel'), scores.cpu(), n_steps
 
 
 # ── Metrics ─────────────────────────────────────────
@@ -756,6 +782,12 @@ def compute_metrics(samples, scores, dist):
     K = len(all_seqs)
     n = len(samples)
     p_np = p_true.numpy()
+
+    # Safety: clamp any leaked MASK_ID tokens to 0
+    if (samples >= V).any():
+        n_bad = (samples >= V).sum().item()
+        print(f"    WARNING: {n_bad} MASK_ID tokens in samples, clamping")
+        samples = samples.clamp(max=V-1)
 
     all_idx = _seq_to_idx(all_seqs)
     sample_idx = _seq_to_idx(samples)
