@@ -1,25 +1,32 @@
 """
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  Experiment 1 — Addition: AR vs Masked Diffusion
+  Experiment 1 — Addition: AR vs Masked Diffusion  (v2)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
   Colab:  %run experiments/exp_addition.py
 
-  Multi-digit scaling: 3d, 5d to find difficulty frontier.
-  Number-level OOD at 3d (paper comparison).
-  Length OOD at each scale.
+  Redesign following advisor feedback:
 
-  Fixation order analysis: which answer digit does diffusion decode
-  first?  Does it correlate with carry positions?
+  1) Structured sampling (Lee et al.):
+       • Digit-balanced: lower-digit operands over-represented
+       • Carry-balanced: roughly equal 0,1,...,nd carries per nd
+  2) Interpolation OOD: train nd∈{1,2,3,4,5,6,8}, test nd=7
+       (avoids position-embedding confound of extrapolation OOD)
+  3) Up to 8-digit operands — challenging even for AR
+  4) Detailed per-sample error analysis:
+       • Per answer-position accuracy
+       • Carry-conditional accuracy
+       • Error categorisation and examples
+       • RoPE vs absolute side-by-side
 
-  Secondary: digit-position exclusion (Appendix B.2.1).
+  12 models: 2(objective) × 3(format) × 2(PE)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 """
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
                 if '__file__' in dir() else '.')
 
-import random, torch
+import random, torch, math
 import matplotlib.pyplot as plt
 import matplotlib; matplotlib.use('Agg')
 import numpy as np
@@ -27,38 +34,33 @@ from collections import defaultdict
 
 from core.tokenizer import CharTokenizer
 from core.train_utils import (
-    mount_drive, save_results, train_model, evaluate,
-    analyse_decode_order, DEVICE,
+    mount_drive, save_results, train_model,
+    generate_ar, generate_diffusion, DEVICE,
 )
 
 EXP_NAME = 'exp_addition'
 
 # ── Config ──────────────────────────────────────────
-MAX_ITERS    = 20_000
-PATIENCE     = 3_000
+ND_OOD       = 7
+ND_TRAIN_SET = [1, 2, 3, 4, 5, 6, 8]
+ND_ALL       = [1, 2, 3, 4, 5, 6, 7, 8]
 
-# Multi-digit configs: (n_digits, n_train, n_test)
-# 3d: number-level OOD (paper comparison), easy baseline
-# 5d: difficulty frontier — where AR vs diffusion diverge
-DIGIT_CONFIGS = [
-    (3,  10_000, 2_000),
-    (5,  50_000, 2_000),
-]
+# Reduced training data — intentionally limited to expose
+# learning difficulty differences between AR and diffusion.
+# Original (Lee et al.) used ~50K; we use 2K to create a
+# regime where neither model achieves 100%.
+ND_ALLOC = {1: 50, 2: 100, 3: 200, 4: 300,
+            5: 350, 6: 400, 8: 600}   # total 2,000
 
-# Number-level OOD only for 3d (paper comparison)
-_rng_split = random.Random(0)
-_ALL_3D = list(range(1000))
-_rng_split.shuffle(_ALL_3D)
-N_HELD_OUT    = 100
-HELD_OUT_OPS  = frozenset(_ALL_3D[:N_HELD_OUT])
-TRAIN_OPS_3D  = sorted(set(_ALL_3D[N_HELD_OUT:]))
-ALL_OPS_3D    = sorted(_ALL_3D)
-HELD_OUT_LIST = sorted(HELD_OUT_OPS)
+N_TEST       = 500      # per digit count
+MAX_ITERS    = 15_000
+PATIENCE     = 2_000
 
-POS_ENCS     = ['absolute', 'rope']
-FORMATS      = ['plain', 'reverse', 'scratchpad']
+FORMATS  = ['plain', 'reverse']
+POS_ENCS = ['absolute', 'rope']
 
-# ── Data generation ─────────────────────────────────
+
+# ── Format functions ────────────────────────────────
 
 def _pad(n, w):
     return str(n).zfill(w)
@@ -82,49 +84,6 @@ FMT_FN = {'plain': _fmt_plain, 'reverse': _fmt_reverse,
            'scratchpad': _fmt_scratchpad}
 
 
-def _gen_from_set(nd, n, operand_list, fmt, seed):
-    rng = random.Random(seed)
-    fn = FMT_FN[fmt]
-    seen, out = set(), []
-    for _ in range(n * 10):
-        if len(out) >= n: break
-        a, b = rng.choice(operand_list), rng.choice(operand_list)
-        if (a, b) in seen: continue
-        seen.add((a, b))
-        out.append(fn(a, b, nd))
-    return out
-
-
-def _gen_ood_number(nd, n, held_list, all_list, fmt, seed):
-    rng = random.Random(seed)
-    fn = FMT_FN[fmt]
-    seen, out = set(), []
-    for _ in range(n * 10):
-        if len(out) >= n: break
-        if rng.random() < 0.5:
-            a, b = rng.choice(held_list), rng.choice(all_list)
-        else:
-            a, b = rng.choice(all_list), rng.choice(held_list)
-        if (a, b) in seen: continue
-        seen.add((a, b))
-        out.append(fn(a, b, nd))
-    return out
-
-
-def _gen_any(nd, n, fmt, seed):
-    rng = random.Random(seed)
-    fn = FMT_FN[fmt]
-    mx = 10 ** nd
-    seen, out = set(), []
-    for _ in range(n * 10):
-        if len(out) >= n: break
-        a, b = rng.randint(0, mx - 1), rng.randint(0, mx - 1)
-        if (a, b) in seen: continue
-        seen.add((a, b))
-        out.append(fn(a, b, nd))
-    return out
-
-
 def get_answer(s, fmt):
     if fmt == 'scratchpad': return s.split('>>')[-1]
     return s.split('=')[1]
@@ -132,154 +91,442 @@ def get_answer(s, fmt):
 def get_full_answer(s):
     return s.split('=', 1)[1]
 
-
-def build_splits_3d(fmt, n_train, n_test):
-    """3d with number-level OOD (paper comparison)."""
-    return {
-        'train':            _gen_from_set(3, n_train, TRAIN_OPS_3D, fmt, 42),
-        'test_id':          _gen_from_set(3, n_test,  TRAIN_OPS_3D, fmt, 1042),
-        'test_ood_number':  _gen_ood_number(3, n_test, HELD_OUT_LIST, ALL_OPS_3D, fmt, 2042),
-        'test_ood_length':  _gen_any(4, n_test, fmt, 3042),
-    }
-
-
-def build_splits_nd(nd, fmt, n_train, n_test):
-    """nd with ID + length OOD only (for 5d)."""
-    return {
-        'train':            _gen_any(nd,   n_train, fmt, 42),
-        'test_id':          _gen_any(nd,   n_test,  fmt, 1042),
-        'test_ood_length':  _gen_any(nd+2, n_test,  fmt, 3042),
-    }
-
-
 def _parse_operands(s):
-    prefix = s.split('=')[0]
-    parts = prefix.split('+')
+    parts = s.split('=')[0].split('+')
     return int(parts[0]), int(parts[1])
 
 
-def breakdown_ood_number(test_samples, eval_result):
-    per_correct = eval_result['per_sample_correct']
-    one_ok, both_ok = [], []
-    for s, ok in zip(test_samples, per_correct):
-        a, b = _parse_operands(s)
-        if a in HELD_OUT_OPS and b in HELD_OUT_OPS:
-            both_ok.append(ok)
-        else:
-            one_ok.append(ok)
-    return {
-        'one_held':  sum(one_ok)  / max(len(one_ok), 1),
-        'both_held': sum(both_ok) / max(len(both_ok), 1),
-        'n_one': len(one_ok), 'n_both': len(both_ok),
-    }
+# ── Carry helpers ───────────────────────────────────
+
+def _count_carries(a, b, nd):
+    """Count carry operations in nd-digit a + b."""
+    a_s, b_s = str(a).zfill(nd), str(b).zfill(nd)
+    carry, count = 0, 0
+    for i in range(nd - 1, -1, -1):
+        s = int(a_s[i]) + int(b_s[i]) + carry
+        carry = s // 10
+        count += carry
+    return count
+
+
+def _carry_positions(a, b, nd):
+    """Return carry-out flags, indexed from LSB (pos 0 = ones)."""
+    a_s, b_s = str(a).zfill(nd), str(b).zfill(nd)
+    flags, carry = [], 0
+    for i in range(nd - 1, -1, -1):
+        s = int(a_s[i]) + int(b_s[i]) + carry
+        carry = s // 10
+        flags.append(bool(carry))
+    return flags
 
 
 def build_tok(fmt):
     chars = list('0123456789+=')
-    if fmt == 'scratchpad': chars.extend(['C', 'S', '>'])
+    if fmt == 'scratchpad':
+        chars.extend(['C', 'S', '>'])
     return CharTokenizer(chars, {'mask': 'M', 'pad': 'P'})
 
 
-# ── Fixation order analysis ──────────────────────────
-# For diffusion: track which answer digit position gets decoded at
-# each step.  Answer positions are indexed 0=MSB to nd=LSB.
-# We also annotate carry positions to test carry-fixation correlation.
+# ── Structured data generation ──────────────────────
 
-def analyse_fixation_order(test_samples, eval_result, nd, fmt, tok):
+def _effective_digits(n):
+    """Number of digits in n (0 has 1 digit)."""
+    return max(1, len(str(n)))
+
+
+def gen_pairs_balanced(nd, n, seed):
     """
-    Analyse which answer-digit positions are fixed first by diffusion.
+    Structured sampling following Lee et al.:
+
+    1) Digit-balanced: operands sampled from [0, 10^nd - 1] with
+       uniform weight across effective digit counts 1..nd.
+       E.g. for nd=5: equal mix of 1-digit (00001-00009),
+       2-digit (00010-00099), ..., 5-digit (10000-99999).
+
+    2) Carry-balanced: within each digit-pair stratum,
+       roughly equal carry counts 0..nd.
+
+    Returns n (a, b) pairs.
+    """
+    rng = random.Random(seed)
+
+    # Digit-count strata ranges
+    digit_ranges = []
+    for d in range(1, nd + 1):
+        lo = 1 if d == 1 else 10 ** (d - 1)
+        hi = 10 ** d - 1
+        digit_ranges.append((lo, hi))
+    # Also include 0 (zero-digit operand) in the 1-digit bucket
+    digit_ranges[0] = (0, 9)
+
+    # Build pool: stratified by (a_eff_digits, b_eff_digits, n_carries)
+    pool = defaultdict(list)
+    seen = set()
+    attempts = n * 100
+
+    for _ in range(attempts):
+        # Pick random effective digit counts for a and b
+        da = rng.randint(1, nd)
+        db = rng.randint(1, nd)
+        lo_a, hi_a = digit_ranges[da - 1]
+        lo_b, hi_b = digit_ranges[db - 1]
+        a = rng.randint(lo_a, hi_a)
+        b = rng.randint(lo_b, hi_b)
+        if (a, b) in seen:
+            continue
+        seen.add((a, b))
+        nc = _count_carries(a, b, nd)
+        pool[nc].append((a, b))
+
+    # Stratified by carry count (primary balancing axis)
+    carry_counts = sorted(pool.keys())
+    target = max(1, n // max(len(carry_counts), 1))
+
+    out = []
+    for nc in carry_counts:
+        rng.shuffle(pool[nc])
+        take = min(target, len(pool[nc]))
+        out.extend(pool[nc][:take])
+
+    # Fill remainder
+    rng2 = random.Random(seed + 9999)
+    hi = 10 ** nd - 1
+    while len(out) < n:
+        a, b = rng2.randint(0, hi), rng2.randint(0, hi)
+        out.append((a, b))
+
+    rng.shuffle(out)
+    return out[:n]
+
+
+def gen_train_mixed(alloc, fmt, seed):
+    """
+    Generate structured training set: digit-balanced + carry-balanced.
+
+    alloc: {nd: n_samples} allocation per digit count.
+    Returns list of formatted strings, shuffled.
+    """
+    fn = FMT_FN[fmt]
+    out = []
+    for nd, n in sorted(alloc.items()):
+        pairs = gen_pairs_balanced(nd, n, seed=seed + nd * 100)
+        for a, b in pairs:
+            out.append(fn(a, b, nd))
+    random.Random(seed).shuffle(out)
+    return out
+
+
+def gen_test(nd, n, fmt, seed):
+    """Generate n carry-balanced test samples for nd-digit."""
+    fn = FMT_FN[fmt]
+    pairs = gen_pairs_balanced(nd, n, seed=seed)
+    return [fn(a, b, nd) for a, b in pairs]
+
+
+# ── Detailed evaluation ─────────────────────────────
+
+def evaluate_detailed(model, tokenizer, test_samples, objective,
+                      fmt, nd, max_len=None, batch_size=128):
+    """
+    Evaluate with full per-sample detail.
+
+    For diffusion, decodes the FULL remaining region (answer + PAD)
+    to match training-time context.
+
+    Returns list of dicts, each containing:
+      a, b, nd, max_eff_digits, gold_ans, pred_ans, correct,
+      pos_correct (per answer digit), carries, n_carries,
+      error_type (if wrong)
+    """
+    mask_id = tokenizer.special_ids['mask']
+    pad_id = tokenizer.special_ids['pad']
+    model.eval()
+
+    # Compute answer length from an example
+    ex = test_samples[0]
+    full_ans = get_full_answer(ex)
+    ans_len = len(tokenizer.encode(full_ans))
+
+    results = []
+
+    for start in range(0, len(test_samples), batch_size):
+        batch = test_samples[start:start + batch_size]
+        B = len(batch)
+
+        penc = [tokenizer.encode(s.split('=')[0] + '=') for s in batch]
+        pmax = max(len(p) for p in penc)
+        pids = torch.full((B, pmax), pad_id, dtype=torch.long)
+        for i, e in enumerate(penc):
+            pids[i, :len(e)] = torch.tensor(e)
+
+        with torch.no_grad():
+            if objective == 'ar':
+                gen = generate_ar(model, pids, ans_len, DEVICE)
+                pred_ids = gen[:, pmax:pmax + ans_len]
+            else:
+                # Decode full remaining region (answer + PAD)
+                n_decode = max_len - pmax if max_len else ans_len
+                gen, _, info = generate_diffusion(
+                    model, pids, n_decode, mask_id,
+                    policy='confidence', greedy=True, device=DEVICE)
+                pred_ids = gen[:, pmax:pmax + ans_len]
+
+        for i in range(B):
+            pred_full = tokenizer.decode(pred_ids[i].cpu().tolist())
+            sample = batch[i]
+            gold_ans = get_answer(sample, fmt)
+
+            # Extract predicted final answer
+            if fmt == 'scratchpad':
+                if '>>' in pred_full:
+                    pred_ans = pred_full.split('>>')[-1]
+                else:
+                    pred_ans = pred_full[-(nd + 1):]
+            else:
+                pred_ans = pred_full
+
+            a, b_val = _parse_operands(sample)
+            max_eff = max(_effective_digits(a), _effective_digits(b_val))
+
+            # Per-position comparison on final answer
+            pos_correct = []
+            for j in range(len(gold_ans)):
+                if j < len(pred_ans):
+                    pos_correct.append(pred_ans[j] == gold_ans[j])
+                else:
+                    pos_correct.append(False)
+
+            carries = _carry_positions(a, b_val, nd)
+            correct = pred_ans == gold_ans
+
+            # Classify error type
+            error_type = None
+            if not correct:
+                if len(pred_ans) != len(gold_ans):
+                    error_type = 'length'
+                else:
+                    wrong_pos = [j for j, c in enumerate(pos_correct)
+                                 if not c]
+                    # Check if errors align with carry positions
+                    carry_pos_set = set()
+                    for ci, cf in enumerate(carries):
+                        if cf:
+                            if fmt == 'reverse':
+                                carry_pos_set.add(ci + 1)
+                            else:
+                                carry_pos_set.add(nd - (ci + 1))
+                    if all(j in carry_pos_set for j in wrong_pos):
+                        error_type = 'carry'
+                    elif len(wrong_pos) == 1:
+                        # off-by-one check
+                        j = wrong_pos[0]
+                        try:
+                            diff = abs(int(pred_ans[j]) - int(gold_ans[j]))
+                            error_type = 'off_by_1' if diff == 1 \
+                                else 'single_digit'
+                        except ValueError:
+                            error_type = 'invalid_char'
+                    else:
+                        error_type = 'multi_digit'
+
+            results.append({
+                'a': a, 'b': b_val, 'nd': nd,
+                'max_eff_digits': max_eff,
+                'gold_ans': gold_ans, 'pred_ans': pred_ans,
+                'correct': correct,
+                'pos_correct': pos_correct,
+                'carries': carries,
+                'n_carries': sum(carries),
+                'error_type': error_type,
+            })
+
+    return results
+
+
+# ── Analysis aggregation ────────────────────────────
+
+def analyse_results(detailed, fmt):
+    """
+    Aggregate detailed evaluation into structured analysis.
 
     Returns:
-        mean_rank[i]: average decode step at which answer position i
-                      was fixed (0=MSB, nd=LSB of (nd+1)-digit answer)
-        carry_corr:   Spearman correlation between carry presence
-                      and fixation rank
+      accuracy, carry_accuracy{nc: (acc, count)},
+      position_accuracy[j], carry_conditional{ci: {...}},
+      eff_digit_accuracy{d: (acc, count)},
+      error_types{type: count},
+      error_examples[{input, gold, pred, wrong_pos, n_carries, type}]
     """
-    if 'decode_orders' not in eval_result:
-        return None
+    if not detailed:
+        return {'accuracy': 0, 'n_samples': 0}
 
-    orders = eval_result['decode_orders']  # list of list of positions
-    ans_len = nd + 1  # answer has nd+1 digits
+    nd = detailed[0]['nd']
+    ans_len = nd + 1
+    n = len(detailed)
 
-    # Find where the answer starts in token sequence
-    ex = test_samples[0]
-    if fmt == 'scratchpad':
-        # answer is after ">>"
-        before_ans = ex.split('>>')[0] + '>>'
-        ans_start = len(tok.encode(before_ans))
-    else:
-        # answer is after "="
-        before_ans = ex.split('=')[0] + '='
-        ans_start = len(tok.encode(before_ans))
+    # 1. Overall accuracy
+    acc = sum(r['correct'] for r in detailed) / n
 
-    # For each sample, extract decode rank for each answer position
-    rank_by_pos = defaultdict(list)  # pos → list of ranks
-    carry_flags = []  # (has_carry_at_pos, rank) pairs
+    # 2. Accuracy by carry count
+    by_nc = defaultdict(list)
+    for r in detailed:
+        by_nc[r['n_carries']].append(r['correct'])
+    carry_acc = {nc: (sum(v) / len(v), len(v))
+                 for nc, v in sorted(by_nc.items())}
 
-    for idx, (sample_str, order) in enumerate(zip(test_samples, orders)):
-        if order is None or len(order) == 0:
+    # 3. Per answer-position accuracy (raw output order)
+    pos_acc = []
+    for j in range(ans_len):
+        vals = [r['pos_correct'][j] for r in detailed
+                if j < len(r['pos_correct'])]
+        pos_acc.append(sum(vals) / max(len(vals), 1))
+
+    # 4. Carry-conditional position accuracy
+    carry_cond = {}
+    for ci in range(nd):
+        if fmt == 'reverse':
+            ans_pos = ci + 1
+        else:
+            ans_pos = nd - (ci + 1)
+
+        if ans_pos < 0 or ans_pos >= ans_len:
             continue
 
-        # Get carry positions from the actual addition
-        a, b = _parse_operands(sample_str)
-        carries = _compute_carries(a, b, nd)
+        with_c = [r['pos_correct'][ans_pos] for r in detailed
+                  if ci < len(r['carries']) and r['carries'][ci]
+                  and ans_pos < len(r['pos_correct'])]
+        without_c = [r['pos_correct'][ans_pos] for r in detailed
+                     if ci < len(r['carries']) and not r['carries'][ci]
+                     and ans_pos < len(r['pos_correct'])]
 
-        # Map decode order to answer positions
-        pos_to_rank = {}
-        for rank, pos in enumerate(order):
-            pos_to_rank[int(pos.item()) if hasattr(pos, 'item') else int(pos)] = rank
+        carry_cond[ci] = {
+            'ans_pos': ans_pos,
+            'acc_with': sum(with_c) / max(len(with_c), 1),
+            'acc_without': sum(without_c) / max(len(without_c), 1),
+            'n_with': len(with_c), 'n_without': len(without_c),
+        }
 
-        for digit_idx in range(ans_len):
-            tok_pos = ans_start + digit_idx
-            if tok_pos in pos_to_rank:
-                rank = pos_to_rank[tok_pos]
-                rank_by_pos[digit_idx].append(rank)
+    # 5. Accuracy by effective digit count (max of a, b)
+    by_eff = defaultdict(list)
+    for r in detailed:
+        by_eff[r['max_eff_digits']].append(r['correct'])
+    eff_digit_acc = {d: (sum(v) / len(v), len(v))
+                     for d, v in sorted(by_eff.items())}
 
-                # For carry correlation (skip MSB carry, index from LSB)
-                # digit_idx 0=MSB, ans_len-1=LSB
-                lsb_idx = ans_len - 1 - digit_idx
-                has_carry = carries[lsb_idx] if lsb_idx < len(carries) else 0
-                carry_flags.append((has_carry, rank))
+    # 6. Error type distribution
+    error_types = defaultdict(int)
+    for r in detailed:
+        if not r['correct']:
+            error_types[r.get('error_type', 'unknown')] += 1
 
-    # Mean rank per answer position
-    mean_rank = {}
-    for pos in range(ans_len):
-        if pos in rank_by_pos and len(rank_by_pos[pos]) > 0:
-            mean_rank[pos] = np.mean(rank_by_pos[pos])
+    # 7. Per-position digit confusion (for errors only)
+    digit_confusion = {}
+    for j in range(ans_len):
+        conf = defaultdict(int)
+        for r in detailed:
+            if (j < len(r['pos_correct']) and not r['pos_correct'][j]
+                    and j < len(r['gold_ans'])
+                    and j < len(r['pred_ans'])):
+                gd, pd = r['gold_ans'][j], r['pred_ans'][j]
+                conf[(gd, pd)] += 1
+        if conf:
+            digit_confusion[j] = dict(conf)
 
-    # Carry-fixation correlation
-    carry_corr = None
-    if len(carry_flags) > 10:
-        from scipy.stats import spearmanr
-        c_arr = np.array(carry_flags)
-        r, p = spearmanr(c_arr[:, 0], c_arr[:, 1])
-        carry_corr = {'rho': float(r), 'p_value': float(p)}
+    # 8. Error examples (up to 20)
+    errors = []
+    for r in detailed:
+        if not r['correct']:
+            wrong = [j for j, c in enumerate(r['pos_correct']) if not c]
+            errors.append({
+                'input': f"{_pad(r['a'], nd)}+{_pad(r['b'], nd)}",
+                'gold': r['gold_ans'], 'pred': r['pred_ans'],
+                'wrong_pos': wrong, 'n_carries': r['n_carries'],
+                'eff_digits': r['max_eff_digits'],
+                'type': r.get('error_type', 'unknown'),
+            })
 
     return {
-        'mean_rank': mean_rank,
-        'carry_corr': carry_corr,
-        'n_samples': len(orders),
+        'accuracy': acc,
+        'n_samples': n,
+        'carry_accuracy': carry_acc,
+        'position_accuracy': pos_acc,
+        'carry_conditional': carry_cond,
+        'eff_digit_accuracy': eff_digit_acc,
+        'error_types': dict(error_types),
+        'digit_confusion': digit_confusion,
+        'n_errors': len(errors),
+        'error_examples': errors[:20],
     }
 
 
-def _compute_carries(a, b, nd):
-    """Return list of carry flags, indexed from LSB (index 0)."""
-    a_s, b_s = str(a).zfill(nd), str(b).zfill(nd)
-    carries = []
-    carry = 0
-    for i in range(nd - 1, -1, -1):
-        s = int(a_s[i]) + int(b_s[i]) + carry
-        carry = s // 10
-        carries.append(carry)
-    carries.append(0)  # no carry into MSB overflow position
-    return carries
+def print_analysis(analysis, nd):
+    """Print formatted analysis for one configuration."""
+    a = analysis
+
+    # Carry breakdown
+    if a.get('carry_accuracy'):
+        parts = [f"{nc}c={acc:.3f}({n})"
+                 for nc, (acc, n) in sorted(a['carry_accuracy'].items())]
+        print(f"    By carries: {' '.join(parts)}")
+
+    # Position accuracy
+    if a.get('position_accuracy'):
+        pa = a['position_accuracy']
+        parts = [f"p{j}={v:.3f}" for j, v in enumerate(pa)]
+        print(f"    By position: {' '.join(parts)}")
+
+    # Effective digit accuracy
+    if a.get('eff_digit_accuracy'):
+        parts = [f"eff{d}={acc:.3f}({n})"
+                 for d, (acc, n) in sorted(
+                     a['eff_digit_accuracy'].items())]
+        print(f"    By eff digits: {' '.join(parts)}")
+
+    # Error type distribution
+    if a.get('error_types'):
+        parts = [f"{t}={c}" for t, c in
+                 sorted(a['error_types'].items(),
+                        key=lambda x: -x[1])]
+        print(f"    Error types: {' '.join(parts)}")
+
+    # Carry conditional (only show if interesting)
+    if a.get('carry_conditional'):
+        for ci, cc in sorted(a['carry_conditional'].items()):
+            if cc['n_with'] > 5 and cc['n_without'] > 5:
+                delta = cc['acc_with'] - cc['acc_without']
+                if abs(delta) > 0.01:
+                    print(f"      carry[{ci}]→pos{cc['ans_pos']}: "
+                          f"with={cc['acc_with']:.3f}({cc['n_with']}) "
+                          f"w/o={cc['acc_without']:.3f}({cc['n_without']}) "
+                          f"Δ={delta:+.3f}")
+
+    # Digit confusion (top confusions)
+    if a.get('digit_confusion'):
+        top_conf = []
+        for pos, conf in a['digit_confusion'].items():
+            for (g, p), cnt in conf.items():
+                top_conf.append((cnt, pos, g, p))
+        top_conf.sort(reverse=True)
+        if top_conf:
+            show = min(5, len(top_conf))
+            parts = [f"pos{p}:{g}→{pr}(×{c})"
+                     for c, p, g, pr in top_conf[:show]]
+            print(f"    Top confusions: {' '.join(parts)}")
+
+    # Error examples
+    if a.get('error_examples') and a['accuracy'] < 1.0:
+        show = min(5, len(a['error_examples']))
+        print(f"    Errors ({a['n_errors']}), first {show}:")
+        for e in a['error_examples'][:show]:
+            print(f"      {e['input']}: gold={e['gold']} "
+                  f"pred={e['pred']} wrong@{e['wrong_pos']} "
+                  f"{e['n_carries']}c [{e['type']}]")
 
 
 # ── Main ────────────────────────────────────────────
 
-def run(include_digit_position=True):
+def run():
     print("=" * 70)
-    print("  EXP 1: Addition — Multi-Digit Scaling + Fixation Order")
+    print("  EXP 1: Addition — Structured Sampling + Interpolation OOD")
     print("=" * 70)
     mount_drive()
     torch.manual_seed(42)
@@ -287,368 +534,357 @@ def run(include_digit_position=True):
     all_results = {}
     all_histories = {}
     convergence_iters = {}
-    fixation_data = {}
 
-    for nd, n_train, n_test in DIGIT_CONFIGS:
-        print(f"\n{'='*60}")
-        print(f"  {nd}-digit addition (train={n_train}, test={n_test})")
-        print(f"{'='*60}")
+    for pos_enc in POS_ENCS:
+        for objective in ['ar', 'diffusion']:
+            for fmt in FORMATS:
+                key = f"{objective}_{fmt}_{pos_enc}"
+                print(f"\n{'─'*60}")
+                print(f"▶ {key}")
+                print(f"{'─'*60}")
 
-        for pos_enc in POS_ENCS:
-            for objective in ['ar', 'diffusion']:
-                for fmt in FORMATS:
-                    key = f"{nd}d_{objective}_{fmt}_{pos_enc}"
-                    print(f"\n▶ {key}")
+                # ── Generate data ──
+                train_data = gen_train_mixed(ND_ALLOC, fmt, seed=42)
 
-                    # Build splits
-                    if nd == 3:
-                        splits = build_splits_3d(fmt, n_train, n_test)
-                        test_splits = ['test_id', 'test_ood_number', 'test_ood_length']
-                    else:
-                        splits = build_splits_nd(nd, fmt, n_train, n_test)
-                        test_splits = ['test_id', 'test_ood_length']
+                test_data = {}
+                for nd in ND_ALL:
+                    test_data[nd] = gen_test(
+                        nd, N_TEST, fmt, seed=1000 + nd)
 
-                    tok = build_tok(fmt)
+                tok = build_tok(fmt)
 
-                    # ── Diagnostic: verify data format ──
-                    ex = splits['train'][0]
-                    ex_enc = tok.encode(ex)
-                    ans_start_pos = ex.index('=') + 1
-                    ans_str = get_answer(ex, fmt)
-                    print(f"  ex: {ex}")
-                    print(f"  tokens: {len(ex_enc)}, ans_start: {ans_start_pos}, "
-                          f"ans: '{ans_str}' ({len(ans_str)} chars)")
+                all_s = train_data
+                for v in test_data.values():
+                    all_s = all_s + v
+                max_len = max(len(tok.encode(s)) for s in all_s) + 1
 
-                    all_s = [s for v in splits.values() for s in v]
-                    max_len = max(len(tok.encode(s)) for s in all_s) + 1
+                # ── Diagnostics ──
+                carry_dist = defaultdict(lambda: defaultdict(int))
+                eff_digit_dist = defaultdict(lambda: defaultdict(int))
+                for s in train_data:
+                    a, b = _parse_operands(s)
+                    nd_s = len(s.split('=')[0].split('+')[0])
+                    nc = _count_carries(a, b, nd_s)
+                    carry_dist[nd_s][nc] += 1
+                    me = max(_effective_digits(a), _effective_digits(b))
+                    eff_digit_dist[nd_s][me] += 1
 
-                    model, hist, ml, conv_it = train_model(
-                        objective, tok, splits['train'], max_len=max_len,
-                        max_iters=MAX_ITERS, patience=PATIENCE,
-                        pos_enc=pos_enc, log_interval=500,
-                    )
-                    all_histories[key] = hist
-                    convergence_iters[key] = conv_it
+                print(f"  Train: {len(train_data)} samples, "
+                      f"max_len={max_len}")
+                for nd_s in sorted(carry_dist):
+                    cd = dict(carry_dist[nd_s])
+                    ed = dict(sorted(eff_digit_dist[nd_s].items()))
+                    print(f"    {nd_s}d carries: {cd}")
+                    print(f"    {nd_s}d eff_dig: {ed}")
+                print(f"  Test: {N_TEST}/nd, OOD=nd={ND_OOD}")
 
-                    get_ans = lambda s, f=fmt: get_answer(s, f)
-                    all_results[key] = {}
+                # ── Train ──
+                model, hist, ml, conv_it = train_model(
+                    objective, tok, train_data, max_len=max_len,
+                    max_iters=MAX_ITERS, patience=PATIENCE,
+                    pos_enc=pos_enc, log_interval=500,
+                )
+                all_histories[key] = hist
+                convergence_iters[key] = conv_it
 
-                    for sp in test_splits:
-                        res = evaluate(
-                            model, tok, splits[sp], objective, get_ans,
-                            get_full_answer, policy='confidence', greedy=True,
-                        )
-                        all_results[key][sp] = res['exact_match']
-                        print(f"    {sp}: {res['exact_match']:.4f}")
+                # ── Evaluate per-nd ──
+                all_results[key] = {}
 
-                        # Number OOD breakdown (3d only)
-                        if sp == 'test_ood_number':
-                            bd = breakdown_ood_number(splits[sp], res)
-                            all_results[key]['number_breakdown'] = bd
-                            print(f"      → one: {bd['one_held']:.4f} "
-                                  f"({bd['n_one']}), both: {bd['both_held']:.4f} "
-                                  f"({bd['n_both']})")
+                for nd in ND_ALL:
+                    tag = 'OOD' if nd == ND_OOD else 'ID'
+                    nd_key = f'{nd}d'
 
-                        # Fixation order (diffusion, test_id only)
-                        if objective == 'diffusion' and sp == 'test_id':
-                            fix = analyse_fixation_order(
-                                splits[sp], res, nd, fmt, tok)
-                            if fix is not None:
-                                fixation_data[key] = fix
-                                mr = fix['mean_rank']
-                                rank_str = ' '.join(
-                                    f"pos{p}={mr[p]:.1f}" for p in sorted(mr))
-                                print(f"      fixation: {rank_str}")
-                                if fix['carry_corr']:
-                                    print(f"      carry_corr: "
-                                          f"rho={fix['carry_corr']['rho']:.3f}")
+                    detailed = evaluate_detailed(
+                        model, tok, test_data[nd], objective,
+                        fmt, nd, max_len=max_len)
+                    analysis = analyse_results(detailed, fmt)
 
-                    save_results(EXP_NAME, all_results, model=model, tag=key)
+                    all_results[key][nd_key] = analysis
 
-    # Store metadata
+                    acc = analysis['accuracy']
+                    print(f"\n  [{tag}] {nd}d: {acc:.4f} "
+                          f"({analysis['n_samples']})")
+                    print_analysis(analysis, nd)
+
+                save_results(EXP_NAME, all_results, model=model,
+                             tag=key)
+
     all_results['convergence_iters'] = convergence_iters
-    all_results['fixation_data'] = {
-        k: {kk: (float(vv) if isinstance(vv, (int, float, np.floating))
-                 else vv)
-            for kk, vv in v.items()}
-        for k, v in fixation_data.items()
-    }
 
-    # ── Visualization ──────────────────────────────────
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    #  Visualisation
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     figs = {}
     configs = [k for k in all_results
-               if isinstance(all_results[k], dict) and 'test_id' in all_results[k]]
+               if isinstance(all_results[k], dict)
+               and '1d' in all_results[k]]
 
-    # 1) Difficulty curve: ID accuracy vs digit count
-    fig, axes = plt.subplots(1, 3, figsize=(20, 5))
-    for fmt_idx, fmt in enumerate(FORMATS):
-        ax = axes[fmt_idx]
+    obj_color = {'ar': '#e74c3c', 'diffusion': '#3498db'}
+
+    # 1) Accuracy vs digit count — per format ───────
+    for fmt in FORMATS:
+        fig, ax = plt.subplots(figsize=(10, 6))
         for obj in ['ar', 'diffusion']:
             for pe in POS_ENCS:
-                xs, ys = [], []
-                for nd, _, _ in DIGIT_CONFIGS:
-                    k = f"{nd}d_{obj}_{fmt}_{pe}"
-                    if k in all_results and isinstance(all_results[k], dict):
-                        xs.append(nd)
-                        ys.append(all_results[k].get('test_id', 0))
+                k = f"{obj}_{fmt}_{pe}"
+                if k not in all_results:
+                    continue
+                accs = [all_results[k].get(f'{nd}d', {})
+                        .get('accuracy', 0) for nd in ND_ALL]
                 ls = '-' if pe == 'absolute' else '--'
-                color = '#e74c3c' if obj == 'ar' else '#3498db'
-                label = f"{obj}_{pe}"
-                ax.plot(xs, ys, ls, color=color, marker='o', label=label, alpha=0.8)
-        ax.set_xlabel('Digits'); ax.set_ylabel('ID Accuracy')
-        ax.set_title(f'{fmt}'); ax.set_ylim(-0.05, 1.05)
-        ax.set_xticks([nd for nd, _, _ in DIGIT_CONFIGS])
-        ax.legend(fontsize=6); ax.grid(alpha=0.3)
-    fig.suptitle('Difficulty Scaling: ID Accuracy vs Digit Count', fontsize=13, y=1.02)
-    fig.tight_layout(); figs['difficulty_curve'] = fig
+                ax.plot(ND_ALL, accs, ls, marker='o',
+                        color=obj_color[obj],
+                        label=f'{obj}/{pe}', alpha=0.8)
+        ax.axvspan(ND_OOD - 0.3, ND_OOD + 0.3,
+                   alpha=0.15, color='orange',
+                   label=f'OOD (nd={ND_OOD})')
+        ax.set_xlabel('Digit Count (nd)')
+        ax.set_ylabel('Exact Match')
+        ax.set_xticks(ND_ALL); ax.set_ylim(-0.05, 1.05)
+        ax.legend(fontsize=8); ax.grid(alpha=0.3)
+        ax.set_title(f'Accuracy vs Digit Count — {fmt}')
+        fig.tight_layout(); figs[f'acc_vs_nd_{fmt}'] = fig
 
-    # 2) Format comparison at each digit count
-    for nd, _, _ in DIGIT_CONFIGS:
-        nd_configs = [k for k in configs if k.startswith(f"{nd}d_")]
-        if not nd_configs:
-            continue
-        sps = ['test_id', 'test_ood_length']
-        if nd == 3:
-            sps = ['test_id', 'test_ood_number', 'test_ood_length']
-        labels = sps
-        fig, axes = plt.subplots(1, len(sps), figsize=(7*len(sps), 6))
-        if len(sps) == 1:
-            axes = [axes]
-        for idx, sp in enumerate(sps):
-            ax = axes[idx]
-            vals = [all_results[k].get(sp, 0) for k in nd_configs]
-            colors = ['#e74c3c' if 'ar' in k else '#3498db' for k in nd_configs]
-            hatches = ['///' if 'rope' in k else '' for k in nd_configs]
-            bars = ax.bar(range(len(nd_configs)), vals, color=colors, alpha=0.85)
-            for bar, h in zip(bars, hatches):
-                bar.set_hatch(h)
-            ax.set_xticks(range(len(nd_configs)))
-            ax.set_xticklabels([k.replace(f'{nd}d_','') for k in nd_configs],
-                               fontsize=5, rotation=45, ha='right')
-            ax.set_ylabel('Exact Match'); ax.set_title(sp); ax.set_ylim(0, 1.05)
-            ax.grid(axis='y', alpha=0.3)
-        fig.suptitle(f'{nd}-digit Addition (hatched=RoPE, red=AR, blue=Diff)',
+    # 2) Carry count breakdown at select nd ─────────
+    for nd_show in [5, 8]:
+        nd_key = f'{nd_show}d'
+        fig, axes = plt.subplots(1, len(FORMATS),
+                                  figsize=(6 * len(FORMATS), 5))
+        for fi, fmt in enumerate(FORMATS):
+            ax = axes[fi]
+            for obj in ['ar', 'diffusion']:
+                for pe in POS_ENCS:
+                    k = f"{obj}_{fmt}_{pe}"
+                    ca = all_results.get(k, {}).get(nd_key, {}) \
+                        .get('carry_accuracy', {})
+                    if not ca:
+                        continue
+                    ncs = sorted(ca.keys())
+                    accs = [ca[nc][0] for nc in ncs]
+                    ls = '-' if pe == 'absolute' else '--'
+                    ax.plot(ncs, accs, ls + 'o',
+                            color=obj_color[obj],
+                            label=f'{obj}/{pe}', alpha=0.8)
+            ax.set_xlabel('# Carries')
+            ax.set_ylabel('Accuracy')
+            ax.set_title(f'{fmt}')
+            ax.set_ylim(-0.05, 1.05)
+            ax.legend(fontsize=6); ax.grid(alpha=0.3)
+        fig.suptitle(f'Accuracy by Carry Count — {nd_show}d',
                      fontsize=13, y=1.02)
-        fig.tight_layout(); figs[f'accuracy_{nd}d'] = fig
+        fig.tight_layout()
+        figs[f'carry_acc_{nd_show}d'] = fig
 
-    # 3) Fixation order heatmap for diffusion
-    diff_fix_keys = [k for k in fixation_data
-                     if 'diffusion' in k and 'plain' in k and 'absolute' in k]
-    if diff_fix_keys:
-        fig, axes = plt.subplots(1, len(diff_fix_keys),
-                                 figsize=(5*len(diff_fix_keys), 4))
-        if len(diff_fix_keys) == 1:
-            axes = [axes]
-        for idx, k in enumerate(sorted(diff_fix_keys)):
-            ax = axes[idx]
-            mr = fixation_data[k]['mean_rank']
-            positions = sorted(mr.keys())
-            ranks = [mr[p] for p in positions]
-            nd_here = int(k.split('d_')[0])
-            labels_pos = [f"MSB" if p == 0 else f"LSB" if p == nd_here
-                          else f"pos{p}" for p in positions]
-            bars = ax.bar(range(len(positions)), ranks, color='#3498db', alpha=0.85)
-            ax.set_xticks(range(len(positions)))
-            ax.set_xticklabels(labels_pos, fontsize=8)
-            ax.set_ylabel('Mean Fixation Rank (lower = decoded earlier)')
-            ax.set_title(f'{k}')
-            ax.grid(axis='y', alpha=0.3)
-        fig.suptitle('Diffusion Fixation Order: Which answer digit is decoded first?',
-                     fontsize=12, y=1.02)
-        fig.tight_layout(); figs['fixation_order'] = fig
+    # 3) Per-position accuracy ──────────────────────
+    for nd_show in [5, 8]:
+        nd_key = f'{nd_show}d'
+        fig, axes = plt.subplots(2, len(FORMATS),
+                                  figsize=(6 * len(FORMATS), 10))
+        for fi, fmt in enumerate(FORMATS):
+            for oi, obj in enumerate(['ar', 'diffusion']):
+                ax = axes[oi, fi]
+                for pe in POS_ENCS:
+                    k = f"{obj}_{fmt}_{pe}"
+                    pa = all_results.get(k, {}).get(nd_key, {}) \
+                        .get('position_accuracy', [])
+                    if not pa:
+                        continue
+                    x = list(range(len(pa)))
+                    ls = '-' if pe == 'absolute' else '--'
+                    ax.plot(x, pa, ls + 's', color=obj_color[obj],
+                            label=f'{pe}', alpha=0.8, markersize=5)
+                ax.set_xlabel('Answer Position')
+                ax.set_ylabel('Accuracy')
+                ax.set_title(f'{obj} / {fmt}')
+                ax.set_ylim(-0.05, 1.05)
+                ax.legend(fontsize=7); ax.grid(alpha=0.3)
+        fig.suptitle(f'Per-Position Accuracy — {nd_show}d',
+                     fontsize=13, y=1.01)
+        fig.tight_layout()
+        figs[f'pos_acc_{nd_show}d'] = fig
 
-    # 4) Fixation order comparison across formats
-    for nd, _, _ in DIGIT_CONFIGS:
-        fmt_keys = {}
+    # 3b) Effective digit accuracy ──────────────────
+    for nd_show in [5, 8]:
+        nd_key = f'{nd_show}d'
+        fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+        for oi, obj in enumerate(['ar', 'diffusion']):
+            ax = axes[oi]
+            for fmt in FORMATS:
+                for pe in POS_ENCS:
+                    k = f"{obj}_{fmt}_{pe}"
+                    eda = all_results.get(k, {}).get(nd_key, {}) \
+                        .get('eff_digit_accuracy', {})
+                    if not eda:
+                        continue
+                    ds = sorted(eda.keys())
+                    accs = [eda[d][0] for d in ds]
+                    ls = '-' if pe == 'absolute' else '--'
+                    marker = 'o' if fmt == 'plain' else \
+                        ('s' if fmt == 'reverse' else '^')
+                    ax.plot(ds, accs, ls, marker=marker,
+                            label=f'{fmt}/{pe}', alpha=0.7)
+            ax.set_xlabel('Max Effective Digits of Operands')
+            ax.set_ylabel('Accuracy')
+            ax.set_title(f'{obj}')
+            ax.set_ylim(-0.05, 1.05)
+            ax.legend(fontsize=6); ax.grid(alpha=0.3)
+        fig.suptitle(f'Accuracy by Operand Size — {nd_show}d',
+                     fontsize=13, y=1.02)
+        fig.tight_layout()
+        figs[f'eff_digit_acc_{nd_show}d'] = fig
+
+    # 3c) Error type breakdown ──────────────────────
+    for nd_show in [5, 7, 8]:
+        nd_key = f'{nd_show}d'
+        error_configs = []
+        for k in configs:
+            et = all_results.get(k, {}).get(nd_key, {}) \
+                .get('error_types', {})
+            if et:
+                error_configs.append((k, et))
+        if not error_configs:
+            continue
+        fig, ax = plt.subplots(figsize=(12, 6))
+        all_types = sorted(set(t for _, et in error_configs
+                               for t in et))
+        x = np.arange(len(error_configs))
+        w = 0.8 / max(len(all_types), 1)
+        for ti, etype in enumerate(all_types):
+            vals = [et.get(etype, 0) for _, et in error_configs]
+            ax.bar(x + ti * w, vals, w, label=etype, alpha=0.8)
+        ax.set_xticks(x + w * len(all_types) / 2)
+        ax.set_xticklabels([k for k, _ in error_configs],
+                           rotation=45, ha='right', fontsize=7)
+        ax.set_ylabel('Error Count')
+        ax.legend(fontsize=7); ax.grid(alpha=0.3, axis='y')
+        tag = '[OOD]' if nd_show == ND_OOD else '[ID]'
+        ax.set_title(f'Error Types — {nd_show}d {tag}')
+        fig.tight_layout()
+        figs[f'error_types_{nd_show}d'] = fig
+
+    # 4) RoPE vs Absolute scatter ───────────────────
+    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+    for oi, obj in enumerate(['ar', 'diffusion']):
+        ax = axes[oi]
         for fmt in FORMATS:
-            k = f"{nd}d_diffusion_{fmt}_absolute"
-            if k in fixation_data:
-                fmt_keys[fmt] = fixation_data[k]
-        if len(fmt_keys) >= 2:
-            fig, ax = plt.subplots(figsize=(8, 5))
-            for fmt, fix in fmt_keys.items():
-                mr = fix['mean_rank']
-                positions = sorted(mr.keys())
-                ranks = [mr[p] for p in positions]
-                ax.plot(positions, ranks, '-o', label=fmt, alpha=0.8)
-            ax.set_xlabel('Answer Position (0=MSB → nd=LSB)')
-            ax.set_ylabel('Mean Fixation Rank')
-            ax.set_title(f'{nd}d: Fixation Order by Format')
-            ax.legend(); ax.grid(alpha=0.3)
-            fig.tight_layout(); figs[f'fixation_compare_{nd}d'] = fig
+            k_abs = f"{obj}_{fmt}_absolute"
+            k_rope = f"{obj}_{fmt}_rope"
+            if k_abs not in all_results or k_rope not in all_results:
+                continue
+            xs, ys, labs = [], [], []
+            for nd in ND_ALL:
+                a_abs = all_results[k_abs].get(f'{nd}d', {}) \
+                    .get('accuracy', 0)
+                a_rope = all_results[k_rope].get(f'{nd}d', {}) \
+                    .get('accuracy', 0)
+                xs.append(a_abs); ys.append(a_rope)
+                labs.append(f'{nd}d')
+            marker = 'o' if fmt == 'plain' else \
+                ('s' if fmt == 'reverse' else '^')
+            ax.scatter(xs, ys, marker=marker, s=60,
+                       label=fmt, alpha=0.7)
+            for x, y, lab in zip(xs, ys, labs):
+                ax.annotate(lab, (x, y), fontsize=6,
+                            textcoords='offset points',
+                            xytext=(4, 4))
+        ax.plot([0, 1], [0, 1], 'k--', alpha=0.3)
+        ax.set_xlabel('Absolute PE Accuracy')
+        ax.set_ylabel('RoPE Accuracy')
+        ax.set_title(obj)
+        ax.set_xlim(-0.05, 1.05); ax.set_ylim(-0.05, 1.05)
+        ax.legend(fontsize=8); ax.grid(alpha=0.3)
+        ax.set_aspect('equal')
+    fig.suptitle('RoPE vs Absolute PE', fontsize=13, y=1.02)
+    fig.tight_layout(); figs['rope_vs_abs'] = fig
+
+    # 5) Training loss curves ───────────────────────
+    fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+    for fi, fmt in enumerate(FORMATS):
+        for oi, obj in enumerate(['ar', 'diffusion']):
+            ax = axes[oi, fi]
+            for pe in POS_ENCS:
+                k = f"{obj}_{fmt}_{pe}"
+                h = all_histories.get(k, {})
+                if 'loss' in h:
+                    ls = '-' if pe == 'absolute' else '--'
+                    ax.plot(h.get('iter', range(len(h['loss']))),
+                            h['loss'], ls, label=pe, alpha=0.7)
+            ax.set_xlabel('Iteration')
+            ax.set_ylabel('Loss')
+            ax.set_title(f'{obj}/{fmt}')
+            ax.legend(fontsize=7); ax.grid(alpha=0.3)
+    fig.suptitle('Training Loss Curves', fontsize=13, y=1.01)
+    fig.tight_layout(); figs['training_loss'] = fig
 
     save_results(EXP_NAME, all_results, figures=figs)
 
-    # ── Summary ──
+    # ── Summary ─────────────────────────────────────
     print("\n" + "=" * 70)
-    print("SUMMARY")
+    print("SUMMARY — Accuracy by Digit Count")
     print("=" * 70)
-    for nd, _, _ in DIGIT_CONFIGS:
-        nd_cfgs = [k for k in configs if k.startswith(f"{nd}d_")]
-        if not nd_cfgs:
-            continue
-        sps = ['test_id']
-        if nd == 3:
-            sps += ['test_ood_number']
-        sps += ['test_ood_length']
-        header = f"{'Config':<40}" + ''.join(f" {s:>12}" for s in sps) + f" {'conv':>8}"
-        print(f"\n{nd}-DIGIT:")
-        print(header)
-        print("-" * len(header))
-        for k in nd_cfgs:
-            r = all_results[k]
-            vals = ''.join(f" {r.get(s, 0):>12.4f}" for s in sps)
-            print(f"{k:<40}{vals} {convergence_iters.get(k,'?'):>8}")
 
-    # Fixation summary
-    if fixation_data:
-        print("\nFIXATION ORDER (diffusion, lower rank = decoded earlier):")
-        for k in sorted(fixation_data.keys()):
-            fix = fixation_data[k]
-            mr = fix['mean_rank']
-            rank_str = ', '.join(f"pos{p}={mr[p]:.1f}" for p in sorted(mr))
-            cc = fix.get('carry_corr')
-            cc_str = f"carry_rho={cc['rho']:.3f}" if cc else "N/A"
-            print(f"  {k}: [{rank_str}] {cc_str}")
+    header = f"{'Config':<32}"
+    for nd in ND_ALL:
+        tag = '*' if nd == ND_OOD else ' '
+        header += f" {nd}d{tag:>5}"
+    header += f"  {'conv':>6}"
+    print(header)
+    print("─" * len(header))
+
+    for fmt in FORMATS:
+        for obj in ['ar', 'diffusion']:
+            for pe in POS_ENCS:
+                k = f"{obj}_{fmt}_{pe}"
+                if k not in all_results:
+                    continue
+                row = f"{k:<32}"
+                for nd in ND_ALL:
+                    a = all_results[k].get(f'{nd}d', {}) \
+                        .get('accuracy', 0)
+                    row += f" {a:>6.3f}"
+                ci = convergence_iters.get(k, '?')
+                row += f"  {ci:>6}"
+                print(row)
+        print()
+
+    # OOD gap analysis
+    print(f"\nOOD ({ND_OOD}d) vs Neighbours "
+          f"({ND_OOD-1}d, {ND_OOD+1}d):")
+    print(f"{'Config':<32}  {ND_OOD-1}d   {ND_OOD}d*  "
+          f"{ND_OOD+1}d   gap")
+    print("─" * 60)
+    for k in sorted(configs):
+        a_lo = all_results[k].get(f'{ND_OOD-1}d', {}) \
+            .get('accuracy', 0)
+        a_ood = all_results[k].get(f'{ND_OOD}d', {}) \
+            .get('accuracy', 0)
+        a_hi = all_results[k].get(f'{ND_OOD+1}d', {}) \
+            .get('accuracy', 0)
+        avg = (a_lo + a_hi) / 2
+        gap = avg - a_ood
+        print(f"{k:<32}  {a_lo:.3f}  {a_ood:.3f}  "
+              f"{a_hi:.3f}  {gap:+.3f}")
+
+    # Detailed error output for key conditions
+    print("\n" + "=" * 70)
+    print("DETAILED ERROR ANALYSIS")
+    print("=" * 70)
+    for nd in [5, 7, 8]:
+        nd_key = f'{nd}d'
+        tag = '[OOD]' if nd == ND_OOD else '[ID]'
+        print(f"\n{'─'*60}")
+        print(f"  {nd}d {tag}")
+        print(f"{'─'*60}")
+        for k in sorted(configs):
+            a = all_results[k].get(nd_key, {})
+            if not a or a.get('accuracy', 1) >= 0.999:
+                continue
+            print(f"\n  ▸ {k}: acc={a['accuracy']:.4f}")
+            print_analysis(a, nd)
 
     plt.show()
-
-    # ── Optional: Digit-position exclusion analysis ──
-    if include_digit_position:
-        dp_results = run_digit_position_analysis()
-        all_results['digit_position'] = dp_results
-
     return all_results
 
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  Secondary Analysis: Digit-Position Exclusion (Lee et al. B.2.1)
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-EXCL_DIGIT = 5
-EXCL_POSITIONS = [0, 1, 2]
-EXCL_FMT = 'plain'
-EXCL_N_TRAIN = 10_000
-EXCL_N_TEST  = 10_000
-DIGITS_FULL  = list(range(10))
-DIGITS_NO5   = [d for d in range(10) if d != EXCL_DIGIT]
-
-
-def _gen_excl_operand(nd, excl_pos, rng):
-    digits = []
-    for p in range(nd):
-        pool = DIGITS_NO5 if p == excl_pos else DIGITS_FULL
-        digits.append(str(rng.choice(pool)))
-    return int(''.join(reversed(digits)))
-
-
-def _gen_excl_data(nd, n, excl_pos, fmt, seed):
-    rng = random.Random(seed)
-    fn = FMT_FN[fmt]
-    seen, out = set(), []
-    for _ in range(n * 10):
-        if len(out) >= n: break
-        a = _gen_excl_operand(nd, excl_pos, rng)
-        b = _gen_excl_operand(nd, excl_pos, rng)
-        if (a, b) in seen: continue
-        seen.add((a, b))
-        out.append(fn(a, b, nd))
-    return out
-
-
-def _has_digit_at_pos(s, digit, pos, nd=3):
-    prefix = s.split('=')[0]
-    parts = prefix.split('+')
-    a_s, b_s = parts[0].zfill(nd), parts[1].zfill(nd)
-    str_idx = nd - 1 - pos
-    return int(a_s[str_idx]) == digit or int(b_s[str_idx]) == digit
-
-
-def run_digit_position_analysis():
-    print("\n" + "=" * 70)
-    print("  SECONDARY: Digit-Position Exclusion (B.2.1)")
-    print(f"  Exclude digit {EXCL_DIGIT} from one position at a time")
-    print("=" * 70)
-    mount_drive()
-    torch.manual_seed(123)
-
-    pos_names = {0: 'LSB (ones)', 1: '2nd (tens)', 2: 'MSB (hundreds)'}
-    test_all = _gen_any(3, EXCL_N_TEST, EXCL_FMT, seed=9999)
-    tok = build_tok(EXCL_FMT)
-    results = {}
-
-    for excl_pos in EXCL_POSITIONS:
-        for objective in ['ar', 'diffusion']:
-            key = f"{objective}_excl{excl_pos}"
-            print(f"\n▶ {key} — exclude {EXCL_DIGIT} from {pos_names[excl_pos]}")
-
-            train = _gen_excl_data(3, EXCL_N_TRAIN, excl_pos, EXCL_FMT,
-                                   seed=42+excl_pos)
-            all_s = train + test_all
-            max_len = max(len(tok.encode(s)) for s in all_s) + 1
-
-            model, hist, ml, conv_it = train_model(
-                objective, tok, train, max_len=max_len,
-                max_iters=MAX_ITERS, patience=PATIENCE,
-                pos_enc='absolute', log_interval=500,
-            )
-
-            get_ans = lambda s: get_answer(s, EXCL_FMT)
-            res = evaluate(
-                model, tok, test_all, objective, get_ans,
-                get_full_answer, policy='confidence', greedy=True,
-            )
-
-            per_correct = res['per_sample_correct']
-            excl_ok, rest_ok = [], []
-            for s, ok in zip(test_all, per_correct):
-                if _has_digit_at_pos(s, EXCL_DIGIT, excl_pos):
-                    excl_ok.append(ok)
-                else:
-                    rest_ok.append(ok)
-
-            results[key] = {
-                'excl_pos': excl_pos,
-                'overall': res['exact_match'],
-                'exclusion_acc': sum(excl_ok) / max(len(excl_ok), 1),
-                'rest_acc': sum(rest_ok) / max(len(rest_ok), 1),
-                'n_excl': len(excl_ok), 'n_rest': len(rest_ok),
-                'conv_it': conv_it,
-            }
-            print(f"    overall: {results[key]['overall']:.4f}, "
-                  f"excl_acc: {results[key]['exclusion_acc']:.4f}")
-
-    # Summary + plot
-    print("\n" + "=" * 70)
-    print("DIGIT-POSITION EXCLUSION SUMMARY")
-    print(f"{'Config':<25} {'Position':<18} {'Overall':>8} {'Excl':>8} {'Rest':>8}")
-    print("-" * 70)
-    for k in sorted(results):
-        r = results[k]
-        print(f"{k:<25} {pos_names[r['excl_pos']]:<18} "
-              f"{r['overall']:>8.4f} {r['exclusion_acc']:>8.4f} {r['rest_acc']:>8.4f}")
-
-    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
-    for ax_idx, metric in enumerate(['overall', 'exclusion_acc']):
-        ax = axes[ax_idx]
-        x = np.arange(len(EXCL_POSITIONS))
-        w = 0.35
-        ar_vals = [results[f'ar_excl{p}'][metric] for p in EXCL_POSITIONS]
-        diff_vals = [results[f'diffusion_excl{p}'][metric] for p in EXCL_POSITIONS]
-        ax.bar(x - w/2, ar_vals, w, label='AR', color='#e74c3c', alpha=0.85)
-        ax.bar(x + w/2, diff_vals, w, label='Diffusion', color='#3498db', alpha=0.85)
-        ax.set_xticks(x)
-        ax.set_xticklabels([pos_names[p] for p in EXCL_POSITIONS])
-        ax.set_ylabel('Exact Match')
-        ax.set_title('Overall' if metric == 'overall' else 'Exclusion Accuracy')
-        ax.set_ylim(0, 1.05); ax.legend(); ax.grid(axis='y', alpha=0.3)
-    fig.suptitle(f'Digit-Position Exclusion: digit {EXCL_DIGIT}', fontsize=13, y=1.02)
-    fig.tight_layout()
-    save_results(f'{EXP_NAME}_digit_position', results, figures={'digit_pos': fig})
-    plt.show()
-    return results
-
-
 if __name__ == '__main__':
-    # Runs main multi-digit experiment + digit-position exclusion analysis
-    run(include_digit_position=True)
+    run()

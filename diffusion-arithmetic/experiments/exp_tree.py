@@ -8,11 +8,15 @@
   Tests whether diffusion models can decode independent output
   segments in parallel without accuracy loss.
 
-  Format:  a1+b1|a2+b2|...|ak+bk=r1|r2|...|rk
-  Example: 328+242|854+204=0570|1058
+  Format:  a1+b1=r1|a2+b2=r2|...|ak+bk=rk
+  Example: 328+242=0570|854+204=1058
+
+  Each problem–answer pair is self-contained. For AR, the model
+  generates each answer immediately after seeing its problem.
+  For diffusion, all answer positions are decoded (along with
+  interleaved problem text in the answer region).
 
   3-digit operands → carry chains make each segment non-trivial.
-  k=1 baseline is redundant with exp_addition and omitted.
 
   Decode strategies tested (same trained model):
     seq       — sequential confidence (1 token/step, fair vs AR)
@@ -51,6 +55,9 @@ MAX_ITERS   = 15_000
 PATIENCE    = 2_000
 POS_ENCS    = ['absolute', 'rope']
 
+# Each segment: "XXX+YYY=ZZZZ" = 3+1+3+1+4 = 12 chars
+SEG_LEN     = 2 * ND + 2 + ANS_WIDTH     # 12
+
 # Diffusion decode strategies to compare
 # (policy, parallel_k, label)
 #   parallel_k: tokens per step (clamped to actual decode length)
@@ -64,14 +71,17 @@ DIFF_STRATEGIES = [
 # ── Data generation ─────────────────────────────────
 
 def gen_sample(k, nd, rng):
-    """Generate one sample: k independent nd-digit additions."""
+    """
+    Generate one sample: k independent nd-digit additions.
+    Format: a1+b1=r1|a2+b2=r2|...|ak+bk=rk
+    """
     lo, hi = 10**(nd - 1), 10**nd - 1
-    problems, answers = [], []
+    segments = []
     for _ in range(k):
         a, b = rng.randint(lo, hi), rng.randint(lo, hi)
-        problems.append(f"{a}+{b}")
-        answers.append(str(a + b).zfill(ANS_WIDTH))
-    return "|".join(problems) + "=" + "|".join(answers)
+        ans = str(a + b).zfill(ANS_WIDTH)
+        segments.append(f"{a}+{b}={ans}")
+    return "|".join(segments)
 
 
 def gen_data_mixed(ks, n, seed=42):
@@ -87,7 +97,45 @@ def gen_data_fixed_k(k, n, seed=42):
 
 
 def get_answer(s):
+    """
+    Extract the answer region (everything after the first '=').
+    For '328+242=0570|854+204=1058' → '0570|854+204=1058'
+    """
     return s.split('=', 1)[1]
+
+
+def get_segment_answers(s, k):
+    """
+    Extract individual answers from the interleaved format.
+    '328+242=0570|854+204=1058' → ['0570', '1058']
+    """
+    segments = s.split('|')
+    return [seg.split('=')[1] for seg in segments]
+
+
+def answer_offsets_in_region(k):
+    """
+    Compute where each segment's answer digits fall within the
+    answer region (everything after the first '=').
+
+    Answer region for k=2: '0570|854+204=1058'
+      seg0 answer at offset 0..3 (ANS_WIDTH chars)
+      seg1 answer at offset 4+8=12..15 (after '|854+204=')
+
+    Returns list of (start, end) pairs into the answer region string.
+    """
+    offsets = []
+    # First segment answer starts at offset 0
+    offsets.append((0, ANS_WIDTH))
+    # Subsequent segments: each preceded by '|' + problem + '='
+    # problem = 'XXX+YYY' = 2*ND+1 chars, plus '|' and '='
+    inter = 1 + (2 * ND + 1) + 1  # |XXX+YYY=
+    pos = ANS_WIDTH
+    for _ in range(1, k):
+        pos += inter
+        offsets.append((pos, pos + ANS_WIDTH))
+        pos += ANS_WIDTH
+    return offsets
 
 
 def build_tok():
@@ -112,27 +160,39 @@ def _kendall_tau(x, y):
     return (con - dis) / d if d > 0 else 0.0
 
 
-def segment_accuracy(pred_str, gold_str, k):
-    """Per-segment exact match."""
-    pred_segs = pred_str.split('|')
-    gold_segs = gold_str.split('|')
-    if len(pred_segs) != k:
-        return [False] * k
-    return [p == g for p, g in zip(pred_segs, gold_segs)]
+def segment_accuracy(pred_ans_region, gold_ans_region, k):
+    """
+    Per-segment exact match from the answer region string.
+    The answer region is '0570|854+204=1058' (interleaved format).
+    Extract answer digits at known offsets.
+    """
+    offsets = answer_offsets_in_region(k)
+    results = []
+    for start, end in offsets:
+        pred_seg = pred_ans_region[start:end] \
+            if end <= len(pred_ans_region) else ''
+        gold_seg = gold_ans_region[start:end] \
+            if end <= len(gold_ans_region) else ''
+        results.append(pred_seg == gold_seg)
+    return results
 
 
-def analyse_parallel_decode(decode_orders, ans_start, k,
-                            seg_width=ANS_WIDTH):
-    """Parallelism metrics from sequential decode orders."""
+def analyse_parallel_decode(decode_orders, ans_start, k):
+    """
+    Parallelism metrics from sequential decode orders.
+    Uses answer_offsets_in_region to locate each segment's answer
+    digit positions within the answer region.
+    """
     if decode_orders is None or len(decode_orders) == 0:
         return {}
 
     N, S = decode_orders.shape
 
+    # Map answer offsets to positions in decode order
+    offsets = answer_offsets_in_region(k)
     seg_positions = []
-    for i in range(k):
-        start = i * (seg_width + 1)
-        seg_positions.append(list(range(start, start + seg_width)))
+    for start, end in offsets:
+        seg_positions.append(list(range(start, end)))
 
     rel_orders = (decode_orders - ans_start).long().clamp(0, S - 1)
     steps = torch.arange(S).unsqueeze(0).expand(N, S).float()

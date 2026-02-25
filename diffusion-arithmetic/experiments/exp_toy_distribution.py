@@ -239,6 +239,60 @@ class MarkovPlusGlobal(ToyDistribution):
         return lp
 
 
+class HardMarkov(ToyDistribution):
+    """
+    Nearly deterministic 2nd-order Markov chain.
+    Each context maps to exactly one token with probability p_peak,
+    the remaining tokens share (1 - p_peak) uniformly.
+
+    l2r is provably optimal: given correct context, conditional
+    entropy per step ≈ H(Bernoulli(p_peak)) ≈ 0.12 bits.
+    Any other ordering must marginalise over uncertain context,
+    giving much higher conditional entropy.
+
+    We also store the deterministic map for analytic comparison.
+    """
+    def __init__(self, order=2, p_peak=0.97, seed=42):
+        super().__init__()
+        self.k = order
+        self.p_peak = p_peak
+        rng = np.random.RandomState(seed)
+        n_ctx = V ** order
+        # Deterministic map: context → preferred token
+        self.preferred = rng.randint(0, V, size=n_ctx)
+        # Build transition log probs
+        p_other = (1.0 - p_peak) / (V - 1)
+        self.trans_logp = torch.full(
+            (n_ctx, V), np.log(p_other + 1e-30), dtype=torch.float32)
+        for c in range(n_ctx):
+            self.trans_logp[c, self.preferred[c]] = np.log(p_peak)
+        # Uniform initial (first `order` tokens)
+        self.init_lp = np.log(1.0 / n_ctx)
+        self._ctx_powers = V ** torch.arange(order)
+
+    def _ctx_index(self, x_ctx):
+        return (x_ctx * self._ctx_powers).sum(-1)
+
+    def log_prob(self, x):
+        x = x.reshape(-1, L); n = x.shape[0]
+        lp = torch.full((n,), self.init_lp, dtype=torch.float32)
+        for t in range(self.k, L):
+            ctx_idx = self._ctx_index(x[:, t-self.k:t])
+            lp += self.trans_logp[ctx_idx, x[:, t]]
+        return lp
+
+    def theoretical_l2r_entropy(self):
+        """Conditional entropy per step for l2r decoding."""
+        p_other = (1.0 - self.p_peak) / (V - 1)
+        h = -(self.p_peak * np.log2(self.p_peak)
+              + (V - 1) * p_other * np.log2(p_other + 1e-30))
+        return h
+
+    def expected_accuracy_l2r(self):
+        """Expected per-token accuracy for l2r greedy decoding."""
+        return self.p_peak
+
+
 # ── Train ───────────────────────────────────────────
 
 def train_toy_model(dist, print_every=5):
@@ -481,49 +535,74 @@ def _seq_to_idx(seqs):
 
 def compute_metrics(samples, scores, dist):
     """
-    Compute TV, KL, mode coverage, path score correlation.
-    Includes bootstrap confidence intervals and ideal baseline TV.
-    Fully vectorized — no Python loops over samples.
+    Compute distributional metrics: TV, forward KL, reverse KL, JS,
+    mode coverage, path score correlation.
+
+    Metrics:
+      tv:         ½ Σ|p - q|          (symmetric, bounded [0,1])
+      kl_forward: KL(p ‖ q) = Σ p log(p/q)   (mode-seeking; ∞ if q=0 where p>0)
+      kl_reverse: KL(q ‖ p) = Σ q log(q/p)   (mean-seeking; penalises q-mass off p)
+      js:         ½ KL(p‖m) + ½ KL(q‖m), m=(p+q)/2  (symmetric, bounded)
+
+    Per-sample: true log-probability for each generated sample,
+    enabling direct comparison with model path scores.
     """
     all_seqs, p_true = dist.full_distribution()
     K = len(all_seqs)
     n = len(samples)
     p_np = p_true.numpy()
 
-    # Pre-compute canonical index for all sequences
-    all_idx = _seq_to_idx(all_seqs)       # (K,) — canonical ordering
-    sample_idx = _seq_to_idx(samples)      # (n,)
+    all_idx = _seq_to_idx(all_seqs)
+    sample_idx = _seq_to_idx(samples)
 
-    # Build empirical distribution via bincount (vectorized)
+    # Empirical distribution
     raw_counts = np.bincount(sample_idx, minlength=V**L)
-    # Map from raw index space to canonical ordering
     q_emp = raw_counts[all_idx] / n
 
-    # Point estimates
+    # ── TV ──
     tv = np.sum(np.abs(p_np - q_emp)) / 2
-    kl = np.sum(p_np * np.log(p_np / np.maximum(q_emp, 1e-10) + 1e-30)
-                * (p_np > 1e-10))
 
-    # Mode coverage (top 100 modes)
+    # ── Forward KL: KL(p ‖ q) ──
+    # Capped: where q=0 and p>0, use log(p/eps)
+    eps = 1e-10
+    q_safe = np.maximum(q_emp, eps)
+    mask_p = p_np > eps
+    kl_forward = np.sum(p_np[mask_p] * np.log(p_np[mask_p] / q_safe[mask_p]))
+
+    # ── Reverse KL: KL(q ‖ p) ──
+    p_safe = np.maximum(p_np, eps)
+    mask_q = q_emp > eps
+    kl_reverse = np.sum(q_emp[mask_q] * np.log(q_emp[mask_q] / p_safe[mask_q]))
+
+    # ── Jensen-Shannon divergence ──
+    m = (p_np + q_emp) / 2
+    m_safe = np.maximum(m, eps)
+    js = 0.5 * np.sum(p_np[mask_p] * np.log(p_np[mask_p] / m_safe[mask_p])) \
+       + 0.5 * np.sum(q_emp[mask_q] * np.log(q_emp[mask_q] / m_safe[mask_q]))
+
+    # ── Mode coverage (top 100) ──
     top_idx = p_true.topk(min(100, K)).indices.numpy()
     coverage = np.mean([q_emp[i] > 0 for i in top_idx])
 
-    # Path score correlation
+    # ── Per-sample true log probability ──
     true_lp = dist.log_prob(samples).numpy()
     scores_np = scores.numpy()
     valid = np.isfinite(scores_np) & np.isfinite(true_lp)
-    sr = spearmanr(scores_np[valid], true_lp[valid])[0] if valid.sum() > 10 else 0
+    sr = spearmanr(scores_np[valid], true_lp[valid])[0] \
+        if valid.sum() > 10 else 0
 
-    # ── Bootstrap CI for TV ──
-    # Vectorized: multinomial resampling of counts
-    tv_boots = np.empty(BOOTSTRAP_K)
+    # ── Bootstrap CI for KL forward ──
+    kl_boots = np.empty(BOOTSTRAP_K)
     for b in range(BOOTSTRAP_K):
         idx = np.random.choice(n, size=n, replace=True)
         boot_counts = np.bincount(sample_idx[idx], minlength=V**L)
         q_boot = boot_counts[all_idx] / n
-        tv_boots[b] = np.sum(np.abs(p_np - q_boot)) / 2
+        q_boot_safe = np.maximum(q_boot, eps)
+        kl_boots[b] = np.sum(
+            p_np[mask_p] * np.log(p_np[mask_p] / q_boot_safe[mask_p]))
 
-    # ── Ideal baseline: TV from sampling p_true directly ──
+    # ── Ideal baseline ──
+    ideal_kls = np.empty(5)
     ideal_tvs = np.empty(5)
     for t in range(5):
         ideal_samples = dist.sample(n)
@@ -531,18 +610,23 @@ def compute_metrics(samples, scores, dist):
         ideal_counts = np.bincount(ideal_idx, minlength=V**L)
         q_ideal = ideal_counts[all_idx] / n
         ideal_tvs[t] = np.sum(np.abs(p_np - q_ideal)) / 2
-    baseline_tv = ideal_tvs.mean()
+        q_ideal_safe = np.maximum(q_ideal, eps)
+        ideal_kls[t] = np.sum(
+            p_np[mask_p] * np.log(p_np[mask_p] / q_ideal_safe[mask_p]))
 
     return {
         'tv': float(tv),
-        'tv_ci_lo': float(np.percentile(tv_boots, 2.5)),
-        'tv_ci_hi': float(np.percentile(tv_boots, 97.5)),
-        'tv_baseline': float(baseline_tv),
-        'tv_excess': float(tv - baseline_tv),
-        'kl': float(kl),
+        'tv_baseline': float(ideal_tvs.mean()),
+        'kl_forward': float(kl_forward),
+        'kl_forward_ci_lo': float(np.percentile(kl_boots, 2.5)),
+        'kl_forward_ci_hi': float(np.percentile(kl_boots, 97.5)),
+        'kl_forward_baseline': float(ideal_kls.mean()),
+        'kl_reverse': float(kl_reverse),
+        'js': float(js),
         'mode_coverage': float(coverage),
         'spearman_r': float(sr),
         'mean_true_lp': float(true_lp.mean()),
+        'std_true_lp': float(true_lp.std()),
         'n_unique': int(len(np.unique(sample_idx))),
         'support_coverage': float(len(np.unique(sample_idx)) / K),
     }
@@ -602,6 +686,175 @@ def compute_mi_order_alignment(mean_ranks, MI):
             'total_mi': total_mi.tolist(), 'mean_ranks': mean_ranks.tolist()}
 
 
+def compute_detailed_analysis(samples, dist):
+    """
+    Per-sample and per-position analysis from the SAME samples
+    used for aggregate metrics (no separate generation).
+
+    Args:
+        samples: (N, L) tensor — the same 500K decoded sequences
+        dist: ToyDistribution — ground truth
+
+    Returns dict with:
+        per_position_marginal_kl:  KL(p_true_marginal ‖ q_empirical_marginal) per pos
+        per_position_mode_acc:     fraction where empirical mode matches true mode
+        true_lp_histogram:         binned distribution of log p_true(x) for samples
+        true_lp_percentiles:       [5, 25, 50, 75, 95] percentiles
+        context_analysis:          (for Markov dists) per-context accuracy
+    """
+    all_seqs, p_true = dist.full_distribution()
+    p_np = p_true.numpy()
+    if isinstance(samples, torch.Tensor):
+        S = samples.numpy()
+    else:
+        S = np.array(samples)
+    N = len(S)
+    eps = 1e-10
+
+    # ── 1. Per-position marginal KL ──
+    # True marginals from full distribution
+    true_marginals = []
+    for i in range(L):
+        m = np.zeros(V)
+        for v in range(V):
+            m[v] = p_np[all_seqs[:, i].numpy() == v].sum()
+        true_marginals.append(m)
+
+    # Empirical marginals from samples
+    emp_marginals = []
+    for i in range(L):
+        m = np.bincount(S[:, i], minlength=V).astype(float) / N
+        emp_marginals.append(m)
+
+    pos_marginal_kl = []
+    for i in range(L):
+        p_m = true_marginals[i]
+        q_m = np.maximum(emp_marginals[i], eps)
+        kl = np.sum(p_m * np.log(p_m / q_m) * (p_m > eps))
+        pos_marginal_kl.append(float(kl))
+
+    # ── 2. Per-position mode accuracy ──
+    # Does the most common token at each position match the true mode?
+    pos_mode_acc = []
+    for i in range(L):
+        true_mode = int(np.argmax(true_marginals[i]))
+        emp_mode = int(np.argmax(emp_marginals[i]))
+        pos_mode_acc.append(true_mode == emp_mode)
+
+    # ── 3. True log-probability distribution of generated samples ──
+    true_lp = dist.log_prob(torch.tensor(S)).numpy()
+    percentiles = np.percentile(true_lp, [5, 25, 50, 75, 95]).tolist()
+
+    # Histogram for plotting
+    hist_counts, hist_edges = np.histogram(true_lp, bins=50)
+    hist_centers = ((hist_edges[:-1] + hist_edges[1:]) / 2).tolist()
+    hist_counts = hist_counts.tolist()
+
+    # Compare with true expected log-prob: E_{x~p}[log p(x)]
+    all_lp = dist.log_prob(all_seqs).numpy()
+    true_expected_lp = float((p_np * all_lp).sum())
+
+    result = {
+        'per_position_marginal_kl': pos_marginal_kl,
+        'per_position_mode_correct': pos_mode_acc,
+        'true_marginals': [m.tolist() for m in true_marginals],
+        'emp_marginals': [m.tolist() for m in emp_marginals],
+        'true_lp_percentiles': percentiles,
+        'true_lp_mean': float(true_lp.mean()),
+        'true_lp_std': float(true_lp.std()),
+        'true_expected_lp': true_expected_lp,
+        'lp_gap': float(true_lp.mean() - true_expected_lp),
+        'hist_centers': hist_centers,
+        'hist_counts': hist_counts,
+    }
+
+    # ── 4. Context-conditional analysis for Markov distributions ──
+    if isinstance(dist, (MarkovChain, MarkovPlusGlobal, HardMarkov)):
+        markov = dist if isinstance(dist, (MarkovChain, HardMarkov)) \
+            else dist.markov
+        order = markov.k
+
+        # For each context, compute empirical vs true conditional
+        n_ctx = V ** order
+        ctx_analysis = {}
+        ctx_counts = np.zeros((n_ctx, V))  # counts of x_t given context
+        ctx_total = np.zeros(n_ctx)
+
+        for t in range(order, L):
+            # Compute context index for all samples
+            ctx_idx = np.zeros(N, dtype=np.int64)
+            for o in range(order):
+                ctx_idx += S[:, t - order + o] * (V ** o)
+            for c in range(n_ctx):
+                mask = ctx_idx == c
+                if mask.any():
+                    for v in range(V):
+                        ctx_counts[c, v] += (S[mask, t] == v).sum()
+                    ctx_total[c] += mask.sum()
+
+        # Per-context KL and accuracy
+        ctx_kl = []
+        ctx_acc = []
+        ctx_details = []
+        for c in range(n_ctx):
+            if ctx_total[c] < 10:
+                continue
+            emp_cond = ctx_counts[c] / max(ctx_total[c], 1)
+            true_cond = np.exp(markov.trans_logp[c].numpy())
+            kl = float(np.sum(
+                true_cond * np.log(true_cond / np.maximum(emp_cond, eps))
+                * (true_cond > eps)))
+            true_mode = int(np.argmax(true_cond))
+            emp_mode = int(np.argmax(emp_cond))
+            acc = float(emp_cond[true_mode])
+
+            ctx_kl.append(kl)
+            ctx_acc.append(acc)
+            ctx_details.append({
+                'ctx': c, 'kl': kl,
+                'true_mode': true_mode, 'emp_mode': emp_mode,
+                'true_mode_prob': float(true_cond[true_mode]),
+                'emp_mode_prob': acc,
+                'n_obs': int(ctx_total[c]),
+            })
+
+        # Sort by KL to find worst contexts
+        ctx_details.sort(key=lambda x: -x['kl'])
+
+        result['context_analysis'] = {
+            'mean_ctx_kl': float(np.mean(ctx_kl)) if ctx_kl else 0,
+            'max_ctx_kl': float(np.max(ctx_kl)) if ctx_kl else 0,
+            'mean_ctx_mode_acc': float(np.mean(ctx_acc)) if ctx_acc else 0,
+            'n_contexts_observed': len(ctx_kl),
+            'worst_contexts': ctx_details[:10],
+            'best_contexts': ctx_details[-5:] if len(ctx_details) > 5
+                else [],
+        }
+
+        # HardMarkov-specific: deterministic map compliance
+        if isinstance(dist, HardMarkov):
+            compliant = 0
+            total = 0
+            per_pos_compliance = []
+            for t in range(order, L):
+                ctx_idx = np.zeros(N, dtype=np.int64)
+                for o in range(order):
+                    ctx_idx += S[:, t - order + o] * (V ** o)
+                preferred = dist.preferred[ctx_idx]
+                match = (S[:, t] == preferred)
+                per_pos_compliance.append(float(match.mean()))
+                compliant += match.sum()
+                total += N
+
+            result['hard_markov'] = {
+                'overall_compliance': float(compliant / max(total, 1)),
+                'per_position_compliance': per_pos_compliance,
+                'expected_compliance': dist.p_peak,
+            }
+
+    return result
+
+
 # ── Main ────────────────────────────────────────────
 
 def run():
@@ -616,9 +869,16 @@ def run():
         'B_Markov2':       MarkovChain(order=2, sparsity=0.1, seed=42),
         'C_GlobalSum':     GlobalSumConstraint(beta=2.0, alpha=0.5, seed=42),
         'D_Markov+Global': MarkovPlusGlobal(beta=1.5, order=2, sparsity=0.1, seed=42),
+        'E_HardMarkov':    HardMarkov(order=2, p_peak=0.97, seed=42),
     }
     for name, dist in distributions.items():
-        print(f"  {name}: H={dist.entropy():.2f} bits")
+        h = dist.entropy()
+        extra = ''
+        if hasattr(dist, 'theoretical_l2r_entropy'):
+            h_l2r = dist.theoretical_l2r_entropy()
+            p_acc = dist.expected_accuracy_l2r()
+            extra = f"  H_l2r/step={h_l2r:.3f}bits  greedy_acc={p_acc:.2%}"
+        print(f"  {name}: H={h:.2f} bits{extra}")
 
     print(f"\n  Sampling stats: V^L={V**L:,}, N_SAMPLES={N_SAMPLES:,}, "
           f"ratio={N_SAMPLES/V**L:.1f}x")
@@ -635,7 +895,7 @@ def run():
               f"gap={uniform_loss - opt_loss:.4f}")
 
     # MI matrices
-    fig_mi, axes = plt.subplots(1, 4, figsize=(20, 4))
+    fig_mi, axes = plt.subplots(1, len(distributions), figsize=(5 * len(distributions), 4))
     for idx, (name, dist) in enumerate(distributions.items()):
         MI = compute_mi(dist)
         im = axes[idx].imshow(MI, cmap='YlOrRd', vmin=0)
@@ -661,12 +921,17 @@ def run():
 
     all_results = {}
     all_orders = {}  # dist_name → policy → list of order tensors
+    all_detailed = {}  # dist_name → policy → detailed analysis
+
+    # Policies to run detailed per-sample analysis on (same 500K samples)
+    DETAILED_POLICIES = {'confidence', 'l2r', 'r2l', 'random'}
 
     for dist_name, dist in distributions.items():
         model = models[dist_name]
         print(f"\n▶ Evaluating: {dist_name}")
         all_results[dist_name] = {}
         all_orders[dist_name] = {}
+        all_detailed[dist_name] = {}
 
         # ── Sequential policies ──
         for pol in seq_policies:
@@ -687,10 +952,38 @@ def run():
             m['nfe'] = L
             all_results[dist_name][pol] = m
             all_orders[dist_name][pol] = orders_list
-            print(f"    {pol:<20} TV={m['tv']:.4f} "
-                  f"[{m['tv_ci_lo']:.4f},{m['tv_ci_hi']:.4f}] "
-                  f"excess={m['tv_excess']:+.4f} "
-                  f"cov={m['support_coverage']:.2%} ({time.time()-t0:.1f}s)")
+
+            # Detailed analysis on the SAME samples
+            if pol in DETAILED_POLICIES:
+                det = compute_detailed_analysis(samples, dist)
+                all_detailed[dist_name][pol] = det
+                # Print key details
+                mkl = det['per_position_marginal_kl']
+                print(f"    {pol:<20} KL_f={m['kl_forward']:.4f} "
+                      f"KL_r={m['kl_reverse']:.4f} "
+                      f"JS={m['js']:.4f} "
+                      f"lp_gap={det['lp_gap']:+.3f}")
+                print(f"      pos_marginal_KL: "
+                      + ' '.join(f"p{i}={k:.4f}" for i, k in enumerate(mkl)))
+                if 'context_analysis' in det:
+                    ca = det['context_analysis']
+                    print(f"      ctx: mean_KL={ca['mean_ctx_kl']:.4f} "
+                          f"max_KL={ca['max_ctx_kl']:.4f} "
+                          f"mode_acc={ca['mean_ctx_mode_acc']:.3f}")
+                if 'hard_markov' in det:
+                    hm = det['hard_markov']
+                    print(f"      compliance: {hm['overall_compliance']:.4f} "
+                          f"(expected: {hm['expected_compliance']:.4f})")
+                    ppc = hm['per_position_compliance']
+                    print(f"      per_pos: "
+                          + ' '.join(f"p{i+2}={c:.3f}"
+                                     for i, c in enumerate(ppc)))
+            else:
+                print(f"    {pol:<20} KL_f={m['kl_forward']:.4f} "
+                      f"KL_r={m['kl_reverse']:.4f} "
+                      f"JS={m['js']:.4f} "
+                      f"cov={m['support_coverage']:.2%} "
+                      f"({time.time()-t0:.1f}s)")
 
         # ── Adaptive threshold ──
         for tau in adaptive_taus:
@@ -707,8 +1000,8 @@ def run():
             m = compute_metrics(samples, scores, dist)
             m['nfe'] = total_steps / max(n_batches, 1)
             all_results[dist_name][key] = m
-            print(f"    {key:<20} TV={m['tv']:.4f} "
-                  f"excess={m['tv_excess']:+.4f} "
+            print(f"    {key:<20} KL_f={m['kl_forward']:.4f} "
+                  f"KL_r={m['kl_reverse']:.4f} "
                   f"NFE={m['nfe']:.1f} ({time.time()-t0:.1f}s)")
 
         # ── Jacobi iteration ──
@@ -726,8 +1019,8 @@ def run():
             m = compute_metrics(samples, scores, dist)
             m['nfe'] = total_steps / max(n_batches, 1)
             all_results[dist_name][key] = m
-            print(f"    {key:<20} TV={m['tv']:.4f} "
-                  f"excess={m['tv_excess']:+.4f} "
+            print(f"    {key:<20} KL_f={m['kl_forward']:.4f} "
+                  f"KL_r={m['kl_reverse']:.4f} "
                   f"NFE={m['nfe']:.1f} ({time.time()-t0:.1f}s)")
 
     # ── Compute MI matrices and alignment scores ──
@@ -762,89 +1055,91 @@ def run():
     for ax in axes: ax.legend(fontsize=7); ax.grid(alpha=0.3)
     fig.tight_layout(); figs['training_curves'] = fig
 
-    # Print baseline TVs
-    print("\n  Baseline TV (from sampling p_true directly):")
+    # Print baseline KL
+    print("\n  Baseline KL_forward (from sampling p_true directly):")
     for dn in dist_names:
-        bl = all_results[dn][seq_policies[0]]['tv_baseline']
+        bl = all_results[dn][seq_policies[0]]['kl_forward_baseline']
         print(f"    {dn}: {bl:.4f}")
 
-    # ── FIG 1: TV excess heatmap (ALL policies) ──
+    # ── FIG 1: KL forward heatmap (ALL policies) ──
     fig, ax = plt.subplots(figsize=(11, 8))
-    data_excess = np.full((len(all_pol_names), len(dist_names)), np.nan)
+    data_kl = np.full((len(all_pol_names), len(dist_names)), np.nan)
     for j, d in enumerate(dist_names):
         for i, p in enumerate(all_pol_names):
             if p in all_results.get(d, {}):
-                data_excess[i, j] = all_results[d][p]['tv_excess']
-    im = ax.imshow(data_excess, cmap='RdYlGn_r', aspect='auto')
+                data_kl[i, j] = all_results[d][p]['kl_forward']
+    im = ax.imshow(data_kl, cmap='RdYlGn_r', aspect='auto')
     ax.set_xticks(range(len(dist_names)))
     ax.set_xticklabels(dist_names, fontsize=8, rotation=20)
     ax.set_yticks(range(len(all_pol_names)))
     ax.set_yticklabels(all_pol_names, fontsize=8)
-    for i in range(data_excess.shape[0]):
-        for j in range(data_excess.shape[1]):
-            if not np.isnan(data_excess[i, j]):
-                ax.text(j, i, f"{data_excess[i,j]:+.3f}", ha='center',
+    for i in range(data_kl.shape[0]):
+        for j in range(data_kl.shape[1]):
+            if not np.isnan(data_kl[i, j]):
+                ax.text(j, i, f"{data_kl[i,j]:.3f}", ha='center',
                         va='center', fontsize=7,
-                        color='white' if data_excess[i,j] > np.nanmedian(
-                            data_excess[~np.isnan(data_excess)]) else 'black')
-    # Draw separators
+                        color='white' if data_kl[i,j] > np.nanmedian(
+                            data_kl[~np.isnan(data_kl)]) else 'black')
     ax.axhline(y=len(seq_policies)-0.5, color='blue', lw=1.5, ls='--')
     ax.axhline(y=len(seq_policies)+len(adaptive_taus)-0.5,
                color='orange', lw=1.5, ls='--')
     plt.colorbar(im, ax=ax, shrink=0.7)
-    ax.set_title('Excess TV: Sequential vs Adaptive vs Jacobi (↓ better)',
+    ax.set_title('KL(p‖q) Forward: Sequential vs Adaptive vs Jacobi (↓ better)',
                  fontsize=12)
-    fig.tight_layout(); figs['tv_excess_heatmap'] = fig
+    fig.tight_layout(); figs['kl_forward_heatmap'] = fig
 
-    # ── FIG 2: NFE vs TV scatter (the meaningful Pareto) ──
+    # ── FIG 2: NFE vs KL scatter (Pareto frontier) ──
     fig, axes = plt.subplots(1, len(dist_names), figsize=(5*len(dist_names), 4.5))
     if len(dist_names) == 1: axes = [axes]
     for col, dn in enumerate(dist_names):
         ax = axes[col]
         dr = all_results.get(dn, {})
-        bl = dr[seq_policies[0]]['tv_baseline']
+        bl = dr[seq_policies[0]]['kl_forward_baseline']
         ax.axhline(y=bl, color='gray', ls=':', alpha=0.5, label='baseline')
 
         # Sequential: all at NFE=L
         for p in seq_policies:
             if p in dr:
                 c = '#2ecc71' if p == 'confidence' else '#95a5a6'
-                ax.scatter(dr[p]['nfe'], dr[p]['tv'], marker='x', s=50,
-                           color=c, zorder=5)
-                ax.annotate(p, (dr[p]['nfe'], dr[p]['tv']), fontsize=5,
+                ax.scatter(dr[p]['nfe'], dr[p]['kl_forward'],
+                           marker='x', s=50, color=c, zorder=5)
+                ax.annotate(p, (dr[p]['nfe'], dr[p]['kl_forward']),
+                            fontsize=5,
                             textcoords="offset points", xytext=(3, 3))
 
-        # Adaptive threshold: different τ → different NFE
+        # Adaptive threshold
         a_nfes = [dr[f"adaptive_τ{t}"]['nfe'] for t in adaptive_taus
                   if f"adaptive_τ{t}" in dr]
-        a_tvs  = [dr[f"adaptive_τ{t}"]['tv'] for t in adaptive_taus
+        a_kls  = [dr[f"adaptive_τ{t}"]['kl_forward']
+                  for t in adaptive_taus
                   if f"adaptive_τ{t}" in dr]
         if a_nfes:
-            ax.plot(a_nfes, a_tvs, '-o', color='#e74c3c', label='adaptive',
-                    markersize=6, zorder=10)
-            for t, nf, tv in zip(adaptive_taus, a_nfes, a_tvs):
-                ax.annotate(f'τ={t}', (nf, tv), fontsize=5,
+            ax.plot(a_nfes, a_kls, '-o', color='#e74c3c',
+                    label='adaptive', markersize=6, zorder=10)
+            for t, nf, kl in zip(adaptive_taus, a_nfes, a_kls):
+                ax.annotate(f'τ={t}', (nf, kl), fontsize=5,
                             textcoords="offset points", xytext=(4, 4))
 
-        # Jacobi: different max_iter → different NFE
+        # Jacobi
         j_nfes = [dr[f"jacobi_i{m}"]['nfe'] for m in jacobi_iters
                   if f"jacobi_i{m}" in dr]
-        j_tvs  = [dr[f"jacobi_i{m}"]['tv'] for m in jacobi_iters
+        j_kls  = [dr[f"jacobi_i{m}"]['kl_forward']
+                  for m in jacobi_iters
                   if f"jacobi_i{m}" in dr]
         if j_nfes:
-            ax.plot(j_nfes, j_tvs, '-s', color='#3498db', label='jacobi',
-                    markersize=6, zorder=10)
-            for m, nf, tv in zip(jacobi_iters, j_nfes, j_tvs):
-                ax.annotate(f'i={m}', (nf, tv), fontsize=5,
+            ax.plot(j_nfes, j_kls, '-s', color='#3498db',
+                    label='jacobi', markersize=6, zorder=10)
+            for m, nf, kl in zip(jacobi_iters, j_nfes, j_kls):
+                ax.annotate(f'i={m}', (nf, kl), fontsize=5,
                             textcoords="offset points", xytext=(4, 4))
 
         ax.set_title(dn, fontsize=10)
         ax.set_xlabel('NFE (forward passes)')
-        ax.set_ylabel('TV Distance')
+        ax.set_ylabel('KL(p‖q)')
         ax.grid(alpha=0.3)
         if col == 0: ax.legend(fontsize=7)
-    fig.suptitle('Speed vs Quality: NFE vs TV', fontsize=13, y=1.02)
-    fig.tight_layout(); figs['nfe_vs_tv'] = fig
+    fig.suptitle('Speed vs Quality: NFE vs KL(p‖q)', fontsize=13, y=1.02)
+    fig.tight_layout(); figs['nfe_vs_kl'] = fig
 
     # ── FIG 3: Decode order heatmap (confidence only, per distribution) ──
     adaptive_pols = [p for p in seq_policies if p not in ('l2r', 'r2l')]
@@ -894,10 +1189,10 @@ def run():
     fig, ax = plt.subplots(figsize=(11, 7))
     rank_data = np.full((len(all_pol_names), len(dist_names)), np.nan)
     for j, dn in enumerate(dist_names):
-        excesses = [(p, all_results[dn].get(p, {}).get('tv_excess', 99))
+        kl_vals = [(p, all_results[dn].get(p, {}).get('kl_forward', 99))
                     for p in all_pol_names]
-        excesses.sort(key=lambda x: x[1])
-        for rank, (p, _) in enumerate(excesses):
+        kl_vals.sort(key=lambda x: x[1])
+        for rank, (p, _) in enumerate(kl_vals):
             i = all_pol_names.index(p)
             rank_data[i, j] = rank + 1
     im = ax.imshow(rank_data, cmap='YlGn_r', aspect='auto',
@@ -915,8 +1210,9 @@ def run():
     ax.axhline(y=len(seq_policies)+len(adaptive_taus)-0.5,
                color='orange', lw=1.5, ls='--')
     plt.colorbar(im, ax=ax, shrink=0.7, label='Rank (1=best)')
-    ax.set_title('Policy Ranking by Excess TV (1=best)\n'
-                 'Blue line: seq|adaptive, Orange: adaptive|jacobi', fontsize=11)
+    ax.set_title('Policy Ranking by KL(p‖q) (1=best)\n'
+                 'Blue line: seq|adaptive, Orange: adaptive|jacobi',
+                 fontsize=11)
     fig.tight_layout(); figs['policy_ranking'] = fig
 
     # ── FIG 6: Spearman correlation heatmap ──
@@ -940,6 +1236,116 @@ def run():
     ax.set_title('Spearman Corr(path_score, log p_true)', fontsize=12)
     fig.tight_layout(); figs['correlation_heatmap'] = fig
 
+    # ── FIG 7: Per-position marginal KL (detailed analysis) ──
+    det_pols = sorted(DETAILED_POLICIES & set(seq_policies))
+    if all_detailed:
+        fig, axes = plt.subplots(1, len(dist_names),
+                                  figsize=(5*len(dist_names), 4))
+        if len(dist_names) == 1: axes = [axes]
+        pol_colors = {'confidence': '#2ecc71', 'l2r': '#3498db',
+                      'r2l': '#e74c3c', 'random': '#95a5a6'}
+        for col, dn in enumerate(dist_names):
+            ax = axes[col]
+            for pol in det_pols:
+                det = all_detailed.get(dn, {}).get(pol)
+                if det is None:
+                    continue
+                mkl = det['per_position_marginal_kl']
+                ax.plot(range(L), mkl, '-o', markersize=4,
+                        color=pol_colors.get(pol, '#888'),
+                        label=pol, alpha=0.8)
+            ax.set_xlabel('Position')
+            ax.set_ylabel('KL(p_marginal ‖ q_marginal)')
+            ax.set_title(dn, fontsize=9)
+            ax.grid(alpha=0.3)
+            if col == 0: ax.legend(fontsize=7)
+        fig.suptitle('Per-Position Marginal KL by Policy',
+                     fontsize=12, y=1.02)
+        fig.tight_layout(); figs['pos_marginal_kl'] = fig
+
+    # ── FIG 8: True log-prob histogram (confidence vs l2r) ──
+    if all_detailed:
+        fig, axes = plt.subplots(1, len(dist_names),
+                                  figsize=(5*len(dist_names), 4))
+        if len(dist_names) == 1: axes = [axes]
+        for col, dn in enumerate(dist_names):
+            ax = axes[col]
+            for pol in ['confidence', 'l2r', 'r2l']:
+                det = all_detailed.get(dn, {}).get(pol)
+                if det is None:
+                    continue
+                ax.plot(det['hist_centers'], det['hist_counts'],
+                        color=pol_colors.get(pol, '#888'),
+                        label=f"{pol} (μ={det['true_lp_mean']:.1f})",
+                        alpha=0.7)
+            # Mark true expected log-prob
+            det0 = next(iter(all_detailed.get(dn, {}).values()), None)
+            if det0:
+                ax.axvline(det0['true_expected_lp'], color='black',
+                           ls=':', alpha=0.5, label='E_p[log p]')
+            ax.set_xlabel('log p_true(x)')
+            ax.set_ylabel('Count')
+            ax.set_title(dn, fontsize=9)
+            ax.legend(fontsize=6); ax.grid(alpha=0.3)
+        fig.suptitle('Distribution of True Probability of Generated Samples',
+                     fontsize=12, y=1.02)
+        fig.tight_layout(); figs['true_lp_histogram'] = fig
+
+    # ── FIG 9: Context-conditional accuracy (Markov dists) ──
+    markov_dists = [dn for dn in dist_names
+                    if any(all_detailed.get(dn, {}).get(p, {})
+                           .get('context_analysis')
+                           for p in det_pols)]
+    if markov_dists:
+        fig, axes = plt.subplots(len(det_pols), len(markov_dists),
+                                  figsize=(5*len(markov_dists),
+                                           3.5*len(det_pols)),
+                                  squeeze=False)
+        for col, dn in enumerate(markov_dists):
+            for row, pol in enumerate(det_pols):
+                ax = axes[row, col]
+                det = all_detailed.get(dn, {}).get(pol, {})
+                ca = det.get('context_analysis')
+                if ca and ca['worst_contexts']:
+                    ctxs = ca['worst_contexts']
+                    kls = [c['kl'] for c in ctxs]
+                    labels = [f"c{c['ctx']}" for c in ctxs]
+                    colors = ['#e74c3c' if c['true_mode'] != c['emp_mode']
+                              else '#2ecc71' for c in ctxs]
+                    ax.barh(range(len(kls)), kls, color=colors, alpha=0.8)
+                    ax.set_yticks(range(len(kls)))
+                    ax.set_yticklabels(labels, fontsize=7)
+                    ax.set_xlabel('KL')
+                ax.set_title(f'{pol} / {dn}', fontsize=8)
+                ax.grid(alpha=0.3, axis='x')
+        fig.suptitle('Worst Contexts by KL '
+                     '(red=wrong mode, green=correct mode)',
+                     fontsize=11, y=1.02)
+        fig.tight_layout(); figs['context_kl'] = fig
+
+    # ── FIG 10: HardMarkov compliance per position ──
+    hm_name = 'E_HardMarkov'
+    if hm_name in all_detailed:
+        fig, ax = plt.subplots(figsize=(8, 5))
+        for pol in det_pols:
+            det = all_detailed.get(hm_name, {}).get(pol, {})
+            hm_d = det.get('hard_markov')
+            if hm_d:
+                ppc = hm_d['per_position_compliance']
+                ax.plot(range(2, 2 + len(ppc)), ppc, '-o',
+                        markersize=5,
+                        color=pol_colors.get(pol, '#888'),
+                        label=f"{pol} "
+                              f"(avg={hm_d['overall_compliance']:.3f})")
+        ax.axhline(y=0.97, color='black', ls=':', alpha=0.5,
+                   label='expected (0.97)')
+        ax.set_xlabel('Position (t)')
+        ax.set_ylabel('Compliance Rate')
+        ax.set_ylim(0.9, 1.005)
+        ax.legend(fontsize=8); ax.grid(alpha=0.3)
+        ax.set_title('HardMarkov: Preferred Token Compliance by Position')
+        fig.tight_layout(); figs['hard_markov_compliance'] = fig
+
     # JSON-safe results
     json_results = {}
     for d in all_results:
@@ -954,6 +1360,31 @@ def run():
             a = mi_alignments[dn][pol]
             json_results['mi_alignments'][dn][pol] = {
                 'rho': a['rho'], 'p_value': a['p_value']}
+    # Include detailed analysis (serializable parts only)
+    json_results['detailed'] = {}
+    for dn in all_detailed:
+        json_results['detailed'][dn] = {}
+        for pol in all_detailed[dn]:
+            det = all_detailed[dn][pol]
+            # Keep scalar/list fields, skip large arrays
+            json_results['detailed'][dn][pol] = {
+                'per_position_marginal_kl': det['per_position_marginal_kl'],
+                'per_position_mode_correct': det['per_position_mode_correct'],
+                'true_lp_percentiles': det['true_lp_percentiles'],
+                'true_lp_mean': det['true_lp_mean'],
+                'true_expected_lp': det['true_expected_lp'],
+                'lp_gap': det['lp_gap'],
+            }
+            if 'context_analysis' in det:
+                ca = det['context_analysis']
+                json_results['detailed'][dn][pol]['context'] = {
+                    'mean_ctx_kl': ca['mean_ctx_kl'],
+                    'max_ctx_kl': ca['max_ctx_kl'],
+                    'mean_ctx_mode_acc': ca['mean_ctx_mode_acc'],
+                }
+            if 'hard_markov' in det:
+                json_results['detailed'][dn][pol]['hard_markov'] = \
+                    det['hard_markov']
 
     save_results(EXP_NAME, json_results, figures=figs)
 
@@ -964,18 +1395,22 @@ def run():
           f"bootstrap_k={BOOTSTRAP_K})")
     print("=" * 70)
 
-    # Combined table: excess TV + NFE
+    # Combined table: KL forward + reverse + NFE
     header = f"{'Policy':<22} {'NFE':>5}"
     for dn in dist_names:
-        header += f"  {dn:>14}"
+        header += f"  {'KL_f':>8} {'KL_r':>8}"
     print(f"\n{header}")
     print("-" * len(header))
     for pol in all_pol_names:
-        nfe = all_results[dist_names[0]].get(pol, {}).get('nfe', float('nan'))
+        nfe = all_results[dist_names[0]].get(pol, {}).get('nfe',
+                                                           float('nan'))
         row = f"{pol:<22} {nfe:>5.1f}"
         for dn in dist_names:
-            exc = all_results[dn].get(pol, {}).get('tv_excess', float('nan'))
-            row += f"  {exc:>+13.4f}"
+            kl_f = all_results[dn].get(pol, {}).get('kl_forward',
+                                                     float('nan'))
+            kl_r = all_results[dn].get(pol, {}).get('kl_reverse',
+                                                     float('nan'))
+            row += f"  {kl_f:>8.4f} {kl_r:>8.4f}"
         print(row)
 
     # MI alignment summary
@@ -991,17 +1426,112 @@ def run():
     # NFE efficiency summary
     print(f"\nNFE Efficiency (per distribution):")
     for dn in dist_names:
-        conf_tv = all_results[dn].get('confidence', {}).get('tv_excess', 99)
-        print(f"  {dn} (confidence baseline: excess={conf_tv:+.4f}, NFE=8):")
+        conf_kl = all_results[dn].get('confidence', {}).get(
+            'kl_forward', 99)
+        print(f"  {dn} (confidence baseline: KL_f={conf_kl:.4f}, "
+              f"NFE=8):")
         for key in ([f"adaptive_τ{t}" for t in adaptive_taus]
                     + [f"jacobi_i{m}" for m in jacobi_iters]):
             if key in all_results[dn]:
                 r = all_results[dn][key]
-                delta = r['tv_excess'] - conf_tv
+                delta = r['kl_forward'] - conf_kl
                 speedup = L / r['nfe'] if r['nfe'] > 0 else 0
                 print(f"    {key:<22} NFE={r['nfe']:.1f} "
                       f"({speedup:.1f}× faster) "
-                      f"Δexcess={delta:+.4f}")
+                      f"ΔKL={delta:+.4f}")
+
+    # ── HardMarkov focus analysis ──
+    hm_name = 'E_HardMarkov'
+    if hm_name in all_results:
+        print(f"\n{'='*60}")
+        print(f"  HARD MARKOV FOCUS ANALYSIS")
+        print(f"{'='*60}")
+        hm = distributions[hm_name]
+        print(f"  Theoretical l2r entropy/step: "
+              f"{hm.theoretical_l2r_entropy():.4f} bits")
+        print(f"  Expected l2r greedy accuracy: "
+              f"{hm.expected_accuracy_l2r():.2%}")
+
+        # Check if confidence discovers l2r
+        hm_r = all_results[hm_name]
+        if 'confidence' in hm_r and 'l2r' in hm_r:
+            conf_kl = hm_r['confidence']['kl_forward']
+            l2r_kl = hm_r['l2r']['kl_forward']
+            r2l_kl = hm_r['r2l']['kl_forward']
+            rand_kl = hm_r.get('random', {}).get('kl_forward', float('nan'))
+            print(f"\n  Policy KL(p‖q):")
+            print(f"    l2r:        {l2r_kl:.4f}  (optimal)")
+            print(f"    confidence: {conf_kl:.4f}  "
+                  f"(gap={conf_kl - l2r_kl:+.4f})")
+            print(f"    random:     {rand_kl:.4f}")
+            print(f"    r2l:        {r2l_kl:.4f}  (worst)")
+
+        # Decode order alignment
+        if hm_name in mi_alignments and 'confidence' in mi_alignments[hm_name]:
+            a = mi_alignments[hm_name]['confidence']
+            print(f"\n  Confidence decode order MI alignment: "
+                  f"ρ={a['rho']:+.3f}")
+            mean_ranks = a['mean_ranks']
+            print(f"  Mean decode rank by position: "
+                  + ' '.join(f"p{i}={r:.1f}"
+                             for i, r in enumerate(mean_ranks)))
+            is_l2r = all(mean_ranks[i] < mean_ranks[i+1]
+                         for i in range(len(mean_ranks)-1))
+            print(f"  Strictly l2r order: {'YES' if is_l2r else 'NO'}")
+
+        # Detailed per-sample analysis
+        for pol in ['confidence', 'l2r', 'r2l']:
+            det = all_detailed.get(hm_name, {}).get(pol)
+            if det and 'hard_markov' in det:
+                hmd = det['hard_markov']
+                print(f"\n  {pol} compliance: "
+                      f"{hmd['overall_compliance']:.4f} "
+                      f"(expected: {hmd['expected_compliance']:.4f})")
+                ppc = hmd['per_position_compliance']
+                print(f"    per-position: "
+                      + ' '.join(f"p{i+2}={c:.4f}"
+                                 for i, c in enumerate(ppc)))
+            if det and 'context_analysis' in det:
+                ca = det['context_analysis']
+                print(f"    context KL: mean={ca['mean_ctx_kl']:.4f} "
+                      f"max={ca['max_ctx_kl']:.4f} "
+                      f"mode_acc={ca['mean_ctx_mode_acc']:.3f}")
+                # Show worst contexts
+                worst = ca['worst_contexts'][:3]
+                if worst:
+                    print(f"    worst contexts:")
+                    for w in worst:
+                        print(f"      ctx={w['ctx']:>2}: "
+                              f"true_mode={w['true_mode']} "
+                              f"emp_mode={w['emp_mode']} "
+                              f"KL={w['kl']:.4f} "
+                              f"p_true={w['true_mode_prob']:.3f} "
+                              f"p_emp={w['emp_mode_prob']:.3f} "
+                              f"(n={w['n_obs']})")
+
+    # ── Detailed analysis summary table ──
+    if all_detailed:
+        print(f"\n{'='*60}")
+        print(f"  DETAILED ANALYSIS SUMMARY")
+        print(f"  (from same {N_SAMPLES:,} samples as aggregate metrics)")
+        print(f"{'='*60}")
+        for dn in dist_names:
+            dd = all_detailed.get(dn, {})
+            if not dd:
+                continue
+            print(f"\n  {dn}:")
+            for pol in det_pols:
+                det = dd.get(pol)
+                if det is None:
+                    continue
+                mkl_max = max(det['per_position_marginal_kl'])
+                mkl_mean = np.mean(det['per_position_marginal_kl'])
+                mode_ok = sum(det['per_position_mode_correct'])
+                print(f"    {pol:<15} "
+                      f"margKL_mean={mkl_mean:.5f} "
+                      f"margKL_max={mkl_max:.5f} "
+                      f"modes_ok={mode_ok}/{L} "
+                      f"lp_gap={det['lp_gap']:+.3f}")
 
     plt.show()
     return all_results
