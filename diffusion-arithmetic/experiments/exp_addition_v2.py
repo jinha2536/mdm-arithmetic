@@ -683,10 +683,14 @@ COLORS = {
     'diff-msb-con': '#c0392b', 'diff-msb-lsb': '#d35400',
 }
 
-def _ck(obj, mt, dp):
-    return 'ar' if obj=='ar' else f"diff-{mt[:3]}-{dp[:3]}"
+def _ck(obj, mt='', dp=''):
+    if obj == 'ar':
+        return 'ar'
+    return f"diff-{mt[:3]}-{dp[:3]}"
 
-def _fk(obj, fmt, mt, dp):
+def _fk(obj, fmt, mt='', dp=''):
+    if obj == 'ar':
+        return f"ar_{fmt}"
     return f"{obj}_{fmt}_{mt}_{dp}"
 
 
@@ -699,7 +703,7 @@ def make_figures(all_dyn, all_final, all_partial):
         def pc(j):
             return cmap(1.0 - j/(ANS_LEN-1)) if fmt=='plain' else cmap(j/(ANS_LEN-1))
 
-        conds = [('ar', 'random')] + [('diffusion', mt) for mt in MASK_TYPES]
+        conds = [('ar', '')] + [('diffusion', mt) for mt in MASK_TYPES]
         nc = len(conds)
 
         # Helper: get x from checkpoints
@@ -823,7 +827,7 @@ def make_figures(all_dyn, all_final, all_partial):
         # ── Fig 5: Final per-position accuracy ──
         fig, axes = plt.subplots(1, 3, figsize=(21, 5))
         for ai, (title, cs) in enumerate([
-            ('AR vs Diffusion (conf decode)', [('ar','random','confidence'),
+            ('AR vs Diffusion (conf decode)', [('ar','',''),
              ('diffusion','random','confidence'), ('diffusion','ordered','confidence'),
              ('diffusion','confidence','confidence'), ('diffusion','msb','confidence')]),
             ('Training mask comparison (conf decode)', [
@@ -933,7 +937,7 @@ def run():
         print(f"\n  [{fmt}] N={len(train_data)}, carries={dict(sorted(cd.items()))}")
 
         # ── AR ──
-        key = _fk('ar', fmt, 'random', 'confidence')
+        key = _fk('ar', fmt)
         print(f"\n{'━'*60}\n▶ {key}\n{'━'*60}")
         m, d = train_with_dynamics('ar', tok, train_data, test_data, max_len, fmt)
         all_dyn[key] = d
@@ -989,7 +993,7 @@ def run():
         print(f"\n  ━━ {fmt} ━━")
         print(f"  {'Condition':<25} {'Acc':>6}  {'TG':>12}  Position Accuracy")
         print(f"  {'─'*90}")
-        all_conds = [('ar','random','confidence')]
+        all_conds = [('ar','','')]
         for mt in MASK_TYPES:
             for dp in DECODE_POLICIES:
                 all_conds.append(('diffusion', mt, dp))
@@ -1008,20 +1012,20 @@ def run():
     print(f"\n  CONFIDENCE RANKING vs LSB-FIRST ORACLE (final τ)")
     for fmt in FORMATS:
         print(f"\n  [{fmt}]")
-        for obj, mt in [('ar','random')]+[('diffusion',mt) for mt in MASK_TYPES]:
+        for obj, mt in [('ar','')]+[('diffusion',mt) for mt in MASK_TYPES]:
             key = _fk(obj, fmt, mt, 'confidence')
             dyn = all_dyn.get(key)
             if not dyn: continue
             tau = dyn['checkpoints'][-1].get('tau_oracle', '?')
-            print(f"    {_ck(obj,mt,'confidence'):<20} τ={tau:.3f}" if isinstance(tau, float)
-                  else f"    {_ck(obj,mt,'confidence'):<20} τ={tau}")
+            print(f"    {_ck(obj,mt):<20} τ={tau:.3f}" if isinstance(tau, float)
+                  else f"    {_ck(obj,mt):<20} τ={tau}")
 
     # ── Learning order ──
     print(f"\n  LEARNING ORDER (epoch to 90% per-pos acc)")
     for fmt in FORMATS:
         labs = _pos_labels(fmt)
         print(f"\n  [{fmt}]")
-        for obj, mt in [('ar','random')]+[('diffusion',mt) for mt in MASK_TYPES]:
+        for obj, mt in [('ar','')]+[('diffusion',mt) for mt in MASK_TYPES]:
             key = _fk(obj, fmt, mt, 'confidence')
             dyn = all_dyn.get(key)
             if not dyn: continue
