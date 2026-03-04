@@ -3,36 +3,30 @@
   Experiment 2 — 8-Digit Addition: Learning Dynamics Analysis
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-  Focus: HOW do AR vs diffusion learn addition, position by position?
+  Fair comparison design:
 
-  Research Questions:
-    Q1. Per-position learning order: Does diffusion learn LSB first
-        even with random masking? How does this compare to AR?
-    Q2. Carry effect on learning: How much slower are carry positions?
-    Q3. Confidence evolution: Which positions does diffusion become
-        confident about first? Does this match the optimal (LSB→MSB)?
-    Q4. Ordered masking: Does it accelerate the natural LSB→MSB
-        curriculum, or does random masking already discover it?
-    Q5. Format effect: Does reverse format change learning dynamics?
-    Q6. Forced LSB decoding: Does it help regardless of training?
+    Training unit: EPOCH (1 epoch = 1 full pass over N=2000 samples)
+      - BATCH_SIZE=200 → 10 batches/epoch, no data waste
+      - Both AR and Diffusion train for exactly MAX_EPOCHS
+      - Logging, eval, everything in epoch units
 
-  Experimental conditions (10 total, absolute PE):
-    ┌──────────────────┬───────────────┬──────────────────┐
-    │ Condition         │ Training      │ Decoding         │
-    ├──────────────────┼───────────────┼──────────────────┤
-    │ AR                │ AR loss       │ L→R greedy       │
-    │ Diff-rand-conf    │ Random mask   │ Confidence       │
-    │ Diff-rand-lsb     │ Random mask   │ Forced LSB→MSB   │
-    │ Diff-ord-conf     │ Ordered mask  │ Confidence       │
-    │ Diff-ord-lsb      │ Ordered mask  │ Forced LSB→MSB   │
-    └──────────────────┴───────────────┴──────────────────┘
-    × 2 formats (plain, reverse)
+    Three x-axes tracked per checkpoint:
+      epoch           : data exposure (same for both)
+      iteration       : gradient updates (same for both, = epoch × 10)
+      token_gradients : actual supervised signals
+                        AR ≈ 9/sample, Diff ≈ 4.5/sample → AR gets ~2×
 
-  Key feature: periodic eval every EVAL_EVERY iterations captures
-  per-position loss, accuracy, and confidence throughout training.
+    Plotting: default x=epoch, secondary x=token_gradients
+    Stopping: fixed budget (no early stopping) + best model by train loss
+
+  Conditions (×2 formats = 14 total):
+    AR, Diff-random-conf, Diff-random-lsb,
+    Diff-ordered-conf, Diff-ordered-lsb,
+    Diff-confidence-conf, Diff-confidence-lsb,   ← PUMA-style adaptive
+    Diff-msb-conf, Diff-msb-lsb                  ← anti-oracle baseline
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 """
-import sys, os, time, math, json, random, copy
+import sys, os, time, math, json, random
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -40,7 +34,6 @@ from torch.utils.data import DataLoader, TensorDataset
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-import matplotlib.ticker as mticker
 import numpy as np
 from collections import defaultdict
 
@@ -50,10 +43,17 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 from core.tokenizer import CharTokenizer
 from core.model import Transformer
 from core.train_utils import (
-    mount_drive, save_results,
-    generate_ar, generate_diffusion, encode_samples,
+    mount_drive, save_results,          # Drive persistence
+    generate_ar, generate_diffusion,    # Generation (incl. l2r/r2l policies)
+    encode_samples,                     # Data encoding
     DEVICE,
 )
+# NOT imported from core (custom in this experiment):
+#   train_with_dynamics  — epoch-based loop + periodic probe + ordered masking
+#   final_evaluate       — per-position & carry-conditional analysis
+#   _analyse_orders      — position-level decode rank (core's is scratchpad-level)
+#   probe_per_position   — per-position loss/acc/conf probe
+#   probe_partial_mask   — partial-mask confidence analysis
 
 EXP_NAME = 'exp_addition_v2_dynamics'
 
@@ -62,34 +62,77 @@ EXP_NAME = 'exp_addition_v2_dynamics'
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 ND = 8
-ANS_LEN = ND + 1
+ANS_LEN = ND + 1                # 9
 
 N_TRAIN = 2000
 N_TEST = 500
 
-MAX_ITERS = 20_000
-PATIENCE = 3_000
-EVAL_EVERY = 500
-LOG_INTERVAL = 200
+# ── Training (epoch-based) ──
+BATCH_SIZE = 200                # 2000 / 200 = 10 batches/epoch
+MAX_EPOCHS = 1500               # fixed budget, no early stopping
+EVAL_EVERY = 50                 # probe eval every 50 epochs
+LOG_EVERY = 20                  # print train loss every 20 epochs
 
 FORMATS = ['plain', 'reverse']
 
+# Architecture
 N_LAYER = 6
 N_HEAD = 6
 N_EMBD = 384
 DROPOUT = 0.2
 POS_ENC = 'absolute'
 
-BATCH_SIZE = 256
+# Optimizer
 LR = 1e-3
 MIN_LR = 1e-4
-WARMUP = 100
+WARMUP_EPOCHS = 10
 GRAD_CLIP = 1.0
 
-MASK_TYPES = ['random', 'ordered']
+MASK_TYPES = ['random', 'ordered', 'confidence', 'msb']
 DECODE_POLICIES = ['confidence', 'lsb']
 
 SEED = 42
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Confidence ranking utilities
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+def _oracle_ranking(fmt):
+    """Oracle (LSB-first) decode order: which position to unmask first.
+    Returns list of position indices from first-unmasked to last-unmasked.
+      plain:   LSB is at index ANS_LEN-1 → unmask last index first
+      reverse: LSB is at index 0         → unmask first index first
+    """
+    if fmt == 'plain':
+        return list(range(ANS_LEN - 1, -1, -1))  # [8,7,...,0]
+    return list(range(ANS_LEN))                   # [0,1,...,8]
+
+
+def _kendall_tau(rank_a, rank_b):
+    """Kendall tau-b between two rankings (lists of position indices).
+    Returns correlation in [-1, 1].  +1 = identical, -1 = reversed.
+    """
+    n = len(rank_a)
+    if n < 2:
+        return 0.0
+    # Convert position-order lists to rank arrays
+    ra = [0] * n
+    rb = [0] * n
+    for r, pos in enumerate(rank_a):
+        ra[pos] = r
+    for r, pos in enumerate(rank_b):
+        rb[pos] = r
+    conc, disc = 0, 0
+    for i in range(n):
+        for j in range(i + 1, n):
+            s = (ra[i] - ra[j]) * (rb[i] - rb[j])
+            if s > 0:
+                conc += 1
+            elif s < 0:
+                disc += 1
+    denom = n * (n - 1) / 2
+    return (conc - disc) / denom if denom > 0 else 0.0
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -133,79 +176,51 @@ def _carry_positions(a, b):
     return flags
 
 def _carry_at_answer_pos(a, b, fmt):
-    """
-    Per-answer-position carry-in flag.
-    carry_in[j] = True if position j receives a carry from its right neighbor.
-    """
-    flags = _carry_positions(a, b)  # flags[i] = carry out of LSB position i
-    carry_in = [False] * ANS_LEN
+    """Per-answer-position carry-in flag."""
+    flags = _carry_positions(a, b)
+    ci = [False] * ANS_LEN
     if fmt == 'plain':
-        # ans = [overflow, digit_{ND-1}, ..., digit_0]
-        # ans[0] = overflow ← carry out of position ND-1
-        # ans[k] for k>=1 = digit at LSB position (ND-k) ← carry out of (ND-k-1)
         for k in range(ANS_LEN):
-            lsb_pos = ND - k
-            if lsb_pos == ND:
-                carry_in[k] = flags[ND - 1] if ND - 1 < len(flags) else False
-            elif 0 <= lsb_pos - 1 < len(flags):
-                carry_in[k] = flags[lsb_pos - 1]
-    else:  # reverse
-        # ans = [digit_0(ones), digit_1, ..., digit_{ND-1}, overflow]
-        # ans[0] = ones digit ← no carry in
-        # ans[k] for k>=1 = digit at LSB position k ← carry out of (k-1)
+            lp = ND - k
+            if lp == ND:
+                ci[k] = flags[ND-1] if ND-1 < len(flags) else False
+            elif 0 <= lp-1 < len(flags):
+                ci[k] = flags[lp-1]
+    else:
         for k in range(ANS_LEN):
-            if k == 0:
-                carry_in[k] = False
-            elif k - 1 < len(flags):
-                carry_in[k] = flags[k - 1]
-    return carry_in
-
+            if k == 0: ci[k] = False
+            elif k-1 < len(flags): ci[k] = flags[k-1]
+    return ci
 
 def build_tok():
-    chars = list('0123456789+=')
-    return CharTokenizer(chars, {'mask': 'M', 'pad': 'P'})
-
+    return CharTokenizer(list('0123456789+='), {'mask': 'M', 'pad': 'P'})
 
 def gen_pairs_balanced(n, seed):
     rng = random.Random(seed)
     pool = defaultdict(list)
     seen = set()
-    attempts = max(n * 200, 100000)
-    for _ in range(attempts):
-        da = rng.randint(1, ND)
-        db = rng.randint(1, ND)
-        lo_a = 0 if da == 1 else 10 ** (da - 1)
-        hi_a = 10 ** da - 1
-        lo_b = 0 if db == 1 else 10 ** (db - 1)
-        hi_b = 10 ** db - 1
-        a = rng.randint(lo_a, hi_a)
-        b = rng.randint(lo_b, hi_b)
-        if (a, b) in seen:
-            continue
+    for _ in range(max(n * 200, 100000)):
+        da, db = rng.randint(1, ND), rng.randint(1, ND)
+        lo_a = 0 if da == 1 else 10**(da-1)
+        lo_b = 0 if db == 1 else 10**(db-1)
+        a = rng.randint(lo_a, 10**da-1)
+        b = rng.randint(lo_b, 10**db-1)
+        if (a, b) in seen: continue
         seen.add((a, b))
-        nc = _count_carries(a, b)
-        pool[nc].append((a, b))
-    carry_counts = sorted(pool.keys())
-    target = max(1, n // max(len(carry_counts), 1))
+        pool[_count_carries(a, b)].append((a, b))
+    target = max(1, n // max(len(pool), 1))
     out = []
-    for nc in carry_counts:
-        rng.shuffle(pool[nc])
-        out.extend(pool[nc][:target])
+    for nc in sorted(pool):
+        rng.shuffle(pool[nc]); out.extend(pool[nc][:target])
     rng2 = random.Random(seed + 9999)
-    hi = 10 ** ND - 1
     while len(out) < n:
-        a, b = rng2.randint(0, hi), rng2.randint(0, hi)
-        if (a, b) not in seen:
-            out.append((a, b))
-            seen.add((a, b))
+        a, b = rng2.randint(0, 10**ND-1), rng2.randint(0, 10**ND-1)
+        if (a, b) not in seen: out.append((a, b)); seen.add((a, b))
     rng.shuffle(out)
     return out[:n]
 
-
 def gen_data(n, fmt, seed):
-    fn = FMT_FN[fmt]
-    pairs = gen_pairs_balanced(n, seed)
-    return [fn(a, b) for a, b in pairs]
+    return [FMT_FN[fmt](a, b) for a, b in gen_pairs_balanced(n, seed)]
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -216,207 +231,158 @@ def gen_data(n, fmt, seed):
 def probe_per_position(model, tokenizer, test_samples, objective,
                        fmt, max_len, device=None):
     """
-    Per-answer-position metrics WITHOUT generation.
-    AR: teacher-forced loss.  Diffusion: fully-masked loss.
+    AR: teacher-forced loss per position.
+    Diffusion: fully-masked loss per position.
     """
-    if device is None:
-        device = DEVICE
+    if device is None: device = DEVICE
     model.eval()
-
     mask_id = tokenizer.special_ids['mask']
-    pad_id = tokenizer.special_ids['pad']
 
-    ids_all, ans_starts_all = encode_samples(test_samples, tokenizer, max_len)
-    ids_all = ids_all.to(device)
-    ans_starts_all = ans_starts_all.to(device)
+    ids_all, ans_all = encode_samples(test_samples, tokenizer, max_len)
+    ids_all, ans_all = ids_all.to(device), ans_all.to(device)
 
-    carry_in_flags = []
-    for s in test_samples:
-        a, b = _parse_operands(s)
-        carry_in_flags.append(_carry_at_answer_pos(a, b, fmt))
+    ci_flags = [_carry_at_answer_pos(*_parse_operands(s), fmt) for s in test_samples]
 
-    pos_loss_sum = torch.zeros(ANS_LEN, device=device)
-    pos_correct_sum = torch.zeros(ANS_LEN, device=device)
-    pos_conf_sum = torch.zeros(ANS_LEN, device=device)
-    pos_count = torch.zeros(ANS_LEN, device=device)
+    L  = torch.zeros(ANS_LEN, device=device)
+    C  = torch.zeros(ANS_LEN, device=device)
+    CF = torch.zeros(ANS_LEN, device=device)
+    N  = torch.zeros(ANS_LEN, device=device)
+    Lc, Ln = torch.zeros(ANS_LEN, device=device), torch.zeros(ANS_LEN, device=device)
+    Cc, Cn = torch.zeros(ANS_LEN, device=device), torch.zeros(ANS_LEN, device=device)
+    Nc, Nn = torch.zeros(ANS_LEN, device=device), torch.zeros(ANS_LEN, device=device)
 
-    pos_loss_carry = torch.zeros(ANS_LEN, device=device)
-    pos_loss_nocarry = torch.zeros(ANS_LEN, device=device)
-    pos_correct_carry = torch.zeros(ANS_LEN, device=device)
-    pos_correct_nocarry = torch.zeros(ANS_LEN, device=device)
-    pos_count_carry = torch.zeros(ANS_LEN, device=device)
-    pos_count_nocarry = torch.zeros(ANS_LEN, device=device)
-
-    bs = 128
-    for start in range(0, len(test_samples), bs):
-        end = min(start + bs, len(test_samples))
-        ids = ids_all[start:end]
-        ans_starts = ans_starts_all[start:end]
+    for st in range(0, len(test_samples), 128):
+        en = min(st+128, len(test_samples))
+        ids, ans = ids_all[st:en], ans_all[st:en]
         B = ids.shape[0]
 
         if objective == 'ar':
             logits = model(ids[:, :-1])
             for b in range(B):
-                a_start = ans_starts[b].item()
-                ci = carry_in_flags[start + b]
+                a_s = ans[b].item()
+                ci = ci_flags[st+b]
                 for j in range(ANS_LEN):
-                    orig_pos = a_start + j
-                    shift_pos = orig_pos - 1
-                    if shift_pos < 0 or shift_pos >= logits.shape[1]:
-                        continue
-                    target = ids[b, orig_pos]
-                    lp = F.log_softmax(logits[b, shift_pos], dim=-1)
-                    loss_j = -lp[target].item()
-                    pred = logits[b, shift_pos].argmax().item()
-                    conf_j = F.softmax(logits[b, shift_pos], dim=-1).max().item()
-
-                    pos_loss_sum[j] += loss_j
-                    pos_correct_sum[j] += float(pred == target.item())
-                    pos_conf_sum[j] += conf_j
-                    pos_count[j] += 1
-                    if ci[j]:
-                        pos_loss_carry[j] += loss_j
-                        pos_correct_carry[j] += float(pred == target.item())
-                        pos_count_carry[j] += 1
-                    else:
-                        pos_loss_nocarry[j] += loss_j
-                        pos_correct_nocarry[j] += float(pred == target.item())
-                        pos_count_nocarry[j] += 1
+                    sp = a_s + j - 1
+                    if sp < 0 or sp >= logits.shape[1]: continue
+                    tgt = ids[b, a_s+j]
+                    lp = F.log_softmax(logits[b, sp], dim=-1)
+                    lj = -lp[tgt].item()
+                    pred = logits[b, sp].argmax().item()
+                    cj = F.softmax(logits[b, sp], dim=-1).max().item()
+                    L[j] += lj; C[j] += float(pred == tgt.item()); CF[j] += cj; N[j] += 1
+                    if ci[j]: Lc[j] += lj; Cc[j] += float(pred == tgt.item()); Nc[j] += 1
+                    else:     Ln[j] += lj; Cn[j] += float(pred == tgt.item()); Nn[j] += 1
         else:
-            x_masked = ids.clone()
+            xm = ids.clone()
             for b in range(B):
-                a_start = ans_starts[b].item()
-                x_masked[b, a_start:a_start + ANS_LEN] = mask_id
-            logits = model(x_masked)
+                a_s = ans[b].item()
+                xm[b, a_s:a_s+ANS_LEN] = mask_id
+            logits = model(xm)
             for b in range(B):
-                a_start = ans_starts[b].item()
-                ci = carry_in_flags[start + b]
+                a_s = ans[b].item()
+                ci = ci_flags[st+b]
                 for j in range(ANS_LEN):
-                    pos = a_start + j
-                    target = ids[b, pos]
+                    pos = a_s + j
+                    tgt = ids[b, pos]
                     lp = F.log_softmax(logits[b, pos], dim=-1)
-                    loss_j = -lp[target].item()
+                    lj = -lp[tgt].item()
                     pred = logits[b, pos].argmax().item()
-                    conf_j = F.softmax(logits[b, pos], dim=-1).max().item()
+                    cj = F.softmax(logits[b, pos], dim=-1).max().item()
+                    L[j] += lj; C[j] += float(pred == tgt.item()); CF[j] += cj; N[j] += 1
+                    if ci[j]: Lc[j] += lj; Cc[j] += float(pred == tgt.item()); Nc[j] += 1
+                    else:     Ln[j] += lj; Cn[j] += float(pred == tgt.item()); Nn[j] += 1
 
-                    pos_loss_sum[j] += loss_j
-                    pos_correct_sum[j] += float(pred == target.item())
-                    pos_conf_sum[j] += conf_j
-                    pos_count[j] += 1
-                    if ci[j]:
-                        pos_loss_carry[j] += loss_j
-                        pos_correct_carry[j] += float(pred == target.item())
-                        pos_count_carry[j] += 1
-                    else:
-                        pos_loss_nocarry[j] += loss_j
-                        pos_correct_nocarry[j] += float(pred == target.item())
-                        pos_count_nocarry[j] += 1
-
-    safe = pos_count.clamp(min=1)
-    safe_c = pos_count_carry.clamp(min=1)
-    safe_nc = pos_count_nocarry.clamp(min=1)
-
+    s, sc, sn = N.clamp(1), Nc.clamp(1), Nn.clamp(1)
+    pos_conf = (CF/s).cpu().tolist()
+    # Confidence-induced decode ranking: highest confidence first
+    conf_ranking = sorted(range(ANS_LEN), key=lambda j: pos_conf[j], reverse=True)
+    oracle = _oracle_ranking(fmt)
+    tau_oracle = _kendall_tau(conf_ranking, oracle)
     return {
-        'pos_loss': (pos_loss_sum / safe).cpu().tolist(),
-        'pos_acc': (pos_correct_sum / safe).cpu().tolist(),
-        'pos_conf': (pos_conf_sum / safe).cpu().tolist(),
-        'pos_loss_carry_in': (pos_loss_carry / safe_c).cpu().tolist(),
-        'pos_loss_no_carry': (pos_loss_nocarry / safe_nc).cpu().tolist(),
-        'pos_acc_carry_in': (pos_correct_carry / safe_c).cpu().tolist(),
-        'pos_acc_no_carry': (pos_correct_nocarry / safe_nc).cpu().tolist(),
-        'overall_loss': (pos_loss_sum.sum() / safe.sum()).item(),
-        'overall_acc': (pos_correct_sum.sum() / safe.sum()).item(),
+        'pos_loss': (L/s).cpu().tolist(),
+        'pos_acc': (C/s).cpu().tolist(),
+        'pos_conf': pos_conf,
+        'conf_ranking': conf_ranking,
+        'tau_oracle': tau_oracle,
+        'pos_loss_carry_in': (Lc/sc).cpu().tolist(),
+        'pos_loss_no_carry': (Ln/sn).cpu().tolist(),
+        'pos_acc_carry_in': (Cc/sc).cpu().tolist(),
+        'pos_acc_no_carry': (Cn/sn).cpu().tolist(),
+        'overall_loss': (L.sum()/s.sum()).item(),
+        'overall_acc': (C.sum()/s.sum()).item(),
     }
 
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# Partial mask confidence probe (diffusion only)
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
 @torch.no_grad()
-def probe_partial_mask_confidence(model, tokenizer, test_samples,
-                                  fmt, max_len, mask_fractions=None,
-                                  device=None):
-    if device is None:
-        device = DEVICE
-    if mask_fractions is None:
-        mask_fractions = [0.2, 0.4, 0.6, 0.8, 1.0]
+def probe_partial_mask(model, tokenizer, test_samples, fmt, max_len,
+                       fracs=None, device=None):
+    """Diffusion: confidence at different masking levels (MSB masked first)."""
+    if device is None: device = DEVICE
+    if fracs is None: fracs = [0.2, 0.4, 0.6, 0.8, 1.0]
     model.eval()
     mask_id = tokenizer.special_ids['mask']
-
-    ids_all, ans_starts_all = encode_samples(test_samples, tokenizer, max_len)
-    ids_all = ids_all.to(device)
-    ans_starts_all = ans_starts_all.to(device)
+    ids_all, ans_all = encode_samples(test_samples, tokenizer, max_len)
+    ids_all, ans_all = ids_all.to(device), ans_all.to(device)
 
     results = {}
-    for frac in mask_fractions:
-        n_mask = max(1, int(math.ceil(frac * ANS_LEN)))
-        conf_sum = torch.zeros(ANS_LEN, device=device)
-        acc_sum = torch.zeros(ANS_LEN, device=device)
-        count = torch.zeros(ANS_LEN, device=device)
-
-        for start in range(0, len(test_samples), 128):
-            end = min(start + 128, len(test_samples))
-            ids = ids_all[start:end]
-            ans_starts = ans_starts_all[start:end]
+    for frac in fracs:
+        nm = max(1, int(math.ceil(frac * ANS_LEN)))
+        conf_s = torch.zeros(ANS_LEN, device=device)
+        acc_s = torch.zeros(ANS_LEN, device=device)
+        cnt = torch.zeros(ANS_LEN, device=device)
+        for st in range(0, len(test_samples), 128):
+            en = min(st+128, len(test_samples))
+            ids, ans = ids_all[st:en], ans_all[st:en]
             B = ids.shape[0]
             x = ids.clone()
-            mask_flags = torch.zeros(B, ANS_LEN, dtype=torch.bool, device=device)
+            mf = torch.zeros(B, ANS_LEN, dtype=torch.bool, device=device)
             for b in range(B):
-                a_start = ans_starts[b].item()
+                a = ans[b].item()
                 if fmt == 'plain':
-                    for j in range(min(n_mask, ANS_LEN)):
-                        x[b, a_start + j] = mask_id
-                        mask_flags[b, j] = True
+                    for j in range(min(nm, ANS_LEN)):
+                        x[b, a+j] = mask_id; mf[b, j] = True
                 else:
-                    for j in range(min(n_mask, ANS_LEN)):
-                        pos = a_start + ANS_LEN - 1 - j
-                        x[b, pos] = mask_id
-                        mask_flags[b, ANS_LEN - 1 - j] = True
+                    for j in range(min(nm, ANS_LEN)):
+                        x[b, a+ANS_LEN-1-j] = mask_id; mf[b, ANS_LEN-1-j] = True
             logits = model(x)
             for b in range(B):
-                a_start = ans_starts[b].item()
+                a = ans[b].item()
                 for j in range(ANS_LEN):
-                    if mask_flags[b, j]:
-                        pos = a_start + j
-                        target = ids[b, pos]
-                        probs = F.softmax(logits[b, pos], dim=-1)
-                        conf_sum[j] += probs.max().item()
-                        acc_sum[j] += float(probs.argmax().item() == target.item())
-                        count[j] += 1
-        safe = count.clamp(min=1)
-        results[frac] = {
-            'pos_conf': (conf_sum / safe).cpu().tolist(),
-            'pos_acc': (acc_sum / safe).cpu().tolist(),
-            'n_masked': n_mask,
-        }
+                    if mf[b, j]:
+                        p = F.softmax(logits[b, a+j], dim=-1)
+                        conf_s[j] += p.max().item()
+                        acc_s[j] += float(p.argmax().item() == ids[b, a+j].item())
+                        cnt[j] += 1
+        s = cnt.clamp(1)
+        results[frac] = {'pos_conf': (conf_s/s).cpu().tolist(),
+                         'pos_acc': (acc_s/s).cpu().tolist(), 'n_masked': nm}
     return results
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# Training with periodic eval
+# Training (epoch-based, fixed budget)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 def train_with_dynamics(
     objective, tokenizer, train_samples, test_samples,
-    max_len, fmt,
-    mask_type='random',
-    eval_every=EVAL_EVERY,
-    n_layer=N_LAYER, n_head=N_HEAD, n_embd=N_EMBD,
-    dropout=DROPOUT, pos_enc=POS_ENC,
-    batch_size=BATCH_SIZE, lr=LR,
-    max_iters=MAX_ITERS, warmup_iters=WARMUP,
-    min_lr=MIN_LR, grad_clip=GRAD_CLIP,
-    patience=PATIENCE, min_delta=1e-4,
-    log_interval=LOG_INTERVAL, device=None,
+    max_len, fmt, mask_type='random', device=None,
 ):
-    if device is None:
-        device = DEVICE
+    """
+    Epoch-based training with periodic per-position probes.
+
+    Replaces core.train_model for this experiment because:
+      1. Epoch-based loop (core uses iteration-based while-loop)
+      2. Periodic probe_per_position eval (core has no mid-training probes)
+      3. Ordered masking support (core only has random masking)
+      4. Token-gradient counting for fair AR/Diffusion comparison
+    """
+    if device is None: device = DEVICE
 
     train_ids, train_ans = encode_samples(train_samples, tokenizer, max_len)
-    loader = DataLoader(
-        TensorDataset(train_ids, train_ans),
-        batch_size=batch_size, shuffle=True, drop_last=True)
+    loader = DataLoader(TensorDataset(train_ids, train_ans),
+                        batch_size=BATCH_SIZE, shuffle=True, drop_last=False)
+    bpe = len(loader)  # batches per epoch
+    total_iters = MAX_EPOCHS * bpe
 
     mask_id = tokenizer.special_ids['mask']
     pad_id = tokenizer.special_ids['pad']
@@ -424,28 +390,29 @@ def train_with_dynamics(
 
     model = Transformer(
         vocab_size=len(tokenizer), block_size=max_len + 8,
-        n_layer=n_layer, n_head=n_head, n_embd=n_embd,
-        dropout=dropout, is_causal=is_causal, pos_enc=pos_enc,
+        n_layer=N_LAYER, n_head=N_HEAD, n_embd=N_EMBD,
+        dropout=DROPOUT, is_causal=is_causal, pos_enc=POS_ENC,
     ).to(device)
 
-    tag = f"{objective}" + (f"/{mask_type}" if objective == 'diffusion' else "")
-    print(f"  [{tag}|{pos_enc}] params={model.n_params:,}, "
-          f"seq_len={max_len}, eval_every={eval_every}")
+    tag = objective + (f"/{mask_type}" if objective == 'diffusion' else "")
+    print(f"  [{tag}|{POS_ENC}] params={model.n_params:,}, "
+          f"seq_len={max_len}, {bpe} batches/epoch, {MAX_EPOCHS} epochs")
 
     optimizer = torch.optim.AdamW(
-        model.parameters(), lr=lr, betas=(0.9, 0.99), weight_decay=0.1)
+        model.parameters(), lr=LR, betas=(0.9, 0.99), weight_decay=0.1)
+    warmup_iters = WARMUP_EPOCHS * bpe
 
     def get_lr(it):
         if it < warmup_iters:
-            return lr * it / max(warmup_iters, 1)
-        ratio = (it - warmup_iters) / max(max_iters - warmup_iters, 1)
-        return min_lr + 0.5 * (lr - min_lr) * (1 + math.cos(math.pi * min(ratio, 1.0)))
+            return LR * it / max(warmup_iters, 1)
+        ratio = (it - warmup_iters) / max(total_iters - warmup_iters, 1)
+        return MIN_LR + 0.5 * (LR - MIN_LR) * (1 + math.cos(math.pi * min(ratio, 1.0)))
 
-    dynamics = {'checkpoints': [], 'train_loss': [], 'converged_at': None}
-    best_loss, best_iter = float('inf'), 0
+    dynamics = {'checkpoints': [], 'train_loss': []}
+    best_loss = float('inf')
     best_state = None
-    model.train()
     it = 0
+    tg = 0  # token-gradient count
     t0 = time.time()
 
     def _pos_labels():
@@ -453,24 +420,28 @@ def train_with_dynamics(
             return ['MSB'] + [f'p{j}' for j in range(1, ANS_LEN-1)] + ['LSB']
         return ['LSB'] + [f'p{j}' for j in range(1, ANS_LEN-1)] + ['MSB']
 
-    def _do_eval():
+    def _do_eval(epoch):
         probe = probe_per_position(
             model, tokenizer, test_samples, objective, fmt, max_len, device)
-        dynamics['checkpoints'].append({'iter': it, **probe})
-        elapsed = time.time() - t0
-        print(f"    [eval@{it:5d}] loss={probe['overall_loss']:.4f} "
-              f"acc={probe['overall_acc']:.4f} | {elapsed:.0f}s")
+        dynamics['checkpoints'].append({
+            'epoch': epoch, 'iter': it, 'token_gradients': tg, **probe})
         labs = _pos_labels()
         acc_str = ' '.join(f"{labs[j]}={probe['pos_acc'][j]:.2f}"
                            for j in range(ANS_LEN))
-        print(f"             acc: {acc_str}")
+        tau_str = f"τ_oracle={probe['tau_oracle']:.3f}" if 'tau_oracle' in probe else ''
+        print(f"    [eval ep {epoch:4d}] loss={probe['overall_loss']:.4f} "
+              f"acc={probe['overall_acc']:.4f} {tau_str} "
+              f"tg={tg:,} | {time.time()-t0:.0f}s")
+        print(f"      {acc_str}")
 
-    _do_eval()
+    # ── Eval at epoch 0 ──
+    model.eval(); _do_eval(0); model.train()
 
-    while it < max_iters:
+    for epoch in range(1, MAX_EPOCHS + 1):
+        epoch_loss = 0.0
+        epoch_n = 0
+
         for batch in loader:
-            if it >= max_iters:
-                break
             for pg in optimizer.param_groups:
                 pg['lr'] = get_lr(it)
 
@@ -481,13 +452,14 @@ def train_with_dynamics(
             if objective == 'ar':
                 logits = model(ids[:, :-1])
                 targets = ids[:, 1:]
-                pos = torch.arange(T - 1, device=device).unsqueeze(0)
-                loss_mask = pos >= (ans_starts.unsqueeze(1) - 1)
-                loss_mask = loss_mask & (targets != pad_id)
-                if loss_mask.sum() == 0:
-                    it += 1; continue
-                loss = F.cross_entropy(logits[loss_mask], targets[loss_mask])
-            else:
+                pos = torch.arange(T-1, device=device).unsqueeze(0)
+                lm = pos >= (ans_starts.unsqueeze(1) - 1)
+                lm = lm & (targets != pad_id)
+                if lm.sum() == 0: it += 1; continue
+                loss = F.cross_entropy(logits[lm], targets[lm])
+                tg += lm.sum().item()
+
+            else:  # diffusion
                 pos = torch.arange(T, device=device).unsqueeze(0)
                 ans_mask = pos >= ans_starts.unsqueeze(1)
 
@@ -496,75 +468,101 @@ def train_with_dynamics(
                     m_probs = t_ratio.unsqueeze(1) * ans_mask.float()
                     m = torch.bernoulli(m_probs).bool()
                     no_m = ~(m.any(dim=1))
-                    for b_idx in no_m.nonzero(as_tuple=True)[0]:
-                        valid = ans_mask[b_idx].nonzero(as_tuple=True)[0]
-                        if len(valid) > 0:
-                            m[b_idx, valid[torch.randint(len(valid), (1,))]] = True
+                    for bi in no_m.nonzero(as_tuple=True)[0]:
+                        v = ans_mask[bi].nonzero(as_tuple=True)[0]
+                        if len(v) > 0: m[bi, v[torch.randint(len(v),(1,))]] = True
+
                 elif mask_type == 'ordered':
                     t_ratio = torch.rand(B, device=device)
                     m = torch.zeros(B, T, dtype=torch.bool, device=device)
-                    for b_idx in range(B):
-                        a_start = ans_starts[b_idx].item()
-                        a_positions = list(range(a_start, min(a_start + ANS_LEN, T)))
-                        n_ans = len(a_positions)
-                        n_mask = max(1, int(math.ceil(t_ratio[b_idx].item() * n_ans)))
+                    for bi in range(B):
+                        a_s = ans_starts[bi].item()
+                        a_pos = list(range(a_s, min(a_s + ANS_LEN, T)))
+                        na = len(a_pos)
+                        nm = max(1, int(math.ceil(t_ratio[bi].item() * na)))
                         if fmt == 'plain':
-                            mask_positions = a_positions[:n_mask]
+                            for p in a_pos[:nm]: m[bi, p] = True
                         else:
-                            mask_positions = a_positions[n_ans - n_mask:]
-                        for p in mask_positions:
-                            m[b_idx, p] = True
-                else:
-                    raise ValueError(f"Unknown mask_type: {mask_type}")
+                            for p in a_pos[na-nm:]: m[bi, p] = True
 
-                x_m = ids.clone()
-                x_m[m] = mask_id
-                logits = model(x_m)
-                if m.sum() == 0:
-                    it += 1; continue
+                elif mask_type == 'msb':
+                    # Anti-oracle: unmask MSB first → mask LSB side
+                    # Opposite direction of 'ordered' (LSB-first)
+                    t_ratio = torch.rand(B, device=device)
+                    m = torch.zeros(B, T, dtype=torch.bool, device=device)
+                    for bi in range(B):
+                        a_s = ans_starts[bi].item()
+                        a_pos = list(range(a_s, min(a_s + ANS_LEN, T)))
+                        na = len(a_pos)
+                        nm = max(1, int(math.ceil(t_ratio[bi].item() * na)))
+                        if fmt == 'plain':
+                            for p in a_pos[na-nm:]: m[bi, p] = True
+                        else:
+                            for p in a_pos[:nm]: m[bi, p] = True
+
+                elif mask_type == 'confidence':
+                    # PUMA-style: mask positions the model is least
+                    # confident about (= unmask high-confidence first).
+                    # Uses a fully-masked forward pass (no grad) to get
+                    # per-position confidence, then builds the mask.
+                    xm_probe = ids.clone()
+                    for bi in range(B):
+                        a_s = ans_starts[bi].item()
+                        xm_probe[bi, a_s:min(a_s + ANS_LEN, T)] = mask_id
+                    with torch.no_grad():
+                        logits_probe = model(xm_probe)
+
+                    t_ratio = torch.rand(B, device=device)
+                    m = torch.zeros(B, T, dtype=torch.bool, device=device)
+                    for bi in range(B):
+                        a_s = ans_starts[bi].item()
+                        a_pos = list(range(a_s, min(a_s + ANS_LEN, T)))
+                        na = len(a_pos)
+                        nm = max(1, int(math.ceil(t_ratio[bi].item() * na)))
+                        # rank by confidence (ascending) → mask least confident
+                        confs = [F.softmax(logits_probe[bi, p], dim=-1
+                                           ).max().item() for p in a_pos]
+                        ranked = sorted(range(na), key=lambda k: confs[k])
+                        for k in range(nm):
+                            m[bi, a_pos[ranked[k]]] = True
+
+                xm = ids.clone(); xm[m] = mask_id
+                logits = model(xm)
+                if m.sum() == 0: it += 1; continue
                 loss = F.cross_entropy(logits[m], ids[m])
+                tg += m.sum().item()
 
             optimizer.zero_grad()
             loss.backward()
-            nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
             optimizer.step()
 
-            cur_loss = loss.item()
-            if it % log_interval == 0:
-                dynamics['train_loss'].append((it, cur_loss))
-                if it % eval_every != 0:
-                    elapsed = time.time() - t0
-                    print(f"    it {it:5d} | loss {cur_loss:.4f} | "
-                          f"lr {get_lr(it):.1e} | {elapsed:.0f}s")
-
-            if it > 0 and it % eval_every == 0:
-                model.eval()
-                _do_eval()
-                model.train()
-
-            if cur_loss < best_loss - min_delta:
-                best_loss = cur_loss
-                best_iter = it
-                best_state = {k: v.cpu().clone()
-                              for k, v in model.state_dict().items()}
-            elif it - best_iter >= patience and it > warmup_iters + patience:
-                print(f"    ✓ Converged at it {it} (best={best_iter})")
-                dynamics['converged_at'] = it
-                if best_state:
-                    model.load_state_dict(
-                        {k: v.to(device) for k, v in best_state.items()})
-                model.eval()
-                _do_eval()
-                return model, dynamics
-
+            epoch_loss += loss.item()
+            epoch_n += 1
             it += 1
 
-    print(f"    ✓ Reached max_iters={max_iters}")
-    dynamics['converged_at'] = max_iters
+        # ── End of epoch ──
+        avg_loss = epoch_loss / max(epoch_n, 1)
+
+        # Best model snapshot (by own training loss)
+        if avg_loss < best_loss:
+            best_loss = avg_loss
+            best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+
+        if epoch % LOG_EVERY == 0:
+            dynamics['train_loss'].append((epoch, avg_loss))
+            print(f"    ep {epoch:4d}/{MAX_EPOCHS} | loss {avg_loss:.4f} | "
+                  f"lr {get_lr(it):.1e} | tg {tg:,} | {time.time()-t0:.0f}s")
+
+        if epoch % EVAL_EVERY == 0:
+            model.eval(); _do_eval(epoch); model.train()
+
+    # ── Load best model ──
+    print(f"    ✓ Done {MAX_EPOCHS} epochs (best train loss: {best_loss:.4f})")
     if best_state:
         model.load_state_dict({k: v.to(device) for k, v in best_state.items()})
     model.eval()
-    _do_eval()
+    _do_eval(MAX_EPOCHS)
     return model, dynamics
 
 
@@ -572,142 +570,100 @@ def train_with_dynamics(
 # Final evaluation (generation-based)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-@torch.no_grad()
-def generate_diffusion_lsb(model, prefix_ids, n_tokens, mask_id,
-                           fmt='plain', greedy=True, device=None):
-    if device is None:
-        device = DEVICE
-    model.eval()
-    B = prefix_ids.shape[0]
-    T_pre = prefix_ids.shape[1]
-    T = T_pre + n_tokens
-    x = torch.full((B, T), mask_id, dtype=torch.long, device=device)
-    x[:, :T_pre] = prefix_ids.to(device)
-    if fmt == 'plain':
-        order = list(range(T_pre + n_tokens - 1, T_pre - 1, -1))
-    else:
-        order = list(range(T_pre, T_pre + n_tokens))
-    orders = []
-    for pos in order:
-        logits = model(x)
-        pos_logits = logits[:, pos, :].clone()
-        pos_logits[:, mask_id] = -float('inf')
-        tok = pos_logits.argmax(-1) if greedy else \
-            torch.multinomial(F.softmax(pos_logits, dim=-1), 1).squeeze(-1)
-        x[:, pos] = tok
-        orders.append(torch.full((B,), pos, dtype=torch.long))
-    return x, torch.stack(orders, dim=1)
+def _lsb_policy(fmt):
+    """Map format to core generate_diffusion policy for LSB-first decoding.
+    plain:   answer is [MSB..LSB] → decode right-to-left = 'r2l'
+    reverse: answer is [LSB..MSB] → decode left-to-right = 'l2r'
+    """
+    return 'r2l' if fmt == 'plain' else 'l2r'
 
 
 def final_evaluate(model, tokenizer, test_samples, objective, fmt,
                    decode_policy='confidence', batch_size=128, device=None):
-    if device is None:
-        device = DEVICE
+    """
+    Generation-based evaluation with per-position & carry analysis.
+
+    Uses core generate_ar / generate_diffusion for generation.
+    Adds per-position accuracy and carry-count breakdown on top.
+    (core.evaluate doesn't track these — it's for exact match only.)
+    """
+    if device is None: device = DEVICE
     mask_id = tokenizer.special_ids['mask']
     pad_id = tokenizer.special_ids['pad']
     model.eval()
+    results, all_orders = [], []
 
-    results = []
-    all_orders = []
-
-    for start in range(0, len(test_samples), batch_size):
-        batch = test_samples[start:start + batch_size]
-        B = len(batch)
-        prefixes = [s.split('=')[0] + '=' for s in batch]
-        penc = [tokenizer.encode(p) for p in prefixes]
-        pmax = max(len(p) for p in penc)
-        pids = torch.full((B, pmax), pad_id, dtype=torch.long)
-        for i, e in enumerate(penc):
-            pids[i, :len(e)] = torch.tensor(e)
+    for st in range(0, len(test_samples), batch_size):
+        batch = test_samples[st:st+batch_size]; B = len(batch)
+        penc = [tokenizer.encode(s.split('=')[0]+'=') for s in batch]
+        pm = max(len(p) for p in penc)
+        pids = torch.full((B, pm), pad_id, dtype=torch.long)
+        for i, e in enumerate(penc): pids[i,:len(e)] = torch.tensor(e)
 
         with torch.no_grad():
             if objective == 'ar':
                 gen = generate_ar(model, pids, ANS_LEN, device)
-                pred_ids = gen[:, pmax:pmax + ANS_LEN]
-                batch_orders = None
-            elif decode_policy == 'lsb':
-                gen, batch_orders = generate_diffusion_lsb(
-                    model, pids, ANS_LEN, mask_id,
-                    fmt=fmt, greedy=True, device=device)
-                pred_ids = gen[:, pmax:pmax + ANS_LEN]
+                pred_ids = gen[:, pm:pm+ANS_LEN]; bo = None
             else:
+                # Both 'confidence' and 'lsb' use core generate_diffusion
+                policy = _lsb_policy(fmt) if decode_policy == 'lsb' else 'confidence'
                 gen, _, info = generate_diffusion(
                     model, pids, ANS_LEN, mask_id,
-                    policy='confidence', greedy=True, device=device)
-                pred_ids = gen[:, pmax:pmax + ANS_LEN]
-                batch_orders = info.get('orders')
-
-        if batch_orders is not None:
-            all_orders.append(batch_orders)
+                    policy=policy, greedy=True, device=device)
+                pred_ids = gen[:, pm:pm+ANS_LEN]
+                bo = info.get('orders')
+        if bo is not None: all_orders.append(bo)
 
         for i in range(B):
-            pred_str = tokenizer.decode(pred_ids[i].cpu().tolist())
-            gold_ans = get_answer(batch[i], fmt)
-            a, b_val = _parse_operands(batch[i])
-            pos_correct = [pred_str[j] == gold_ans[j]
-                           if j < len(pred_str) else False
-                           for j in range(len(gold_ans))]
-            results.append({
-                'correct': pred_str == gold_ans,
-                'pos_correct': pos_correct,
-                'n_carries': _count_carries(a, b_val),
-            })
+            ps = tokenizer.decode(pred_ids[i].cpu().tolist())
+            gs = get_answer(batch[i], fmt)
+            a, b = _parse_operands(batch[i])
+            pc = [ps[j]==gs[j] if j<len(ps) else False for j in range(len(gs))]
+            results.append({'correct': ps==gs, 'pos_correct': pc,
+                           'n_carries': _count_carries(a, b)})
 
     n = len(results)
     acc = sum(r['correct'] for r in results) / max(n, 1)
-    pos_acc = []
-    for j in range(ANS_LEN):
-        vals = [r['pos_correct'][j] for r in results]
-        pos_acc.append(sum(vals) / max(len(vals), 1))
+    pos_acc = [sum(r['pos_correct'][j] for r in results)/max(n,1) for j in range(ANS_LEN)]
     by_nc = defaultdict(list)
-    for r in results:
-        by_nc[r['n_carries']].append(r['correct'])
+    for r in results: by_nc[r['n_carries']].append(r['correct'])
     carry_acc = {nc: (sum(v)/len(v), len(v)) for nc, v in sorted(by_nc.items())}
 
-    decode_order_analysis = None
+    oa = None
     if all_orders:
-        orders_cat = torch.cat(all_orders, dim=0)
-        prefix_len = len(tokenizer.encode(test_samples[0].split('=')[0] + '='))
-        decode_order_analysis = _analyse_orders(orders_cat, prefix_len, fmt)
+        oc = torch.cat(all_orders, dim=0)
+        pl = len(tokenizer.encode(test_samples[0].split('=')[0]+'='))
+        oa = _analyse_orders(oc, pl, fmt)
 
-    return {
-        'accuracy': acc, 'n_samples': n,
-        'position_accuracy': pos_acc,
-        'carry_accuracy': carry_acc,
-        'decode_order_analysis': decode_order_analysis,
-    }
+    return {'accuracy': acc, 'n_samples': n, 'position_accuracy': pos_acc,
+            'carry_accuracy': carry_acc, 'decode_order_analysis': oa}
 
 
 def _analyse_orders(decode_orders, prefix_len, fmt):
+    """Per-position decode rank analysis.
+    Different from core.analyse_decode_order which is scratchpad-vs-final.
+    This computes mean/median rank per answer position + LSB-first ratio.
+    """
     N, S = decode_orders.shape
-    rank_of_pos = torch.full((N, ANS_LEN), float('nan'))
+    rop = torch.full((N, ANS_LEN), float('nan'))
     for i in range(N):
-        for step in range(S):
-            rel = decode_orders[i, step].item() - prefix_len
-            if 0 <= rel < ANS_LEN:
-                rank_of_pos[i, rel] = step
-
-    mean_rank, median_rank = [], []
+        for s in range(S):
+            r = decode_orders[i, s].item() - prefix_len
+            if 0 <= r < ANS_LEN: rop[i, r] = s
+    mr, mdr = [], []
     for j in range(ANS_LEN):
-        valid = rank_of_pos[:, j][~rank_of_pos[:, j].isnan()]
-        mean_rank.append(valid.mean().item() if len(valid) > 0 else -1)
-        median_rank.append(valid.median().item() if len(valid) > 0 else -1)
-
-    lsb_idx = ANS_LEN - 1 if fmt == 'plain' else 0
-    msb_idx = 0 if fmt == 'plain' else ANS_LEN - 1
-    valid_both = ~(rank_of_pos[:, lsb_idx].isnan() | rank_of_pos[:, msb_idx].isnan())
-    lsb_first = (rank_of_pos[valid_both, lsb_idx] <
-                 rank_of_pos[valid_both, msb_idx]).float().mean().item() if valid_both.any() else -1
-
-    rank_hist = torch.zeros(ANS_LEN, S)
+        v = rop[:, j][~rop[:, j].isnan()]
+        mr.append(v.mean().item() if len(v)>0 else -1)
+        mdr.append(v.median().item() if len(v)>0 else -1)
+    li = ANS_LEN-1 if fmt=='plain' else 0
+    mi = 0 if fmt=='plain' else ANS_LEN-1
+    vb = ~(rop[:, li].isnan() | rop[:, mi].isnan())
+    lf = (rop[vb, li] < rop[vb, mi]).float().mean().item() if vb.any() else -1
+    rh = torch.zeros(ANS_LEN, S)
     for j in range(ANS_LEN):
-        for r in range(S):
-            rank_hist[j, r] = (rank_of_pos[:, j] == r).sum()
-
-    return {
-        'mean_rank': mean_rank, 'median_rank': median_rank,
-        'lsb_first_ratio': lsb_first, 'rank_histogram': rank_hist,
-    }
+        for r in range(S): rh[j, r] = (rop[:, j]==r).sum()
+    return {'mean_rank': mr, 'median_rank': mdr,
+            'lsb_first_ratio': lf, 'rank_histogram': rh}
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -720,253 +676,228 @@ def _pos_labels(fmt):
     return ['LSB'] + [f'p{j}' for j in range(1, ANS_LEN-1)] + ['MSB']
 
 COLORS = {
-    'ar':             '#e74c3c',
-    'diff-rand-conf': '#3498db',
-    'diff-rand-lsb':  '#2ecc71',
-    'diff-ord-conf':  '#9b59b6',
-    'diff-ord-lsb':   '#e67e22',
+    'ar': '#e74c3c',
+    'diff-ran-con': '#3498db', 'diff-ran-lsb': '#2ecc71',
+    'diff-ord-con': '#9b59b6', 'diff-ord-lsb': '#e67e22',
+    'diff-con-con': '#1abc9c', 'diff-con-lsb': '#16a085',
+    'diff-msb-con': '#c0392b', 'diff-msb-lsb': '#d35400',
 }
 
-def _cond_key(obj, mt, dp):
-    if obj == 'ar': return 'ar'
-    return f"diff-{mt[:3]}-{dp[:3]}"
+def _ck(obj, mt, dp):
+    return 'ar' if obj=='ar' else f"diff-{mt[:3]}-{dp[:3]}"
 
-def _full_key(obj, fmt, mt, dp):
+def _fk(obj, fmt, mt, dp):
     return f"{obj}_{fmt}_{mt}_{dp}"
 
 
-def make_figures(all_dynamics, all_final, all_partial_conf):
+def make_figures(all_dyn, all_final, all_partial):
     figs = {}
-    # Use a colormap for per-position lines
-    pos_cmap = plt.cm.coolwarm  # blue(LSB-easy) → red(MSB-hard)
+    cmap = plt.cm.coolwarm
 
     for fmt in FORMATS:
         labels = _pos_labels(fmt)
+        def pc(j):
+            return cmap(1.0 - j/(ANS_LEN-1)) if fmt=='plain' else cmap(j/(ANS_LEN-1))
 
-        def pos_color(j):
-            """Color by semantic difficulty: LSB=blue, MSB=red."""
-            if fmt == 'plain':
-                # j=0 is MSB(hard), j=8 is LSB(easy) → reverse
-                return pos_cmap(1.0 - j / (ANS_LEN - 1))
-            else:
-                # j=0 is LSB(easy), j=8 is MSB(hard)
-                return pos_cmap(j / (ANS_LEN - 1))
+        conds = [('ar', 'random')] + [('diffusion', mt) for mt in MASK_TYPES]
+        nc = len(conds)
 
-        # ── Fig 1: Per-position LOSS trajectory ──────
-        conditions = []
-        for obj in ['ar', 'diffusion']:
-            for mt in (['random'] if obj == 'ar' else MASK_TYPES):
-                conditions.append((obj, mt))
-        n_cond = len(conditions)
+        # Helper: get x from checkpoints
+        def get_x(dyn, axis='epoch'):
+            return [c[axis] for c in dyn['checkpoints']]
 
-        fig, axes = plt.subplots(1, n_cond, figsize=(6 * n_cond, 5))
-        if n_cond == 1: axes = [axes]
-        for ax_i, (obj, mt) in enumerate(conditions):
-            dp = 'confidence'
-            key = _full_key(obj, fmt, mt, dp)
-            dyn = all_dynamics.get(key)
+        # ── Fig 1: Per-position LOSS (x=epoch) ──
+        fig, axes = plt.subplots(1, nc, figsize=(6*nc, 5), squeeze=False)
+        axes = axes[0]
+        for ai, (obj, mt) in enumerate(conds):
+            key = _fk(obj, fmt, mt, 'confidence')
+            dyn = all_dyn.get(key)
             if not dyn: continue
-            ax = axes[ax_i]
-            ck = _cond_key(obj, mt, dp)
-            iters = [c['iter'] for c in dyn['checkpoints']]
+            ax = axes[ai]
+            xs = get_x(dyn)
             for j in range(ANS_LEN):
-                losses = [c['pos_loss'][j] for c in dyn['checkpoints']]
-                ax.plot(iters, losses, '-', color=pos_color(j),
-                        label=labels[j], linewidth=1.5)
-            ax.set_xlabel('Iteration')
-            ax.set_ylabel('CE Loss')
-            ax.set_title(ck)
-            ax.legend(fontsize=5, ncol=3, loc='upper right')
-            ax.grid(alpha=0.3)
-        fig.suptitle(f'Per-Position Loss Trajectory — {fmt}', fontsize=13, y=1.02)
-        fig.tight_layout()
-        figs[f'pos_loss_traj_{fmt}'] = fig
+                ax.plot(xs, [c['pos_loss'][j] for c in dyn['checkpoints']],
+                        '-', color=pc(j), label=labels[j], lw=1.5)
+            ax.set_xlabel('Epoch'); ax.set_ylabel('CE Loss')
+            ax.set_title(_ck(obj, mt, 'confidence'))
+            ax.legend(fontsize=5, ncol=3, loc='upper right'); ax.grid(alpha=0.3)
+        fig.suptitle(f'Per-Position Loss — {fmt}', fontsize=13, y=1.02)
+        fig.tight_layout(); figs[f'pos_loss_{fmt}'] = fig
 
-        # ── Fig 2: Per-position ACCURACY trajectory ──
-        fig, axes = plt.subplots(1, n_cond, figsize=(6 * n_cond, 5))
-        if n_cond == 1: axes = [axes]
-        for ax_i, (obj, mt) in enumerate(conditions):
-            dp = 'confidence'
-            key = _full_key(obj, fmt, mt, dp)
-            dyn = all_dynamics.get(key)
+        # ── Fig 2: Per-position ACC (x=epoch) ──
+        fig, axes = plt.subplots(1, nc, figsize=(6*nc, 5), squeeze=False)
+        axes = axes[0]
+        for ai, (obj, mt) in enumerate(conds):
+            key = _fk(obj, fmt, mt, 'confidence')
+            dyn = all_dyn.get(key)
             if not dyn: continue
-            ax = axes[ax_i]
-            ck = _cond_key(obj, mt, dp)
-            iters = [c['iter'] for c in dyn['checkpoints']]
+            ax = axes[ai]
+            xs = get_x(dyn)
             for j in range(ANS_LEN):
-                accs = [c['pos_acc'][j] for c in dyn['checkpoints']]
-                ax.plot(iters, accs, '-', color=pos_color(j),
-                        label=labels[j], linewidth=1.5)
-            ax.set_xlabel('Iteration')
-            ax.set_ylabel('Accuracy (teacher-forced/fully-masked)')
-            ax.set_ylim(-0.05, 1.05)
-            ax.set_title(ck)
-            ax.legend(fontsize=5, ncol=3, loc='lower right')
-            ax.grid(alpha=0.3)
-        fig.suptitle(f'Per-Position Accuracy Trajectory — {fmt}', fontsize=13, y=1.02)
-        fig.tight_layout()
-        figs[f'pos_acc_traj_{fmt}'] = fig
+                ax.plot(xs, [c['pos_acc'][j] for c in dyn['checkpoints']],
+                        '-', color=pc(j), label=labels[j], lw=1.5)
+            ax.set_xlabel('Epoch'); ax.set_ylabel('Accuracy')
+            ax.set_ylim(-0.05, 1.05); ax.set_title(_ck(obj, mt, 'confidence'))
+            ax.legend(fontsize=5, ncol=3, loc='lower right'); ax.grid(alpha=0.3)
+        fig.suptitle(f'Per-Position Accuracy — {fmt}', fontsize=13, y=1.02)
+        fig.tight_layout(); figs[f'pos_acc_{fmt}'] = fig
 
-        # ── Fig 3: Carry gap trajectory ──────────────
-        fig, axes = plt.subplots(1, n_cond, figsize=(6 * n_cond, 5))
-        if n_cond == 1: axes = [axes]
-        for ax_i, (obj, mt) in enumerate(conditions):
-            dp = 'confidence'
-            key = _full_key(obj, fmt, mt, dp)
-            dyn = all_dynamics.get(key)
+        # ── Fig 2b: Per-position ACC (x=token_gradients) ──
+        fig, axes = plt.subplots(1, nc, figsize=(6*nc, 5), squeeze=False)
+        axes = axes[0]
+        for ai, (obj, mt) in enumerate(conds):
+            key = _fk(obj, fmt, mt, 'confidence')
+            dyn = all_dyn.get(key)
             if not dyn: continue
-            ax = axes[ax_i]
-            ck = _cond_key(obj, mt, dp)
-            iters = [c['iter'] for c in dyn['checkpoints']]
+            ax = axes[ai]
+            xs = get_x(dyn, 'token_gradients')
             for j in range(ANS_LEN):
-                gaps = [c['pos_loss_carry_in'][j] - c['pos_loss_no_carry'][j]
-                        for c in dyn['checkpoints']]
-                ax.plot(iters, gaps, '-', color=pos_color(j),
-                        label=labels[j], linewidth=1.5)
-            ax.axhline(0, color='black', linewidth=0.5, ls='--')
-            ax.set_xlabel('Iteration')
-            ax.set_ylabel('Loss(carry) − Loss(no carry)')
-            ax.set_title(ck)
-            ax.legend(fontsize=5, ncol=3)
-            ax.grid(alpha=0.3)
-        fig.suptitle(f'Carry Effect on Loss — {fmt}  (+ = carry harder)',
+                ax.plot(xs, [c['pos_acc'][j] for c in dyn['checkpoints']],
+                        '-', color=pc(j), label=labels[j], lw=1.5)
+            ax.set_xlabel('Token-Gradients'); ax.set_ylabel('Accuracy')
+            ax.set_ylim(-0.05, 1.05); ax.set_title(_ck(obj, mt, 'confidence'))
+            ax.legend(fontsize=5, ncol=3, loc='lower right'); ax.grid(alpha=0.3)
+            ax.ticklabel_format(axis='x', style='sci', scilimits=(0,0))
+        fig.suptitle(f'Per-Position Accuracy — {fmt}  (x = token-gradient count)',
                      fontsize=12, y=1.02)
-        fig.tight_layout()
-        figs[f'carry_gap_{fmt}'] = fig
+        fig.tight_layout(); figs[f'pos_acc_tg_{fmt}'] = fig
 
-        # ── Fig 4: Confidence evolution (diffusion) ──
-        diff_conds = [(mt, _full_key('diffusion', fmt, mt, 'confidence'))
-                      for mt in MASK_TYPES
-                      if _full_key('diffusion', fmt, mt, 'confidence') in all_dynamics]
-        if diff_conds:
-            fig, axes = plt.subplots(1, len(diff_conds),
-                                      figsize=(6 * len(diff_conds), 5))
-            if len(diff_conds) == 1: axes = [axes]
-            for ax_i, (mt, key) in enumerate(diff_conds):
-                dyn = all_dynamics[key]
-                ax = axes[ax_i]
-                iters = [c['iter'] for c in dyn['checkpoints']]
+        # ── Fig 3: Carry gap ──
+        fig, axes = plt.subplots(1, nc, figsize=(6*nc, 5), squeeze=False)
+        axes = axes[0]
+        for ai, (obj, mt) in enumerate(conds):
+            key = _fk(obj, fmt, mt, 'confidence')
+            dyn = all_dyn.get(key)
+            if not dyn: continue
+            ax = axes[ai]
+            xs = get_x(dyn)
+            for j in range(ANS_LEN):
+                ax.plot(xs, [c['pos_loss_carry_in'][j]-c['pos_loss_no_carry'][j]
+                             for c in dyn['checkpoints']],
+                        '-', color=pc(j), label=labels[j], lw=1.5)
+            ax.axhline(0, color='k', lw=0.5, ls='--')
+            ax.set_xlabel('Epoch'); ax.set_ylabel('Loss(carry) − Loss(no carry)')
+            ax.set_title(_ck(obj, mt, 'confidence'))
+            ax.legend(fontsize=5, ncol=3); ax.grid(alpha=0.3)
+        fig.suptitle(f'Carry Effect — {fmt}  (+ = carry harder)',
+                     fontsize=12, y=1.02)
+        fig.tight_layout(); figs[f'carry_gap_{fmt}'] = fig
+
+        # ── Fig 4: Confidence evolution ──
+        dconds = [(mt, _fk('diffusion', fmt, mt, 'confidence'))
+                  for mt in MASK_TYPES
+                  if _fk('diffusion', fmt, mt, 'confidence') in all_dyn]
+        if dconds:
+            fig, axes = plt.subplots(1, len(dconds), figsize=(6*len(dconds), 5), squeeze=False)
+            axes = axes[0]
+            for ai, (mt, key) in enumerate(dconds):
+                dyn = all_dyn[key]; ax = axes[ai]
+                xs = get_x(dyn)
                 for j in range(ANS_LEN):
-                    confs = [c['pos_conf'][j] for c in dyn['checkpoints']]
-                    ax.plot(iters, confs, '-', color=pos_color(j),
-                            label=labels[j], linewidth=1.5)
-                ax.set_xlabel('Iteration')
-                ax.set_ylabel('Confidence (fully masked)')
-                ax.set_ylim(0, 1.05)
-                ax.set_title(f'mask={mt}')
-                ax.legend(fontsize=5, ncol=3, loc='lower right')
-                ax.grid(alpha=0.3)
-            fig.suptitle(f'Diffusion Confidence Evolution — {fmt}',
-                         fontsize=13, y=1.02)
-            fig.tight_layout()
-            figs[f'conf_evolution_{fmt}'] = fig
+                    ax.plot(xs, [c['pos_conf'][j] for c in dyn['checkpoints']],
+                            '-', color=pc(j), label=labels[j], lw=1.5)
+                ax.set_xlabel('Epoch'); ax.set_ylabel('Confidence (fully masked)')
+                ax.set_ylim(0, 1.05); ax.set_title(f'mask={mt}')
+                ax.legend(fontsize=5, ncol=3, loc='lower right'); ax.grid(alpha=0.3)
+            fig.suptitle(f'Confidence Evolution — {fmt}', fontsize=13, y=1.02)
+            fig.tight_layout(); figs[f'conf_evo_{fmt}'] = fig
 
-        # ── Fig 5: Final per-position accuracy ───────
-        fig, axes = plt.subplots(1, 2, figsize=(14, 5))
-        for ax_i, (title, conds) in enumerate([
-            ('AR vs Diffusion', [
-                ('ar', 'random', 'confidence'),
-                ('diffusion', 'random', 'confidence'),
-                ('diffusion', 'ordered', 'confidence'),
-            ]),
-            ('Decoding policy', [
-                ('diffusion', 'random', 'confidence'),
-                ('diffusion', 'random', 'lsb'),
-                ('diffusion', 'ordered', 'confidence'),
-                ('diffusion', 'ordered', 'lsb'),
-            ]),
+        # ── Fig 4b: τ_oracle evolution (confidence ranking vs LSB-first) ──
+        if dconds:
+            fig, ax = plt.subplots(figsize=(10, 5))
+            for mt, key in dconds:
+                dyn = all_dyn[key]
+                xs = get_x(dyn)
+                taus = [c.get('tau_oracle', 0) for c in dyn['checkpoints']]
+                ck = _ck('diffusion', mt, 'confidence')
+                ax.plot(xs, taus, '-', color=COLORS.get(ck, '#333'),
+                        label=f'mask={mt}', lw=2, alpha=0.8)
+            ax.axhline(1.0, color='green', ls='--', lw=1, alpha=0.5, label='perfect oracle')
+            ax.axhline(0.0, color='grey', ls=':', lw=1, alpha=0.5)
+            ax.axhline(-1.0, color='red', ls='--', lw=1, alpha=0.5, label='anti-oracle')
+            ax.set_xlabel('Epoch'); ax.set_ylabel('Kendall τ vs LSB-first oracle')
+            ax.set_ylim(-1.1, 1.1); ax.set_title(f'Confidence Ranking Alignment — {fmt}')
+            ax.legend(fontsize=8); ax.grid(alpha=0.3)
+            fig.tight_layout(); figs[f'tau_oracle_{fmt}'] = fig
+
+        # ── Fig 5: Final per-position accuracy ──
+        fig, axes = plt.subplots(1, 3, figsize=(21, 5))
+        for ai, (title, cs) in enumerate([
+            ('AR vs Diffusion (conf decode)', [('ar','random','confidence'),
+             ('diffusion','random','confidence'), ('diffusion','ordered','confidence'),
+             ('diffusion','confidence','confidence'), ('diffusion','msb','confidence')]),
+            ('Training mask comparison (conf decode)', [
+             ('diffusion','random','confidence'), ('diffusion','ordered','confidence'),
+             ('diffusion','confidence','confidence'), ('diffusion','msb','confidence')]),
+            ('LSB decode comparison', [
+             ('diffusion','random','lsb'), ('diffusion','ordered','lsb'),
+             ('diffusion','confidence','lsb'), ('diffusion','msb','lsb')]),
         ]):
-            ax = axes[ax_i]
-            for obj, mt, dp in conds:
-                key = _full_key(obj, fmt, mt, dp)
+            ax = axes[ai]
+            for obj, mt, dp in cs:
+                key = _fk(obj, fmt, mt, dp)
                 r = all_final.get(key)
                 if r and r.get('position_accuracy'):
-                    ck = _cond_key(obj, mt, dp)
-                    pa = r['position_accuracy']
-                    ax.plot(range(ANS_LEN), pa, '-o',
-                            color=COLORS.get(ck, '#333'),
-                            label=f"{ck} ({r['accuracy']:.3f})",
-                            alpha=0.8, markersize=4)
-            ax.set_xticks(range(ANS_LEN))
-            ax.set_xticklabels(labels, fontsize=7)
-            ax.set_ylim(-0.05, 1.05)
-            ax.set_ylabel('Generation Accuracy')
-            ax.set_title(title)
-            ax.legend(fontsize=7); ax.grid(alpha=0.3)
-        fig.suptitle(f'Final Per-Position Accuracy — {fmt}', fontsize=13, y=1.02)
-        fig.tight_layout()
-        figs[f'final_pos_acc_{fmt}'] = fig
+                    ck = _ck(obj, mt, dp)
+                    ax.plot(range(ANS_LEN), r['position_accuracy'], '-o',
+                            color=COLORS.get(ck,'#333'),
+                            label=f"{ck} ({r['accuracy']:.3f})", alpha=0.8, ms=4)
+            ax.set_xticks(range(ANS_LEN)); ax.set_xticklabels(labels, fontsize=7)
+            ax.set_ylim(-0.05, 1.05); ax.set_ylabel('Gen. Accuracy')
+            ax.set_title(title); ax.legend(fontsize=6); ax.grid(alpha=0.3)
+        fig.suptitle(f'Final Position Accuracy — {fmt}', fontsize=13, y=1.02)
+        fig.tight_layout(); figs[f'final_acc_{fmt}'] = fig
 
-        # ── Fig 6: Decode order heatmaps ─────────────
-        order_data = []
-        for mt in MASK_TYPES:
-            key = _full_key('diffusion', fmt, mt, 'confidence')
-            r = all_final.get(key)
-            if r and r.get('decode_order_analysis'):
-                order_data.append((mt, r['decode_order_analysis']))
-        if order_data:
-            fig, axes = plt.subplots(1, len(order_data),
-                                      figsize=(7 * len(order_data), 5))
-            if len(order_data) == 1: axes = [axes]
-            for ax, (mt, oa) in zip(axes, order_data):
+        # ── Fig 6: Decode order heatmaps ──
+        od = [(mt, all_final.get(_fk('diffusion',fmt,mt,'confidence'),{}).get('decode_order_analysis'))
+              for mt in MASK_TYPES]
+        od = [(mt, oa) for mt, oa in od if oa]
+        if od:
+            fig, axes = plt.subplots(1, len(od), figsize=(7*len(od), 5), squeeze=False)
+            axes = axes[0]
+            for ax, (mt, oa) in zip(axes, od):
                 rh = oa['rank_histogram'].float()
-                rh_norm = rh / rh.sum(dim=1, keepdim=True).clamp(min=1)
-                im = ax.imshow(rh_norm.numpy(), aspect='auto',
-                               cmap='YlOrRd', interpolation='nearest')
-                ax.set_xlabel('Decode Step (0=first)')
-                ax.set_ylabel('Answer Position')
-                ax.set_yticks(range(ANS_LEN))
-                ax.set_yticklabels(labels, fontsize=8)
+                rn = rh / rh.sum(1, keepdim=True).clamp(1)
+                im = ax.imshow(rn.numpy(), aspect='auto', cmap='YlOrRd')
+                ax.set_xlabel('Decode Step'); ax.set_ylabel('Position')
+                ax.set_yticks(range(ANS_LEN)); ax.set_yticklabels(labels, fontsize=8)
                 plt.colorbar(im, ax=ax, label='Fraction')
-                ax.set_title(f'mask={mt} | LSB-first={oa["lsb_first_ratio"]:.2f}')
-            fig.suptitle(f'Confidence Decode Order — {fmt}', fontsize=13, y=1.02)
-            fig.tight_layout()
-            figs[f'decode_order_{fmt}'] = fig
+                ax.set_title(f'mask={mt} | LSB-1st={oa["lsb_first_ratio"]:.2f}')
+            fig.suptitle(f'Decode Order — {fmt}', fontsize=13, y=1.02)
+            fig.tight_layout(); figs[f'decode_ord_{fmt}'] = fig
 
-        # ── Fig 7: Partial mask confidence ────────────
+        # ── Fig 7: Partial mask ──
         for mt in MASK_TYPES:
-            key = _full_key('diffusion', fmt, mt, 'confidence')
-            pc = all_partial_conf.get(key)
-            if not pc: continue
-            fracs = sorted(pc.keys())
+            key = _fk('diffusion', fmt, mt, 'confidence')
+            pcd = all_partial.get(key)
+            if not pcd: continue
+            fracs = sorted(pcd.keys())
             fig, axes = plt.subplots(1, 2, figsize=(14, 5))
-            for ax, metric, ylabel in [
-                (axes[0], 'pos_conf', 'Confidence'),
-                (axes[1], 'pos_acc', 'Accuracy'),
-            ]:
-                for frac in fracs:
-                    vals = pc[frac][metric]
-                    ax.plot(range(ANS_LEN), vals, '-o', markersize=3,
-                            label=f'mask={frac:.0%} ({pc[frac]["n_masked"]}pos)',
-                            alpha=0.8)
-                ax.set_xticks(range(ANS_LEN))
-                ax.set_xticklabels(labels, fontsize=7)
-                ax.set_ylabel(ylabel)
-                if metric == 'pos_acc': ax.set_ylim(-0.05, 1.05)
+            for ax, m, yl in [(axes[0],'pos_conf','Confidence'),(axes[1],'pos_acc','Accuracy')]:
+                for f in fracs:
+                    ax.plot(range(ANS_LEN), pcd[f][m], '-o', ms=3,
+                            label=f'mask={f:.0%}', alpha=0.8)
+                ax.set_xticks(range(ANS_LEN)); ax.set_xticklabels(labels, fontsize=7)
+                ax.set_ylabel(yl)
+                if m=='pos_acc': ax.set_ylim(-0.05, 1.05)
                 ax.legend(fontsize=6); ax.grid(alpha=0.3)
-            fig.suptitle(f'Partial Mask Analysis — {fmt}, mask={mt}\n'
-                         f'(MSB masked first → LSB visible)',
-                         fontsize=12, y=1.08)
-            fig.tight_layout()
-            figs[f'partial_mask_{fmt}_{mt}'] = fig
+            fig.suptitle(f'Partial Mask — {fmt}, mask={mt}', fontsize=12, y=1.05)
+            fig.tight_layout(); figs[f'partial_{fmt}_{mt}'] = fig
 
-        # ── Fig 8: Training loss curves ──────────────
+        # ── Fig 8: Training loss ──
         fig, ax = plt.subplots(figsize=(10, 6))
-        for obj, mt in conditions:
-            dp = 'confidence'
-            key = _full_key(obj, fmt, mt, dp)
-            dyn = all_dynamics.get(key)
-            if not dyn: continue
-            ck = _cond_key(obj, mt, dp)
-            iters_l = [x[0] for x in dyn['train_loss']]
-            losses = [x[1] for x in dyn['train_loss']]
-            ax.plot(iters_l, losses, '-', color=COLORS.get(ck, '#333'),
-                    label=ck, alpha=0.7)
-        ax.set_xlabel('Iteration'); ax.set_ylabel('Training Loss')
+        for obj, mt in conds:
+            key = _fk(obj, fmt, mt, 'confidence')
+            dyn = all_dyn.get(key)
+            if not dyn or not dyn['train_loss']: continue
+            ck = _ck(obj, mt, 'confidence')
+            ax.plot([x[0] for x in dyn['train_loss']],
+                    [x[1] for x in dyn['train_loss']],
+                    '-', color=COLORS.get(ck,'#333'), label=ck, alpha=0.7)
+        ax.set_xlabel('Epoch'); ax.set_ylabel('Training Loss (each model\'s own)')
         ax.set_title(f'Training Loss — {fmt}')
         ax.legend(fontsize=8); ax.grid(alpha=0.3)
-        fig.tight_layout()
-        figs[f'train_loss_{fmt}'] = fig
+        fig.tight_layout(); figs[f'train_loss_{fmt}'] = fig
 
     return figs
 
@@ -988,163 +919,122 @@ def run():
     print(f"  ND={ND}, ANS_LEN={ANS_LEN}, max_len={max_len}")
     print(f"  Plain:   {sample}")
     print(f"  Reverse: {_fmt_reverse(12345678, 87654321)}")
+    print(f"  Budget:  {MAX_EPOCHS} epochs × {N_TRAIN//BATCH_SIZE} batches "
+          f"= {MAX_EPOCHS * (N_TRAIN//BATCH_SIZE):,} iters")
+    print(f"  Eval every {EVAL_EVERY} epochs → {MAX_EPOCHS//EVAL_EVERY} checkpoints")
 
-    all_dynamics = {}
-    all_final = {}
-    all_partial_conf = {}
+    all_dyn, all_final, all_partial = {}, {}, {}
 
     for fmt in FORMATS:
         train_data = gen_data(N_TRAIN, fmt, seed=SEED)
         test_data = gen_data(N_TEST, fmt, seed=9000)
-
-        carry_dist = defaultdict(int)
-        for s in train_data:
-            a, b = _parse_operands(s)
-            carry_dist[_count_carries(a, b)] += 1
-        print(f"\n  [{fmt}] Train: {len(train_data)}, "
-              f"carries: {dict(sorted(carry_dist.items()))}")
+        cd = defaultdict(int)
+        for s in train_data: a, b = _parse_operands(s); cd[_count_carries(a, b)] += 1
+        print(f"\n  [{fmt}] N={len(train_data)}, carries={dict(sorted(cd.items()))}")
 
         # ── AR ──
-        key = _full_key('ar', fmt, 'random', 'confidence')
-        print(f"\n{'━'*60}")
-        print(f"▶ {key}")
-        print(f"{'━'*60}")
-        model_ar, dyn_ar = train_with_dynamics(
-            'ar', tok, train_data, test_data, max_len=max_len, fmt=fmt)
-        all_dynamics[key] = dyn_ar
-        res = final_evaluate(model_ar, tok, test_data, 'ar', fmt)
-        all_final[key] = res
-        print(f"  Final gen accuracy: {res['accuracy']:.4f}")
-        del model_ar
-        torch.cuda.empty_cache() if torch.cuda.is_available() else None
+        key = _fk('ar', fmt, 'random', 'confidence')
+        print(f"\n{'━'*60}\n▶ {key}\n{'━'*60}")
+        m, d = train_with_dynamics('ar', tok, train_data, test_data, max_len, fmt)
+        all_dyn[key] = d
+        r = final_evaluate(m, tok, test_data, 'ar', fmt)
+        all_final[key] = r
+        print(f"  Final gen acc: {r['accuracy']:.4f}")
+        del m; torch.cuda.empty_cache() if torch.cuda.is_available() else None
 
-        # ── Diffusion variants ──
-        for mask_type in MASK_TYPES:
-            key_base = _full_key('diffusion', fmt, mask_type, 'confidence')
-            print(f"\n{'━'*60}")
-            print(f"▶ {key_base}")
-            print(f"{'━'*60}")
-            model_diff, dyn_diff = train_with_dynamics(
-                'diffusion', tok, train_data, test_data,
-                max_len=max_len, fmt=fmt, mask_type=mask_type)
-            all_dynamics[key_base] = dyn_diff
-
-            print(f"  Partial mask analysis...")
-            pc = probe_partial_mask_confidence(
-                model_diff, tok, test_data, fmt, max_len)
-            all_partial_conf[key_base] = pc
+        # ── Diffusion ──
+        for mt in MASK_TYPES:
+            kb = _fk('diffusion', fmt, mt, 'confidence')
+            print(f"\n{'━'*60}\n▶ {kb}\n{'━'*60}")
+            m, d = train_with_dynamics('diffusion', tok, train_data, test_data,
+                                       max_len, fmt, mask_type=mt)
+            all_dyn[kb] = d
+            print(f"  Partial mask probe...")
+            all_partial[kb] = probe_partial_mask(m, tok, test_data, fmt, max_len)
 
             for dp in DECODE_POLICIES:
-                key = _full_key('diffusion', fmt, mask_type, dp)
+                key = _fk('diffusion', fmt, mt, dp)
                 print(f"\n  Final eval: {key}")
-                res = final_evaluate(
-                    model_diff, tok, test_data, 'diffusion', fmt,
-                    decode_policy=dp)
-                all_final[key] = res
-                print(f"  Accuracy: {res['accuracy']:.4f}")
-                oa = res.get('decode_order_analysis')
+                r = final_evaluate(m, tok, test_data, 'diffusion', fmt, decode_policy=dp)
+                all_final[key] = r
+                print(f"  Acc: {r['accuracy']:.4f}")
+                oa = r.get('decode_order_analysis')
                 if oa:
-                    labs = _pos_labels(fmt)
-                    mr = oa['mean_rank']
-                    print(f"    LSB-first: {oa['lsb_first_ratio']:.3f}")
+                    labs = _pos_labels(fmt); mr = oa['mean_rank']
+                    print(f"    LSB-1st: {oa['lsb_first_ratio']:.3f}")
                     print(f"    Rank: {' '.join(f'{labs[j]}={mr[j]:.1f}' for j in range(ANS_LEN))}")
-
-            del model_diff
-            torch.cuda.empty_cache() if torch.cuda.is_available() else None
+            del m; torch.cuda.empty_cache() if torch.cuda.is_available() else None
 
     # ── Figures ──
-    print(f"\n{'='*70}")
-    print("  Generating figures...")
-    figs = make_figures(all_dynamics, all_final, all_partial_conf)
+    print(f"\n{'='*70}\n  Generating figures...\n{'='*70}")
+    figs = make_figures(all_dyn, all_final, all_partial)
 
     # ── Save ──
-    save_data = {'config': {
-        'ND': ND, 'ANS_LEN': ANS_LEN, 'N_TRAIN': N_TRAIN,
-        'N_TEST': N_TEST, 'MAX_ITERS': MAX_ITERS,
-    }}
-    for key, dyn in all_dynamics.items():
-        save_data[f'dynamics_{key}'] = {
-            'checkpoints': dyn['checkpoints'],
-            'train_loss': dyn['train_loss'],
-            'converged_at': dyn['converged_at'],
-        }
-    for key, res in all_final.items():
-        save_res = {k: v for k, v in res.items() if k != 'decode_order_analysis'}
-        oa = res.get('decode_order_analysis')
-        if oa:
-            save_res['decode_order'] = {
-                'mean_rank': oa['mean_rank'],
-                'median_rank': oa['median_rank'],
-                'lsb_first_ratio': oa['lsb_first_ratio'],
-            }
-        save_data[f'final_{key}'] = save_res
-    for key, pc in all_partial_conf.items():
-        save_data[f'partial_conf_{key}'] = pc
-    save_results(EXP_NAME, save_data, figures=figs)
+    sd = {'config': {'ND': ND, 'ANS_LEN': ANS_LEN, 'N_TRAIN': N_TRAIN,
+                     'N_TEST': N_TEST, 'MAX_EPOCHS': MAX_EPOCHS, 'BATCH_SIZE': BATCH_SIZE}}
+    for k, d in all_dyn.items():
+        sd[f'dyn_{k}'] = {'checkpoints': d['checkpoints'], 'train_loss': d['train_loss']}
+    for k, r in all_final.items():
+        sr = {kk: vv for kk, vv in r.items() if kk != 'decode_order_analysis'}
+        oa = r.get('decode_order_analysis')
+        if oa: sr['decode_order'] = {kk: vv for kk, vv in oa.items() if kk != 'rank_histogram'}
+        sd[f'final_{k}'] = sr
+    for k, p in all_partial.items(): sd[f'partial_{k}'] = p
+    save_results(EXP_NAME, sd, figures=figs)
 
     # ── Summary ──
-    print(f"\n{'='*70}")
-    print("  SUMMARY")
-    print(f"{'='*70}")
-
+    print(f"\n{'='*70}\n  SUMMARY\n{'='*70}")
     for fmt in FORMATS:
-        print(f"\n  ━━ {fmt} ━━")
         labs = _pos_labels(fmt)
-        print(f"  {'Condition':<25} {'Acc':>6}  Position Accuracy")
-        print(f"  {'─'*25} {'─'*6}  {'─'*60}")
-        for obj, mt, dp in [
-            ('ar', 'random', 'confidence'),
-            ('diffusion', 'random', 'confidence'),
-            ('diffusion', 'random', 'lsb'),
-            ('diffusion', 'ordered', 'confidence'),
-            ('diffusion', 'ordered', 'lsb'),
-        ]:
-            key = _full_key(obj, fmt, mt, dp)
+        print(f"\n  ━━ {fmt} ━━")
+        print(f"  {'Condition':<25} {'Acc':>6}  {'TG':>12}  Position Accuracy")
+        print(f"  {'─'*90}")
+        all_conds = [('ar','random','confidence')]
+        for mt in MASK_TYPES:
+            for dp in DECODE_POLICIES:
+                all_conds.append(('diffusion', mt, dp))
+        for obj, mt, dp in all_conds:
+            key = _fk(obj, fmt, mt, dp)
             r = all_final.get(key)
             if not r: continue
-            ck = _cond_key(obj, mt, dp)
+            dk = _fk(obj, fmt, mt, 'confidence')
+            dyn = all_dyn.get(dk, {})
+            tg = dyn.get('checkpoints', [{}])[-1].get('token_gradients', '?')
             pa = r.get('position_accuracy', [])
-            pa_str = ' '.join(f"{pa[j]:.2f}" for j in range(len(pa)))
-            print(f"  {ck:<25} {r['accuracy']:>6.3f}  {pa_str}")
+            print(f"  {_ck(obj,mt,dp):<25} {r['accuracy']:>6.3f}  {tg:>12,}  "
+                  f"{' '.join(f'{v:.2f}' for v in pa)}")
 
-        print(f"\n  Decode order (confidence):")
-        for mt in MASK_TYPES:
-            key = _full_key('diffusion', fmt, mt, 'confidence')
-            r = all_final.get(key)
-            oa = r.get('decode_order_analysis') if r else None
-            if oa:
-                mr = oa['mean_rank']
-                print(f"    mask={mt}: " + ' '.join(
-                    f"{labs[j]}={mr[j]:.1f}" for j in range(ANS_LEN)))
-                print(f"    LSB-first ratio: {oa['lsb_first_ratio']:.3f}")
+    # ── τ_oracle at final checkpoint ──
+    print(f"\n  CONFIDENCE RANKING vs LSB-FIRST ORACLE (final τ)")
+    for fmt in FORMATS:
+        print(f"\n  [{fmt}]")
+        for obj, mt in [('ar','random')]+[('diffusion',mt) for mt in MASK_TYPES]:
+            key = _fk(obj, fmt, mt, 'confidence')
+            dyn = all_dyn.get(key)
+            if not dyn: continue
+            tau = dyn['checkpoints'][-1].get('tau_oracle', '?')
+            print(f"    {_ck(obj,mt,'confidence'):<20} τ={tau:.3f}" if isinstance(tau, float)
+                  else f"    {_ck(obj,mt,'confidence'):<20} τ={tau}")
 
-    # ── Key findings ──
-    print(f"\n{'='*70}")
-    print("  LEARNING ORDER (iteration to reach 90% per-pos acc)")
-    print(f"{'='*70}")
+    # ── Learning order ──
+    print(f"\n  LEARNING ORDER (epoch to 90% per-pos acc)")
     for fmt in FORMATS:
         labs = _pos_labels(fmt)
         print(f"\n  [{fmt}]")
-        for obj in ['ar', 'diffusion']:
-            for mt in (['random'] if obj == 'ar' else MASK_TYPES):
-                dp = 'confidence'
-                key = _full_key(obj, fmt, mt, dp)
-                dyn = all_dynamics.get(key)
-                if not dyn: continue
-                ck = _cond_key(obj, mt, dp)
-                first_90 = {}
-                for j in range(ANS_LEN):
-                    for c in dyn['checkpoints']:
-                        if c['pos_acc'][j] >= 0.9:
-                            first_90[j] = c['iter']
-                            break
-                parts = [f"{labs[j]}@{first_90.get(j, '>max')}"
-                         for j in range(ANS_LEN)]
-                print(f"    {ck:<20} {' '.join(parts)}")
+        for obj, mt in [('ar','random')]+[('diffusion',mt) for mt in MASK_TYPES]:
+            key = _fk(obj, fmt, mt, 'confidence')
+            dyn = all_dyn.get(key)
+            if not dyn: continue
+            f90 = {}
+            for j in range(ANS_LEN):
+                for c in dyn['checkpoints']:
+                    if c['pos_acc'][j] >= 0.9: f90[j] = c['epoch']; break
+            parts = [f"{labs[j]}@ep{f90[j]}" if j in f90 else f"{labs[j]}@-"
+                     for j in range(ANS_LEN)]
+            print(f"    {_ck(obj,mt,'confidence'):<20} {' '.join(parts)}")
 
     plt.show()
-    return all_dynamics, all_final, all_partial_conf
-
+    return all_dyn, all_final, all_partial
 
 if __name__ == '__main__':
     run()
