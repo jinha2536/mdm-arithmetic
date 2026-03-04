@@ -315,7 +315,10 @@ def generate_diffusion(model, prefix_ids, n_tokens, mask_id,
     if policy.startswith('parallel'):
         while not unmasked[:, T_pre:].all():
             logits = model(x)
-            probs = F.softmax(logits, dim=-1)
+            # For position selection: exclude MASK
+            sel_logits = logits.clone()
+            sel_logits[:, :, mask_id] = -float('inf')
+            probs = F.softmax(sel_logits, dim=-1)
             step_positions = torch.full((B,), -1, dtype=torch.long)  # track first
             for b in range(B):
                 mp = (~unmasked[b]).nonzero(as_tuple=True)[0]
@@ -356,7 +359,10 @@ def generate_diffusion(model, prefix_ids, n_tokens, mask_id,
     # ── Sequential ──
     for t in range(n_tokens):
         logits = model(x)
-        probs = F.softmax(logits, dim=-1)
+        # For position selection: exclude MASK from confidence/entropy
+        sel_logits = logits.clone()
+        sel_logits[:, :, mask_id] = -float('inf')
+        probs = F.softmax(sel_logits, dim=-1)
 
         if policy == 'confidence':
             sc = probs.max(-1).values.clone(); sc[unmasked] = -1; pos = sc.argmax(-1)
@@ -383,7 +389,7 @@ def generate_diffusion(model, prefix_ids, n_tokens, mask_id,
             raise ValueError(f"Unknown policy: {policy}")
 
         lp_at_pos = logits[torch.arange(B, device=device), pos]
-        # exclude MASK and PAD from generation
+        # exclude MASK from token selection (PAD remains valid for diffusion)
         lp_at_pos[:, mask_id] = -float('inf')
         if greedy:
             tok = lp_at_pos.argmax(-1)
