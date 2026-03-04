@@ -95,47 +95,6 @@ SEED = 42
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# Confidence ranking utilities
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-def _oracle_ranking(fmt):
-    """Oracle (LSB-first) decode order: which position to unmask first.
-    Returns list of position indices from first-unmasked to last-unmasked.
-      plain:   LSB is at index ANS_LEN-1 → unmask last index first
-      reverse: LSB is at index 0         → unmask first index first
-    """
-    if fmt == 'plain':
-        return list(range(ANS_LEN - 1, -1, -1))  # [8,7,...,0]
-    return list(range(ANS_LEN))                   # [0,1,...,8]
-
-
-def _kendall_tau(rank_a, rank_b):
-    """Kendall tau-b between two rankings (lists of position indices).
-    Returns correlation in [-1, 1].  +1 = identical, -1 = reversed.
-    """
-    n = len(rank_a)
-    if n < 2:
-        return 0.0
-    # Convert position-order lists to rank arrays
-    ra = [0] * n
-    rb = [0] * n
-    for r, pos in enumerate(rank_a):
-        ra[pos] = r
-    for r, pos in enumerate(rank_b):
-        rb[pos] = r
-    conc, disc = 0, 0
-    for i in range(n):
-        for j in range(i + 1, n):
-            s = (ra[i] - ra[j]) * (rb[i] - rb[j])
-            if s > 0:
-                conc += 1
-            elif s < 0:
-                disc += 1
-    denom = n * (n - 1) / 2
-    return (conc - disc) / denom if denom > 0 else 0.0
-
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Data
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -287,30 +246,36 @@ def probe_per_position(model, tokenizer, test_samples, objective,
                     lp = F.log_softmax(logits[b, pos], dim=-1)
                     lj = -lp[tgt].item()
                     pred = logits[b, pos].argmax().item()
-                    cj = F.softmax(logits[b, pos], dim=-1).max().item()
+                    # Exclude MASK token from confidence
+                    cl = logits[b, pos].clone()
+                    cl[mask_id] = -float('inf')
+                    cj = F.softmax(cl, dim=-1).max().item()
                     L[j] += lj; C[j] += float(pred == tgt.item()); CF[j] += cj; N[j] += 1
                     if ci[j]: Lc[j] += lj; Cc[j] += float(pred == tgt.item()); Nc[j] += 1
                     else:     Ln[j] += lj; Cn[j] += float(pred == tgt.item()); Nn[j] += 1
 
-    s, sc, sn = N.clamp(1), Nc.clamp(1), Nn.clamp(1)
+    s = N.clamp(1)
     pos_conf = (CF/s).cpu().tolist()
-    # Confidence-induced decode ranking: highest confidence first
-    conf_ranking = sorted(range(ANS_LEN), key=lambda j: pos_conf[j], reverse=True)
-    oracle = _oracle_ranking(fmt)
-    tau_oracle = _kendall_tau(conf_ranking, oracle)
-    return {
+    # Carry-conditioned: use None where no samples exist (e.g. LSB has no carry-in)
+    def _safe_div(num, den):
+        out = []
+        for n, d in zip(num.cpu().tolist(), den.cpu().tolist()):
+            out.append(n / d if d > 0 else None)
+        return out
+    result = {
         'pos_loss': (L/s).cpu().tolist(),
         'pos_acc': (C/s).cpu().tolist(),
         'pos_conf': pos_conf,
-        'conf_ranking': conf_ranking,
-        'tau_oracle': tau_oracle,
-        'pos_loss_carry_in': (Lc/sc).cpu().tolist(),
-        'pos_loss_no_carry': (Ln/sn).cpu().tolist(),
-        'pos_acc_carry_in': (Cc/sc).cpu().tolist(),
-        'pos_acc_no_carry': (Cn/sn).cpu().tolist(),
+        'pos_loss_carry_in': _safe_div(Lc, Nc),
+        'pos_loss_no_carry': _safe_div(Ln, Nn),
+        'pos_acc_carry_in': _safe_div(Cc, Nc),
+        'pos_acc_no_carry': _safe_div(Cn, Nn),
         'overall_loss': (L.sum()/s.sum()).item(),
         'overall_acc': (C.sum()/s.sum()).item(),
     }
+    # Confidence ranking is only meaningful for diffusion (fully-masked probe).
+    # AR's pos_conf is teacher-forced confidence — a different quantity entirely.
+    return result
 
 
 @torch.no_grad()
@@ -349,13 +314,18 @@ def probe_partial_mask(model, tokenizer, test_samples, fmt, max_len,
                 a = ans[b].item()
                 for j in range(ANS_LEN):
                     if mf[b, j]:
-                        p = F.softmax(logits[b, a+j], dim=-1)
+                        cl = logits[b, a+j].clone()
+                        cl[mask_id] = -float('inf')
+                        p = F.softmax(cl, dim=-1)
                         conf_s[j] += p.max().item()
                         acc_s[j] += float(p.argmax().item() == ids[b, a+j].item())
                         cnt[j] += 1
-        s = cnt.clamp(1)
-        results[frac] = {'pos_conf': (conf_s/s).cpu().tolist(),
-                         'pos_acc': (acc_s/s).cpu().tolist(), 'n_masked': nm}
+        results[frac] = {
+            'pos_conf': [conf_s[j].item()/cnt[j].item() if cnt[j]>0 else None
+                         for j in range(ANS_LEN)],
+            'pos_acc':  [acc_s[j].item()/cnt[j].item() if cnt[j]>0 else None
+                         for j in range(ANS_LEN)],
+            'n_masked': nm}
     return results
 
 
@@ -428,10 +398,8 @@ def train_with_dynamics(
         labs = _pos_labels()
         acc_str = ' '.join(f"{labs[j]}={probe['pos_acc'][j]:.2f}"
                            for j in range(ANS_LEN))
-        tau_str = f"τ_oracle={probe['tau_oracle']:.3f}" if 'tau_oracle' in probe else ''
         print(f"    [eval ep {epoch:4d}] loss={probe['overall_loss']:.4f} "
-              f"acc={probe['overall_acc']:.4f} {tau_str} "
-              f"tg={tg:,} | {time.time()-t0:.0f}s")
+              f"acc={probe['overall_acc']:.4f} | {time.time()-t0:.0f}s")
         print(f"      {acc_str}")
 
     # ── Eval at epoch 0 ──
@@ -503,14 +471,15 @@ def train_with_dynamics(
                 elif mask_type == 'confidence':
                     # PUMA-style: mask positions the model is least
                     # confident about (= unmask high-confidence first).
-                    # Uses a fully-masked forward pass (no grad) to get
-                    # per-position confidence, then builds the mask.
+                    # Probe in eval mode (no dropout noise) for clean ranking.
                     xm_probe = ids.clone()
                     for bi in range(B):
                         a_s = ans_starts[bi].item()
                         xm_probe[bi, a_s:min(a_s + ANS_LEN, T)] = mask_id
+                    model.eval()
                     with torch.no_grad():
                         logits_probe = model(xm_probe)
+                    model.train()
 
                     t_ratio = torch.rand(B, device=device)
                     m = torch.zeros(B, T, dtype=torch.bool, device=device)
@@ -520,8 +489,12 @@ def train_with_dynamics(
                         na = len(a_pos)
                         nm = max(1, int(math.ceil(t_ratio[bi].item() * na)))
                         # rank by confidence (ascending) → mask least confident
-                        confs = [F.softmax(logits_probe[bi, p], dim=-1
-                                           ).max().item() for p in a_pos]
+                        # Exclude MASK token from confidence to avoid bias
+                        confs = []
+                        for p in a_pos:
+                            lp = logits_probe[bi, p].clone()
+                            lp[mask_id] = -float('inf')
+                            confs.append(F.softmax(lp, dim=-1).max().item())
                         ranked = sorted(range(na), key=lambda k: confs[k])
                         for k in range(nm):
                             m[bi, a_pos[ranked[k]]] = True
@@ -554,7 +527,7 @@ def train_with_dynamics(
             print(f"    ep {epoch:4d}/{MAX_EPOCHS} | loss {avg_loss:.4f} | "
                   f"lr {get_lr(it):.1e} | tg {tg:,} | {time.time()-t0:.0f}s")
 
-        if epoch % EVAL_EVERY == 0:
+        if epoch % EVAL_EVERY == 0 and epoch < MAX_EPOCHS:
             model.eval(); _do_eval(epoch); model.train()
 
     # ── Load best model ──
@@ -776,8 +749,13 @@ def make_figures(all_dyn, all_final, all_partial):
             ax = axes[ai]
             xs = get_x(dyn)
             for j in range(ANS_LEN):
-                ax.plot(xs, [c['pos_loss_carry_in'][j]-c['pos_loss_no_carry'][j]
-                             for c in dyn['checkpoints']],
+                def _carry_gap(c, j):
+                    ci = c['pos_loss_carry_in'][j]
+                    nc = c['pos_loss_no_carry'][j]
+                    if ci is None or nc is None:
+                        return float('nan')
+                    return ci - nc
+                ax.plot(xs, [_carry_gap(c, j) for c in dyn['checkpoints']],
                         '-', color=pc(j), label=labels[j], lw=1.5)
             ax.axhline(0, color='k', lw=0.5, ls='--')
             ax.set_xlabel('Epoch'); ax.set_ylabel('Loss(carry) − Loss(no carry)')
@@ -805,24 +783,6 @@ def make_figures(all_dyn, all_final, all_partial):
                 ax.legend(fontsize=5, ncol=3, loc='lower right'); ax.grid(alpha=0.3)
             fig.suptitle(f'Confidence Evolution — {fmt}', fontsize=13, y=1.02)
             fig.tight_layout(); figs[f'conf_evo_{fmt}'] = fig
-
-        # ── Fig 4b: τ_oracle evolution (confidence ranking vs LSB-first) ──
-        if dconds:
-            fig, ax = plt.subplots(figsize=(10, 5))
-            for mt, key in dconds:
-                dyn = all_dyn[key]
-                xs = get_x(dyn)
-                taus = [c.get('tau_oracle', 0) for c in dyn['checkpoints']]
-                ck = _ck('diffusion', mt, 'confidence')
-                ax.plot(xs, taus, '-', color=COLORS.get(ck, '#333'),
-                        label=f'mask={mt}', lw=2, alpha=0.8)
-            ax.axhline(1.0, color='green', ls='--', lw=1, alpha=0.5, label='perfect oracle')
-            ax.axhline(0.0, color='grey', ls=':', lw=1, alpha=0.5)
-            ax.axhline(-1.0, color='red', ls='--', lw=1, alpha=0.5, label='anti-oracle')
-            ax.set_xlabel('Epoch'); ax.set_ylabel('Kendall τ vs LSB-first oracle')
-            ax.set_ylim(-1.1, 1.1); ax.set_title(f'Confidence Ranking Alignment — {fmt}')
-            ax.legend(fontsize=8); ax.grid(alpha=0.3)
-            fig.tight_layout(); figs[f'tau_oracle_{fmt}'] = fig
 
         # ── Fig 5: Final per-position accuracy ──
         fig, axes = plt.subplots(1, 3, figsize=(21, 5))
@@ -1007,18 +967,6 @@ def run():
             pa = r.get('position_accuracy', [])
             print(f"  {_ck(obj,mt,dp):<25} {r['accuracy']:>6.3f}  {tg:>12,}  "
                   f"{' '.join(f'{v:.2f}' for v in pa)}")
-
-    # ── τ_oracle at final checkpoint ──
-    print(f"\n  CONFIDENCE RANKING vs LSB-FIRST ORACLE (final τ)")
-    for fmt in FORMATS:
-        print(f"\n  [{fmt}]")
-        for obj, mt in [('ar','')]+[('diffusion',mt) for mt in MASK_TYPES]:
-            key = _fk(obj, fmt, mt, 'confidence')
-            dyn = all_dyn.get(key)
-            if not dyn: continue
-            tau = dyn['checkpoints'][-1].get('tau_oracle', '?')
-            print(f"    {_ck(obj,mt):<20} τ={tau:.3f}" if isinstance(tau, float)
-                  else f"    {_ck(obj,mt):<20} τ={tau}")
 
     # ── Learning order ──
     print(f"\n  LEARNING ORDER (epoch to 90% per-pos acc)")
