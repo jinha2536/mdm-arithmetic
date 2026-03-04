@@ -64,14 +64,14 @@ EXP_NAME = 'exp_addition_v2_dynamics'
 ND = 8
 ANS_LEN = ND + 1                # 9
 
-N_TRAIN = 2000
-N_TEST = 500
+N_TRAIN = 500
+N_TEST = 5000
 
 # ── Training (epoch-based) ──
-BATCH_SIZE = 200                # 2000 / 200 = 10 batches/epoch
-MAX_EPOCHS = 1500               # fixed budget, no early stopping
-EVAL_EVERY = 50                 # probe eval every 50 epochs
-LOG_EVERY = 20                  # print train loss every 20 epochs
+BATCH_SIZE = 100                # 500 / 100 = 5 batches/epoch
+MAX_EPOCHS = 2000               # fixed budget, no early stopping
+EVAL_EVERY = 200                 # probe eval every 200 epochs
+LOG_EVERY = 100                  # print train loss every 100 epochs
 
 FORMATS = ['plain', 'reverse']
 
