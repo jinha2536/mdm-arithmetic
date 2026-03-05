@@ -68,17 +68,17 @@ N_TRAIN = 500
 N_TEST = 5000
 
 # ── Training (epoch-based) ──
-BATCH_SIZE = 100                # 500 / 100 = 5 batches/epoch
-MAX_EPOCHS = 2000               # fixed budget, no early stopping
-EVAL_EVERY = 200                 # probe eval every 200 epochs
-LOG_EVERY = 100                  # print train loss every 100 epochs
+BATCH_SIZE = 50                # 500 / 50 = 10 batches/epoch
+MAX_EPOCHS = 1500               # fixed budget, no early stopping
+EVAL_EVERY = 100                 # probe eval every 100 epochs
+LOG_EVERY = 100                  # print train loss every 20 epochs
 
 FORMATS = ['plain', 'reverse']
 
 # Architecture
-N_LAYER = 6
-N_HEAD = 6
-N_EMBD = 384
+N_LAYER = 2
+N_HEAD = 2
+N_EMBD = 128
 DROPOUT = 0.2
 POS_ENC = 'absolute'
 
@@ -180,6 +180,36 @@ def gen_pairs_balanced(n, seed):
 
 def gen_data(n, fmt, seed):
     return [FMT_FN[fmt](a, b) for a, b in gen_pairs_balanced(n, seed)]
+
+
+def gen_test_pairs_full(n, seed):
+    """Generate test pairs where both operands are full ND-digit numbers.
+    Carry-balanced like gen_pairs_balanced, but no short operands.
+    """
+    rng = random.Random(seed)
+    lo = 10**(ND - 1)    # 10000000 for ND=8
+    hi = 10**ND - 1       # 99999999
+    pool = defaultdict(list)
+    seen = set()
+    for _ in range(max(n * 200, 100000)):
+        a = rng.randint(lo, hi)
+        b = rng.randint(lo, hi)
+        if (a, b) in seen: continue
+        seen.add((a, b))
+        pool[_count_carries(a, b)].append((a, b))
+    target = max(1, n // max(len(pool), 1))
+    out = []
+    for nc in sorted(pool):
+        rng.shuffle(pool[nc]); out.extend(pool[nc][:target])
+    while len(out) < n:
+        a, b = rng.randint(lo, hi), rng.randint(lo, hi)
+        if (a, b) not in seen: out.append((a, b)); seen.add((a, b))
+    rng.shuffle(out)
+    return out[:n]
+
+
+def gen_test_data(n, fmt, seed):
+    return [FMT_FN[fmt](a, b) for a, b in gen_test_pairs_full(n, seed)]
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -891,10 +921,13 @@ def run():
 
     for fmt in FORMATS:
         train_data = gen_data(N_TRAIN, fmt, seed=SEED)
-        test_data = gen_data(N_TEST, fmt, seed=9000)
+        test_data = gen_test_data(N_TEST, fmt, seed=9000)
         cd = defaultdict(int)
         for s in train_data: a, b = _parse_operands(s); cd[_count_carries(a, b)] += 1
-        print(f"\n  [{fmt}] N={len(train_data)}, carries={dict(sorted(cd.items()))}")
+        print(f"\n  [{fmt}] train N={len(train_data)}, carries={dict(sorted(cd.items()))}")
+        cd_test = defaultdict(int)
+        for s in test_data: a, b = _parse_operands(s); cd_test[_count_carries(a, b)] += 1
+        print(f"  [{fmt}] test  N={len(test_data)} (full {ND}-digit), carries={dict(sorted(cd_test.items()))}")
 
         # ── AR ──
         key = _fk('ar', fmt)
