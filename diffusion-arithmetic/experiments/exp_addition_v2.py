@@ -21,7 +21,7 @@
 
   Conditions (×2 formats = 14 total):
     AR, Diff-random-conf, Diff-random-lsb,
-    Diff-ordered-conf, Diff-ordered-lsb,
+    Diff-lsb-conf, Diff-lsb-lsb,
     Diff-confidence-conf, Diff-confidence-lsb,   ← PUMA-style adaptive
     Diff-msb-conf, Diff-msb-lsb                  ← anti-oracle baseline
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -49,7 +49,7 @@ from core.train_utils import (
     DEVICE,
 )
 # NOT imported from core (custom in this experiment):
-#   train_with_dynamics  — epoch-based loop + periodic probe + ordered masking
+#   train_with_dynamics  — epoch-based loop + periodic probe + LSB/MSB masking
 #   final_evaluate       — per-position & carry-conditional analysis
 #   _analyse_orders      — position-level decode rank (core's is scratchpad-level)
 #   probe_per_position   — per-position loss/acc/conf probe
@@ -68,10 +68,10 @@ N_TRAIN = 500
 N_TEST = 5000
 
 # ── Training (epoch-based) ──
-BATCH_SIZE = 50                # 500 / 50 = 10 batches/epoch
+BATCH_SIZE = 50                # 2000 / 200 = 10 batches/epoch
 MAX_EPOCHS = 1500               # fixed budget, no early stopping
-EVAL_EVERY = 100                 # probe eval every 100 epochs
-LOG_EVERY = 100                  # print train loss every 20 epochs
+EVAL_EVERY = 50                 # probe eval every 50 epochs
+LOG_EVERY = 20                  # print train loss every 20 epochs
 
 FORMATS = ['plain', 'reverse']
 
@@ -88,7 +88,7 @@ MIN_LR = 1e-4
 WARMUP_EPOCHS = 10
 GRAD_CLIP = 1.0
 
-MASK_TYPES = ['random', 'ordered', 'confidence', 'msb']
+MASK_TYPES = ['random', 'lsb', 'confidence', 'msb']
 DECODE_POLICIES = ['confidence', 'lsb']
 
 SEED = 42
@@ -470,7 +470,7 @@ def train_with_dynamics(
                         v = ans_mask[bi].nonzero(as_tuple=True)[0]
                         if len(v) > 0: m[bi, v[torch.randint(len(v),(1,))]] = True
 
-                elif mask_type == 'ordered':
+                elif mask_type == 'lsb':
                     t_ratio = torch.rand(B, device=device)
                     m = torch.zeros(B, T, dtype=torch.bool, device=device)
                     for bi in range(B):
@@ -484,8 +484,7 @@ def train_with_dynamics(
                             for p in a_pos[na-nm:]: m[bi, p] = True
 
                 elif mask_type == 'msb':
-                    # Anti-oracle: unmask MSB first → mask LSB side
-                    # Opposite direction of 'ordered' (LSB-first)
+                    # Anti-oracle: unmask MSB first (opposite of 'lsb')
                     t_ratio = torch.rand(B, device=device)
                     m = torch.zeros(B, T, dtype=torch.bool, device=device)
                     for bi in range(B):
@@ -681,7 +680,7 @@ def _pos_labels(fmt):
 COLORS = {
     'ar': '#e74c3c',
     'diff-ran-con': '#3498db', 'diff-ran-lsb': '#2ecc71',
-    'diff-ord-con': '#9b59b6', 'diff-ord-lsb': '#e67e22',
+    'diff-lsb-con': '#9b59b6', 'diff-lsb-lsb': '#e67e22',
     'diff-con-con': '#1abc9c', 'diff-con-lsb': '#16a085',
     'diff-msb-con': '#c0392b', 'diff-msb-lsb': '#d35400',
 }
@@ -818,13 +817,13 @@ def make_figures(all_dyn, all_final, all_partial):
         fig, axes = plt.subplots(1, 3, figsize=(21, 5))
         for ai, (title, cs) in enumerate([
             ('AR vs Diffusion (conf decode)', [('ar','',''),
-             ('diffusion','random','confidence'), ('diffusion','ordered','confidence'),
+             ('diffusion','random','confidence'), ('diffusion','lsb','confidence'),
              ('diffusion','confidence','confidence'), ('diffusion','msb','confidence')]),
             ('Training mask comparison (conf decode)', [
-             ('diffusion','random','confidence'), ('diffusion','ordered','confidence'),
+             ('diffusion','random','confidence'), ('diffusion','lsb','confidence'),
              ('diffusion','confidence','confidence'), ('diffusion','msb','confidence')]),
             ('LSB decode comparison', [
-             ('diffusion','random','lsb'), ('diffusion','ordered','lsb'),
+             ('diffusion','random','lsb'), ('diffusion','lsb','lsb'),
              ('diffusion','confidence','lsb'), ('diffusion','msb','lsb')]),
         ]):
             ax = axes[ai]
