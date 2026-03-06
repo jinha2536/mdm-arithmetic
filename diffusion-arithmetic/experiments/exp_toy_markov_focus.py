@@ -415,7 +415,7 @@ def run():
                       'leave-\none-out']
     dist_colors = {'A_Markov2': '#3498db',
                    'B_HardMarkov99': '#e74c3c',
-                   'C_UniformGlobalSum': '#2ecc71'}
+                   'C_HardGlobalSum': '#2ecc71'}
     width = 0.25
 
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
