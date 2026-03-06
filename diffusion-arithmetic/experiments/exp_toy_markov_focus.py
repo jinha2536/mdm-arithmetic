@@ -13,7 +13,7 @@
   Distributions (V=4, L=8, V^L = 65 536):
     A: Markov2            — soft 2nd-order Markov (sparsity=0.1)
     B: HardMarkov99       — near-deterministic Markov (p_peak=0.99)
-    C: UniformGlobalSum   — hard mod-V constraint, uniform within valid
+    C: HardGlobalSum      — hard mod-V constraint with position-wise bias
 
   Metrics per (S, t) pair:
     KL(p_true ‖ p_θ)           — how far off overall
@@ -58,22 +58,30 @@ EXP_NAME = 'exp_toy_markov_focus'
 # Distribution
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-class UniformGlobalSum(ToyDistribution):
+class HardGlobalSum(ToyDistribution):
     """
     Hard constraint: sum(x_i) mod V == 0.
-    Uniform among valid sequences.
+    Within valid sequences, probability ∝ ∏ base_probs(x_i).
 
-    Conditionals (analytically):
-      |S| <= L-2  →  p(x_t | x_S) = 1/V   (always uniform)
-      |S| = L-1   →  point mass at (-Σs) mod V
+    Position-wise bias (alpha=0.5, peaked Dirichlet) gives
+    non-trivial conditionals even with small |S|:
+    - Marginals are NOT uniform — some tokens preferred per position
+    - Conditioning on S reshapes remaining distribution through
+      both the bias AND the mod constraint
+    - Unlike Markov, dependency is fully symmetric (no causal direction)
     """
-    def __init__(self):
+    def __init__(self, alpha=0.5, seed=42):
         super().__init__()
+        rng = np.random.RandomState(seed)
+        self.base_lp = torch.tensor(
+            np.log(rng.dirichlet([alpha] * V, size=L) + 1e-30),
+            dtype=torch.float32)
 
     def log_prob(self, x):
         x = x.reshape(-1, L)
+        lp = sum(self.base_lp[i][x[:, i]] for i in range(L))
         valid = (x.sum(-1) % V == 0)
-        return torch.where(valid, torch.tensor(0.0), torch.tensor(-70.0))
+        return torch.where(valid, lp, torch.tensor(-70.0))
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -304,7 +312,7 @@ def run():
     distributions = {
         'A_Markov2':           MarkovChain(order=2, sparsity=0.1, seed=42),
         'B_HardMarkov99':      HardMarkov(order=2, p_peak=0.99, seed=42),
-        'C_UniformGlobalSum':  UniformGlobalSum(),
+        'C_HardGlobalSum':     HardGlobalSum(alpha=0.5, seed=42),
     }
     dist_names = list(distributions.keys())
 
