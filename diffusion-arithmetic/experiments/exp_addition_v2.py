@@ -66,7 +66,7 @@ ND = 8
 ANS_LEN = ND + 1                # 9
 
 N_TRAIN = 2000
-N_TEST = 500
+N_TEST = 10000
 
 # ── Training (epoch-based) ──
 BATCH_SIZE = 200                # 2000 / 200 = 10 batches/epoch
