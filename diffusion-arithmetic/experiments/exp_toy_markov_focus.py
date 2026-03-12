@@ -1,32 +1,29 @@
 """
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  Experiment 3b — Learned Conditional Analysis
+  Experiment 3b — Learned Conditional Analysis + pass@k
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
   Colab:  %run experiments/exp_toy_markov_focus.py
 
-  Directly probe how well the trained masked-diffusion model has
-  learned conditional distributions, WITHOUT decoding or sampling:
+  Two analyses on two distributions (V=4, L=8, fully enumerable):
 
-      p_θ(x_t | x_S = s)  vs  p_true(x_t | x_S = s)
+  ── Part 1: Conditional Analysis ─────────────────────
+  Directly compare p_θ(x_t | x_S=s) vs p_true(x_t | x_S=s)
+  for diverse conditioning patterns (causal, anticausal, gap, etc.)
 
-  Distributions (V=4, L=8, V^L = 65 536):
-    A: Markov2            — soft 2nd-order Markov (sparsity=0.1)
-    B: HardMarkov99       — near-deterministic Markov (p_peak=0.99)
-    C: HardGlobalSum      — hard mod-V constraint with position-wise bias
+  Metrics: mode_accuracy, true_answer_prob, KL, error_type
 
-  Metrics per (S, t) pair:
-    KL(p_true ‖ p_θ)           — how far off overall
-    mode_accuracy               — did the model get the most likely token right?
-    true_answer_prob            — how much probability on the correct answer?
-    error_type                  — when wrong: marginal fallback or wrong response?
+  ── Part 2: pass@k Analysis ──────────────────────────
+  Fix prefix, generate k samples with different decode policies,
+  measure pass@k and sample diversity.
 
-  Conditioning patterns:
-    Direction:     causal_w2, anticausal_w2, sandwich
-    Progressive:   l2r_progressive, r2l_progressive
-    Gap:           causal_w2 (no gap), causal_gap1, causal_gap2
-    Sufficiency:   single_left, causal_w2, causal_w3
-    Extremes:      marginal (no context), leave_one_out (full context)
+  Key insight: even a well-calibrated model produces very different
+  pass@k curves depending on decode order, because ORDER determines
+  WHERE branching occurs in the sample tree.
+
+  Distributions:
+    A: HardMarkov       — order=2, p_peak=0.75 (moderate stochasticity)
+    B: HardGlobalSum    — hard mod-V + peaked position bias (α=0.3)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 """
 import sys, os
@@ -41,12 +38,13 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from itertools import product as iter_product
+from math import comb
 
 from experiments.exp_toy_distribution import (
     V, L, MASK_ID, TOTAL_V,
     N_TRAIN, MAX_EPOCHS, PATIENCE_EPOCHS, BATCH_SIZE, LR,
     D_MODEL, N_HEADS, N_LAYERS,
-    ToyDistribution, MarkovChain, HardMarkov,
+    ToyDistribution, HardMarkov,
     train_toy_model, compute_mi,
 )
 from core.train_utils import mount_drive, save_results, DEVICE
@@ -55,22 +53,17 @@ EXP_NAME = 'exp_toy_markov_focus'
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# Distribution
+# Distributions
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 class HardGlobalSum(ToyDistribution):
     """
-    Hard constraint: sum(x_i) mod V == 0.
-    Within valid sequences, probability ∝ ∏ base_probs(x_i).
+    p(x) ∝ 1[Σx_i ≡ 0 (mod V)] · ∏ b_i(x_i)
 
-    Position-wise bias (alpha=0.5, peaked Dirichlet) gives
-    non-trivial conditionals even with small |S|:
-    - Marginals are NOT uniform — some tokens preferred per position
-    - Conditioning on S reshapes remaining distribution through
-      both the bias AND the mod constraint
-    - Unlike Markov, dependency is fully symmetric (no causal direction)
+    Position-wise bias b_i ~ Dir(α) with α=0.3 (very peaked).
+    Mod-V constraint creates symmetric global dependency.
     """
-    def __init__(self, alpha=0.5, seed=42):
+    def __init__(self, alpha=0.3, seed=42):
         super().__init__()
         rng = np.random.RandomState(seed)
         self.base_lp = torch.tensor(
@@ -85,47 +78,33 @@ class HardGlobalSum(ToyDistribution):
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# Core analysis
+# Part 1: Conditional Analysis
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 @torch.no_grad()
 def evaluate_conditional(model, dist, S_positions, target_pos,
                          prune_threshold=1e-10, batch_size=2048):
     """
-    For each context s ∈ V^|S| (weighted by p(x_S=s)):
-      1. Forward pass with S positions set to s, rest MASK
-      2. Read p_θ(x_t | x_S=s)
-      3. Compare with p_true(x_t | x_S=s)
-
-    Returns:
-        kl_forward        E_s[KL(p_true ‖ p_θ)]
-        true_entropy      H_true(x_t | x_S)
-        model_entropy     H_model(x_t | x_S)
-        mode_accuracy     P[argmax p_θ == argmax p_true]     (p(s)-weighted)
-        true_answer_prob  E_s[p_θ(true_mode | s)]
-        frac_correct      fraction of contexts where mode is correct
-        frac_marginal_fb  fraction of wrong contexts → marginal fallback
-        frac_wrong_resp   fraction of wrong contexts → neither correct nor marginal
+    For each context s ∈ V^|S|, compare p_θ(x_t|s) vs p_true(x_t|s).
+    All metrics are p(x_S=s)-weighted.
     """
     all_seqs, p_true = dist.full_distribution()
     p_np = p_true.numpy()
     S_np = all_seqs.numpy()
     eps = 1e-15
 
-    # Enumerate contexts
     if len(S_positions) == 0:
         contexts = [()]
     else:
         contexts = list(iter_product(range(V), repeat=len(S_positions)))
 
-    # Compute marginal mode for error classification
+    # Marginal mode for error classification
     marginal_dist = np.zeros(V)
     for v in range(V):
         marginal_dist[v] = p_np[S_np[:, target_pos] == v].sum()
     marginal_dist /= marginal_dist.sum() + eps
     marginal_mode = int(np.argmax(marginal_dist))
 
-    # Pre-compute true conditionals with pruning
     valid_contexts = []
     for s_val in contexts:
         mask = np.ones(len(p_np), dtype=bool)
@@ -146,7 +125,6 @@ def evaluate_conditional(model, dist, S_positions, target_pos,
     if not valid_contexts:
         return None
 
-    # Batch forward passes
     inputs = []
     for s_val, _, _ in valid_contexts:
         x_in = torch.full((L,), MASK_ID, dtype=torch.long)
@@ -164,23 +142,12 @@ def evaluate_conditional(model, dist, S_positions, target_pos,
         all_model_probs.append(probs.cpu())
     all_model_probs = torch.cat(all_model_probs, dim=0).numpy()
 
-    # ── Aggregate ──
-    total_kl = 0.0
-    total_h_true = total_h_model = 0.0
-    total_w = 0.0
-
-    # Error pattern tracking
-    weighted_mode_acc = 0.0
-    weighted_true_prob = 0.0
-    n_correct = 0
-    n_marginal_fb = 0
-    n_wrong_resp = 0
-
-    per_context = []
+    total_kl = total_h_true = total_h_model = total_w = 0.0
+    weighted_mode_acc = weighted_true_prob = 0.0
+    n_correct = n_marginal_fb = n_wrong_resp = 0
 
     for idx, (s_val, p_ctx, p_true_t) in enumerate(valid_contexts):
         p_m = all_model_probs[idx]
-
         true_mode = int(np.argmax(p_true_t))
         model_mode = int(np.argmax(p_m))
         correct = (true_mode == model_mode)
@@ -196,28 +163,15 @@ def evaluate_conditional(model, dist, S_positions, target_pos,
         total_h_true += p_ctx * h_true
         total_h_model += p_ctx * h_model
         total_w += p_ctx
-
         weighted_mode_acc += p_ctx * float(correct)
         weighted_true_prob += p_ctx * float(p_m[true_mode])
 
         if correct:
             n_correct += 1
+        elif model_mode == marginal_mode:
+            n_marginal_fb += 1
         else:
-            if model_mode == marginal_mode:
-                n_marginal_fb += 1
-            else:
-                n_wrong_resp += 1
-
-        per_context.append({
-            'true_mode': true_mode,
-            'model_mode': model_mode,
-            'correct': correct,
-            'true_mode_prob_model': float(p_m[true_mode]),
-            'true_mode_prob_true': float(p_true_t[true_mode]),
-            'model_conf': float(p_m.max()),
-            'kl': float(kl),
-            'weight': float(p_ctx),
-        })
+            n_wrong_resp += 1
 
     w = max(total_w, eps)
     n_total = len(valid_contexts)
@@ -230,61 +184,32 @@ def evaluate_conditional(model, dist, S_positions, target_pos,
         'entropy_gap': float((total_h_model - total_h_true) / w),
         'mode_accuracy': float(weighted_mode_acc / w),
         'true_answer_prob': float(weighted_true_prob / w),
-        'frac_correct': n_correct / max(n_total, 1),
-        'frac_marginal_fb': n_marginal_fb / max(n_wrong, 1),
-        'frac_wrong_resp': n_wrong_resp / max(n_wrong, 1),
         'n_correct': n_correct,
         'n_marginal_fb': n_marginal_fb,
         'n_wrong_resp': n_wrong_resp,
         'n_contexts': n_total,
-        'n_pruned': len(contexts) - n_total,
-        'per_context': per_context,
     }
 
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# Conditioning patterns
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
 def make_all_patterns():
     P = {}
-
     P['marginal'] = [([], t) for t in range(L)]
-
-    # Direction (|S|=2)
+    P['single_left'] = [([t - 1], t) for t in range(1, L)]
+    P['single_right'] = [([t + 1], t) for t in range(L - 1)]
     P['causal_w2'] = [([t - 2, t - 1], t) for t in range(2, L)]
     P['anticausal_w2'] = [([t + 1, t + 2], t) for t in range(L - 2)]
     P['sandwich'] = [([t - 1, t + 1], t) for t in range(1, L - 1)]
-
-    # Single neighbour
-    P['single_left'] = [([t - 1], t) for t in range(1, L)]
-    P['single_right'] = [([t + 1], t) for t in range(L - 1)]
-
-    # Progressive
+    P['causal_w3'] = [([t - 3, t - 2, t - 1], t) for t in range(3, L)]
+    P['causal_gap1'] = [([t - 3, t - 1], t) for t in range(3, L)]
+    P['causal_gap2'] = [([t - 4, t - 1], t) for t in range(4, L)]
     P['l2r_progressive'] = [(list(range(t)), t) for t in range(1, L)]
     P['r2l_progressive'] = [(list(range(t + 1, L)), t)
                              for t in range(L - 2, -1, -1)]
-
-    # Sufficiency
-    P['causal_w3'] = [([t - 3, t - 2, t - 1], t) for t in range(3, L)]
-
-    # Gap
-    P['causal_gap1'] = [([t - 3, t - 1], t) for t in range(3, L)]
-    P['causal_gap2'] = [([t - 4, t - 1], t) for t in range(4, L)]
-
-    # Distant
     P['distant'] = [([0, L - 1], t) for t in range(1, L - 1)]
-
-    # Leave-one-out
     P['leave_one_out'] = [
         (list(range(t)) + list(range(t + 1, L)), t) for t in range(L)]
-
     return P
 
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# Helpers
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 def avg_metric(cr_list, key):
     vals = [r[key] for r in cr_list if r is not None]
@@ -299,22 +224,231 @@ def error_counts(cr_list):
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Part 2: pass@k
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+@torch.no_grad()
+def decode_with_prefix(model, n, prefix_pos, prefix_vals, policy):
+    """
+    Decode with some positions pre-filled.
+    Remaining positions filled according to policy with temperature sampling.
+    """
+    x = torch.full((n, L), MASK_ID, dtype=torch.long, device=DEVICE)
+    unmasked = torch.zeros(n, L, dtype=torch.bool, device=DEVICE)
+
+    for pos, val in zip(prefix_pos, prefix_vals):
+        x[:, pos] = val
+        unmasked[:, pos] = True
+
+    n_remaining = L - len(prefix_pos)
+    for step in range(n_remaining):
+        logits = model(x)
+        logits[:, :, MASK_ID] = -float('inf')
+        probs = F.softmax(logits, dim=-1)
+
+        if policy == 'confidence':
+            sc = probs.max(-1).values.clone(); sc[unmasked] = -1
+            pos = sc.argmax(-1)
+        elif policy == 'low_entropy':
+            e = -(probs * (probs + 1e-10).log()).sum(-1)
+            e[unmasked] = 1e9; pos = e.argmin(-1)
+        elif policy == 'high_entropy':
+            e = -(probs * (probs + 1e-10).log()).sum(-1)
+            e[unmasked] = -1e9; pos = e.argmax(-1)
+        elif policy == 'random':
+            rand_sc = torch.rand(n, L, device=DEVICE)
+            rand_sc[unmasked] = -1; pos = rand_sc.argmax(-1)
+        elif policy == 'l2r':
+            remaining = (~unmasked[0]).nonzero(as_tuple=True)[0]
+            pos = remaining[0].expand(n)
+        elif policy == 'r2l':
+            remaining = (~unmasked[0]).nonzero(as_tuple=True)[0]
+            pos = remaining[-1].expand(n)
+        else:
+            raise ValueError(policy)
+
+        lp = logits[torch.arange(n, device=DEVICE), pos]
+        tok = torch.multinomial(F.softmax(lp, dim=-1), 1).squeeze(-1)
+        x[torch.arange(n, device=DEVICE), pos] = tok
+        unmasked[torch.arange(n, device=DEVICE), pos] = True
+
+    result = x.cpu()
+    result = result.clamp(max=V - 1)
+    return result
+
+
+def compute_target_markov(dist, prefix_vals):
+    """
+    Given prefix (x0, x1), compute the mode sequence by greedily
+    following the preferred token at each step.
+    """
+    order = dist.k
+    seq = list(prefix_vals)
+    for t in range(order, L):
+        ctx_idx = sum(seq[t - order + i] * (V ** i) for i in range(order))
+        seq.append(int(dist.preferred[ctx_idx]))
+    return seq
+
+
+def compute_target_globalsum(dist, prefix_pos, prefix_vals):
+    """
+    DP to find highest-probability completion satisfying sum mod V = 0.
+    State: (position, running_sum mod V).
+    """
+    free_positions = [i for i in range(L) if i not in prefix_pos]
+    prefix_sum = sum(prefix_vals) % V
+    target_residual = (V - prefix_sum) % V  # free positions must sum to this mod V
+
+    n_free = len(free_positions)
+    base_lp = dist.base_lp.numpy()
+
+    # DP forward: dp[step][residual] = max log-prob achievable
+    NEG_INF = -1e30
+    dp = [[NEG_INF] * V for _ in range(n_free + 1)]
+    choice = [[0] * V for _ in range(n_free)]
+    dp[0][0] = 0.0
+
+    for step in range(n_free):
+        pos = free_positions[step]
+        for r_prev in range(V):
+            if dp[step][r_prev] <= NEG_INF:
+                continue
+            for v in range(V):
+                r_new = (r_prev + v) % V
+                new_val = dp[step][r_prev] + base_lp[pos][v]
+                if new_val > dp[step + 1][r_new]:
+                    dp[step + 1][r_new] = new_val
+                    choice[step][r_new] = v
+
+    # Backtrack
+    seq = [0] * L
+    for pos, val in zip(prefix_pos, prefix_vals):
+        seq[pos] = val
+
+    r = target_residual
+    for step in range(n_free - 1, -1, -1):
+        v = choice[step][r]
+        seq[free_positions[step]] = v
+        r = (r - v) % V
+
+    return seq
+
+
+def pass_at_k(n_samples, n_correct, k):
+    """Unbiased estimator from Chen et al. (2021)."""
+    if n_samples - n_correct < k:
+        return 1.0
+    return 1.0 - comb(n_samples - n_correct, k) / comb(n_samples, k)
+
+
+def evaluate_pass_k(model, dist, policies, n_samples=200,
+                    n_prefixes=50, k_values=None, seed=42):
+    """
+    For random prefixes, generate n_samples per policy,
+    compute pass@k and diversity metrics.
+
+    Returns dict: policy → {pass_at_k: {k: value}, diversity: {...}}
+    """
+    if k_values is None:
+        k_values = [1, 2, 5, 10, 20, 50, 100]
+
+    rng = np.random.RandomState(seed)
+    is_markov = isinstance(dist, HardMarkov)
+    order = dist.k if is_markov else 2  # prefix size
+
+    # Generate random prefixes (first `order` positions)
+    prefix_pos = list(range(order))
+    prefix_pool = [tuple(rng.randint(0, V, size=order))
+                   for _ in range(n_prefixes)]
+
+    # Compute targets
+    targets = {}
+    for pf in prefix_pool:
+        if is_markov:
+            targets[pf] = compute_target_markov(dist, list(pf))
+        else:
+            targets[pf] = compute_target_globalsum(
+                dist, prefix_pos, list(pf))
+
+    results = {}
+    for pol in policies:
+        all_pass = {k: [] for k in k_values}
+        all_hamming = []
+        all_unique = []
+        t0 = time.time()
+
+        for pf in prefix_pool:
+            target = torch.tensor(targets[pf], dtype=torch.long)
+
+            # Generate samples in batches
+            samples_list = []
+            remaining = n_samples
+            while remaining > 0:
+                bs = min(remaining, BATCH_SIZE)
+                s = decode_with_prefix(
+                    model, bs, prefix_pos, list(pf), pol)
+                samples_list.append(s)
+                remaining -= bs
+            samples = torch.cat(samples_list, dim=0)[:n_samples]
+
+            # Count correct (exact match)
+            correct = (samples == target.unsqueeze(0)).all(dim=1)
+            n_correct = correct.sum().item()
+
+            for k in k_values:
+                if k <= n_samples:
+                    all_pass[k].append(pass_at_k(n_samples, n_correct, k))
+
+            # Diversity: pairwise Hamming distance (subsample for speed)
+            sub = samples[:min(100, n_samples)].numpy()
+            if len(sub) > 1:
+                total_ham = 0; n_pairs = 0
+                for i in range(len(sub)):
+                    for j in range(i + 1, min(i + 20, len(sub))):
+                        total_ham += (sub[i] != sub[j]).sum()
+                        n_pairs += 1
+                avg_ham = total_ham / max(n_pairs, 1) / L
+                all_hamming.append(avg_ham)
+
+            # Unique sequences
+            unique = len(set(tuple(s.tolist()) for s in samples))
+            all_unique.append(unique / n_samples)
+
+        dt = time.time() - t0
+        pk = {k: float(np.mean(v)) for k, v in all_pass.items() if v}
+        results[pol] = {
+            'pass_at_k': pk,
+            'diversity': float(np.mean(all_hamming)) if all_hamming else 0,
+            'unique_ratio': float(np.mean(all_unique)),
+            'time': dt,
+        }
+        pk_str = ' '.join(f"k={k}:{v:.3f}" for k, v in pk.items())
+        print(f"    {pol:<15} {pk_str}  "
+              f"div={results[pol]['diversity']:.3f}  "
+              f"uniq={results[pol]['unique_ratio']:.2%}  "
+              f"({dt:.1f}s)")
+
+    return results
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Run
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 def run():
     print("=" * 70)
-    print("  EXP 3b: Learned Conditional Analysis")
+    print("  EXP 3b: Conditional Analysis + pass@k")
     print("=" * 70)
     mount_drive()
     torch.manual_seed(42); np.random.seed(42)
 
     distributions = {
-        'A_Markov2':           MarkovChain(order=2, sparsity=0.1, seed=42),
-        'B_HardMarkov99':      HardMarkov(order=2, p_peak=0.99, seed=42),
-        'C_HardGlobalSum':     HardGlobalSum(alpha=0.5, seed=42),
+        'A_HardMarkov':    HardMarkov(order=2, p_peak=0.75, seed=42),
+        'B_HardGlobalSum': HardGlobalSum(alpha=0.3, seed=42),
     }
     dist_names = list(distributions.keys())
+    dist_colors = {'A_HardMarkov': '#e74c3c',
+                   'B_HardGlobalSum': '#2ecc71'}
 
     # ── Distribution summary ──
     for name, dist in distributions.items():
@@ -322,25 +456,24 @@ def run():
         _, p = dist.full_distribution()
         n_sup = (p > 1e-20).sum().item()
         extra = ''
-        if hasattr(dist, 'theoretical_l2r_entropy'):
+        if isinstance(dist, HardMarkov):
             extra = (f"  H_l2r/step={dist.theoretical_l2r_entropy():.3f}"
-                     f"  greedy_acc={dist.expected_accuracy_l2r():.2%}")
+                     f"  p_peak={dist.p_peak}"
+                     f"  seq_mode_prob≈{dist.p_peak**(L-dist.k):.3f}")
         print(f"  {name}: H={h:.2f} bits  "
               f"support={n_sup}/{V**L} ({n_sup/V**L*100:.1f}%){extra}")
 
-    # ── MI matrices ──
+    # ── MI ──
     fig_mi, axes_mi = plt.subplots(
         1, len(distributions), figsize=(5 * len(distributions), 4))
     if len(distributions) == 1:
         axes_mi = [axes_mi]
-    mi_matrices = {}
     for idx, (name, dist) in enumerate(distributions.items()):
         MI = compute_mi(dist)
-        mi_matrices[name] = MI
         im = axes_mi[idx].imshow(MI, cmap='YlOrRd', vmin=0)
         axes_mi[idx].set_title(name, fontsize=10)
         plt.colorbar(im, ax=axes_mi[idx], shrink=0.8)
-    fig_mi.suptitle('Mutual Information I(X_i; X_j)', fontsize=13, y=1.02)
+    fig_mi.suptitle('Mutual Information', fontsize=13, y=1.02)
     fig_mi.tight_layout()
     figs = {'mi_matrices': fig_mi}
 
@@ -352,7 +485,6 @@ def run():
         models[name] = model
         train_hists[name] = hist
 
-    # Training curves
     fig, axes = plt.subplots(1, 2, figsize=(14, 4))
     for name, h in train_hists.items():
         axes[0].plot(h['loss'], label=name, alpha=0.8)
@@ -363,16 +495,20 @@ def run():
         ax.legend(fontsize=7); ax.grid(alpha=0.3)
     fig.tight_layout(); figs['training_curves'] = fig
 
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    # Evaluate
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # ══════════════════════════════════════════════════
+    # PART 1: Conditional Analysis
+    # ══════════════════════════════════════════════════
+
+    print("\n" + "=" * 70)
+    print("  PART 1: Conditional Analysis")
+    print("=" * 70)
 
     patterns = make_all_patterns()
-    results = {}
+    cond_results = {}
 
     for dist_name, dist in distributions.items():
         model = models[dist_name]
-        results[dist_name] = {}
+        cond_results[dist_name] = {}
         print(f"\n▶ Evaluating: {dist_name}")
 
         for cat, instances in patterns.items():
@@ -381,13 +517,11 @@ def run():
             for S_pos, target in instances:
                 r = evaluate_conditional(model, dist, S_pos, target)
                 if r is not None:
-                    r['S'] = S_pos
-                    r['target'] = target
+                    r['S'] = S_pos; r['target'] = target
                     r['|S|'] = len(S_pos)
                     cat_results.append(r)
-            results[dist_name][cat] = cat_results
+            cond_results[dist_name][cat] = cat_results
             dt = time.time() - t0
-
             if cat_results:
                 nc, nf, nw = error_counts(cat_results)
                 n_wrong = nf + nw
@@ -399,411 +533,340 @@ def run():
                       f"KL={avg_metric(cat_results, 'kl_forward'):.5f}"
                       f"{fb_str}  ({dt:.1f}s)")
 
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    # Shared constants for figures
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # ── Conditional Figures ──
 
     display_cats = ['marginal', 'single_left', 'single_right',
                     'causal_w2', 'anticausal_w2', 'sandwich',
-                    'causal_w3', 'causal_gap1',
-                    'leave_one_out']
-    display_labels = ['marginal\n(no ctx)', 'single\nleft',
-                      'single\nright',
+                    'causal_w3', 'causal_gap1', 'leave_one_out']
+    display_labels = ['marginal', 'single\nleft', 'single\nright',
                       'causal\n{t-2,t-1}', 'anti-causal\n{t+1,t+2}',
-                      'sandwich\n{t-1,t+1}',
-                      'causal\nw=3', 'causal\ngap=1',
-                      'leave-\none-out']
-    dist_colors = {'A_Markov2': '#3498db',
-                   'B_HardMarkov99': '#e74c3c',
-                   'C_HardGlobalSum': '#2ecc71'}
-    width = 0.25
+                      'sandwich\n{t-1,t+1}', 'causal\nw=3',
+                      'causal\ngap=1', 'leave-\none-out']
+    width = 0.35
 
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    # FIG 1: Mode Accuracy by Pattern
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    fig, ax = plt.subplots(figsize=(14, 5))
+    # FIG C1: Mode Accuracy
+    fig, ax = plt.subplots(figsize=(13, 5))
     x = np.arange(len(display_cats))
     for i, dn in enumerate(dist_names):
-        accs = [avg_metric(results[dn].get(c, []), 'mode_accuracy')
+        accs = [avg_metric(cond_results[dn].get(c, []), 'mode_accuracy')
                 for c in display_cats]
         bars = ax.bar(x + i * width, accs, width,
                       label=dn, color=dist_colors[dn], alpha=0.85)
         for bar, val in zip(bars, accs):
             if not np.isnan(val):
                 ax.text(bar.get_x() + bar.get_width() / 2,
-                        bar.get_height(),
-                        f'{val:.0%}', ha='center', va='bottom', fontsize=6)
-    ax.set_xticks(x + width)
-    ax.set_xticklabels(display_labels, fontsize=8)
-    ax.set_ylabel('Mode Accuracy (weighted)')
-    ax.set_ylim(0, 1.12)
-    ax.axhline(y=1/V, color='gray', ls=':', alpha=0.5, label='chance (1/V)')
-    ax.legend(fontsize=7, loc='lower right')
-    ax.grid(axis='y', alpha=0.3)
-    ax.set_title('Mode Accuracy: Does the Model Predict the Right Token?',
-                 fontsize=12)
-    fig.tight_layout(); figs['mode_accuracy'] = fig
+                        bar.get_height(), f'{val:.0%}',
+                        ha='center', va='bottom', fontsize=6)
+    ax.set_xticks(x + width / 2); ax.set_xticklabels(display_labels, fontsize=8)
+    ax.set_ylabel('Mode Accuracy'); ax.set_ylim(0, 1.12)
+    ax.axhline(y=1/V, color='gray', ls=':', alpha=0.5, label='chance')
+    ax.legend(fontsize=7); ax.grid(axis='y', alpha=0.3)
+    ax.set_title('Mode Accuracy by Conditioning Pattern', fontsize=12)
+    fig.tight_layout(); figs['cond_mode_acc'] = fig
 
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    # FIG 2: True Answer Probability by Pattern
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    fig, ax = plt.subplots(figsize=(14, 5))
+    # FIG C2: True Answer Prob
+    fig, ax = plt.subplots(figsize=(13, 5))
     for i, dn in enumerate(dist_names):
-        probs = [avg_metric(results[dn].get(c, []), 'true_answer_prob')
+        probs = [avg_metric(cond_results[dn].get(c, []), 'true_answer_prob')
                  for c in display_cats]
         bars = ax.bar(x + i * width, probs, width,
                       label=dn, color=dist_colors[dn], alpha=0.85)
         for bar, val in zip(bars, probs):
             if not np.isnan(val):
                 ax.text(bar.get_x() + bar.get_width() / 2,
-                        bar.get_height(),
-                        f'{val:.2f}', ha='center', va='bottom', fontsize=6)
-    ax.set_xticks(x + width)
-    ax.set_xticklabels(display_labels, fontsize=8)
-    ax.set_ylabel('E[p_θ(true answer | context)]')
-    ax.set_ylim(0, 1.12)
-    ax.axhline(y=1/V, color='gray', ls=':', alpha=0.5, label='chance (1/V)')
-    ax.legend(fontsize=7, loc='lower right')
-    ax.grid(axis='y', alpha=0.3)
-    ax.set_title('True Answer Probability: How Much Mass on the Right Token?',
-                 fontsize=12)
-    fig.tight_layout(); figs['true_answer_prob'] = fig
+                        bar.get_height(), f'{val:.2f}',
+                        ha='center', va='bottom', fontsize=6)
+    ax.set_xticks(x + width / 2); ax.set_xticklabels(display_labels, fontsize=8)
+    ax.set_ylabel('p_θ(true answer)'); ax.set_ylim(0, 1.12)
+    ax.axhline(y=1/V, color='gray', ls=':', alpha=0.5, label='chance')
+    ax.legend(fontsize=7); ax.grid(axis='y', alpha=0.3)
+    ax.set_title('True Answer Probability by Conditioning Pattern', fontsize=12)
+    fig.tight_layout(); figs['cond_true_prob'] = fig
 
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    # FIG 3: Error Type Breakdown (stacked bar, per dist)
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # FIG C3: Error Type (stacked bar)
     fig, axes = plt.subplots(1, len(dist_names),
-                             figsize=(5.5 * len(dist_names), 5))
+                             figsize=(6 * len(dist_names), 5))
     if len(dist_names) == 1:
         axes = [axes]
-
     for col, dn in enumerate(dist_names):
         ax = axes[col]
         cats_data = []
         for cat in display_cats:
-            cr = results[dn].get(cat, [])
+            cr = cond_results[dn].get(cat, [])
             if cr:
                 nc, nf, nw = error_counts(cr)
                 total = nc + nf + nw
-                cats_data.append((nc / total, nf / total, nw / total))
+                cats_data.append((nc/total, nf/total, nw/total))
             else:
                 cats_data.append((0, 0, 0))
-
         correct = [d[0] for d in cats_data]
         marg_fb = [d[1] for d in cats_data]
         wrong_r = [d[2] for d in cats_data]
-
         ax.bar(x, correct, 0.6, label='Correct', color='#2ecc71')
         ax.bar(x, marg_fb, 0.6, bottom=correct,
-               label='Wrong → marginal fallback', color='#f39c12')
+               label='→ marginal fallback', color='#f39c12')
         ax.bar(x, wrong_r, 0.6,
-               bottom=[c + m for c, m in zip(correct, marg_fb)],
-               label='Wrong → other token', color='#e74c3c')
-
-        ax.set_xticks(x)
-        ax.set_xticklabels(display_labels, fontsize=7)
-        ax.set_ylabel('Fraction of contexts')
-        ax.set_ylim(0, 1.05)
+               bottom=[c+m for c, m in zip(correct, marg_fb)],
+               label='→ wrong response', color='#e74c3c')
+        ax.set_xticks(x); ax.set_xticklabels(display_labels, fontsize=7)
+        ax.set_ylabel('Fraction'); ax.set_ylim(0, 1.05)
         ax.set_title(dn, fontsize=10)
         if col == 0:
-            ax.legend(fontsize=7, loc='lower right')
+            ax.legend(fontsize=7)
         ax.grid(axis='y', alpha=0.3)
+    fig.suptitle('Error Type Breakdown', fontsize=12, y=1.02)
+    fig.tight_layout(); figs['cond_error_type'] = fig
 
-    fig.suptitle('Error Type: When Wrong, Is It Marginal Fallback?',
-                 fontsize=12, y=1.02)
-    fig.tight_layout(); figs['error_type'] = fig
-
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    # FIG 4: Direction Asymmetry — per target position
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # FIG C4: Direction asymmetry per position
     dir_cats = ['causal_w2', 'anticausal_w2', 'sandwich']
     dir_colors_map = {'causal_w2': '#2ecc71', 'anticausal_w2': '#e74c3c',
                       'sandwich': '#9b59b6'}
-    dir_labels = {'causal_w2': 'causal {t-2,t-1}→t',
-                  'anticausal_w2': 'anti-causal {t+1,t+2}→t',
-                  'sandwich': 'sandwich {t-1,t+1}→t'}
+    dir_labels = {'causal_w2': 'causal', 'anticausal_w2': 'anti-causal',
+                  'sandwich': 'sandwich'}
 
-    fig, axes = plt.subplots(2, len(dist_names),
-                             figsize=(6 * len(dist_names), 8))
+    fig, axes = plt.subplots(1, len(dist_names),
+                             figsize=(6 * len(dist_names), 4.5))
     if len(dist_names) == 1:
-        axes = axes.reshape(-1, 1)
+        axes = [axes]
     for col, dn in enumerate(dist_names):
-        # Top: true answer prob
-        ax = axes[0, col]
+        ax = axes[col]
         for cat in dir_cats:
-            cr = results[dn].get(cat, [])
+            cr = cond_results[dn].get(cat, [])
             if cr:
-                targets = [r['target'] for r in cr]
-                vals = [r['true_answer_prob'] for r in cr]
-                ax.plot(targets, vals, '-o', color=dir_colors_map[cat],
+                ax.plot([r['target'] for r in cr],
+                        [r['true_answer_prob'] for r in cr],
+                        '-o', color=dir_colors_map[cat],
                         label=dir_labels[cat], markersize=5, alpha=0.85)
-        mr = results[dn].get('marginal', [])
+        mr = cond_results[dn].get('marginal', [])
         if mr:
             ax.plot([r['target'] for r in mr],
                     [r['true_answer_prob'] for r in mr],
-                    '--', color='gray', alpha=0.5, label='no context')
-        ax.set_ylabel('p_θ(true answer)')
-        ax.set_title(dn, fontsize=10)
-        ax.set_ylim(0, 1.05)
-        ax.grid(alpha=0.3)
-        if col == 0:
-            ax.legend(fontsize=6)
-
-        # Bottom: KL
-        ax = axes[1, col]
-        for cat in dir_cats:
-            cr = results[dn].get(cat, [])
-            if cr:
-                targets = [r['target'] for r in cr]
-                vals = [r['kl_forward'] for r in cr]
-                ax.plot(targets, vals, '-o', color=dir_colors_map[cat],
-                        label=dir_labels[cat], markersize=5, alpha=0.85)
+                    '--', color='gray', alpha=0.5, label='marginal')
         ax.set_xlabel('Target position t')
-        ax.set_ylabel('KL(p_true ‖ p_θ)')
-        ax.grid(alpha=0.3)
-
-    fig.suptitle('Direction Asymmetry by Position', fontsize=12, y=1.01)
-    fig.tight_layout(); figs['direction_per_position'] = fig
-
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    # FIG 5: Progressive Chain
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    fig, axes = plt.subplots(2, len(dist_names),
-                             figsize=(6 * len(dist_names), 8))
-    if len(dist_names) == 1:
-        axes = axes.reshape(-1, 1)
-    chain_colors = {'l2r_progressive': '#2ecc71',
-                    'r2l_progressive': '#e74c3c'}
-    chain_labels = {'l2r_progressive': 'l2r {0,…,t-1}→t',
-                    'r2l_progressive': 'r2l {t+1,…,7}→t'}
-
-    for col, dn in enumerate(dist_names):
-        # Top: true answer prob
-        ax = axes[0, col]
-        for chain in ['l2r_progressive', 'r2l_progressive']:
-            cr = results[dn].get(chain, [])
-            if cr:
-                sizes = [r['|S|'] for r in cr]
-                vals = [r['true_answer_prob'] for r in cr]
-                ax.plot(sizes, vals, '-o', color=chain_colors[chain],
-                        label=chain_labels[chain], markersize=5, alpha=0.85)
         ax.set_ylabel('p_θ(true answer)')
-        ax.set_title(dn, fontsize=10)
-        ax.set_ylim(0, 1.05)
+        ax.set_title(dn, fontsize=10); ax.set_ylim(0, 1.05)
         ax.grid(alpha=0.3)
         if col == 0:
             ax.legend(fontsize=7)
+    fig.suptitle('Direction Asymmetry', fontsize=12, y=1.02)
+    fig.tight_layout(); figs['cond_direction'] = fig
 
-        # Bottom: mode accuracy
-        ax = axes[1, col]
-        for chain in ['l2r_progressive', 'r2l_progressive']:
-            cr = results[dn].get(chain, [])
+    # FIG C5: Progressive chain
+    fig, axes = plt.subplots(1, len(dist_names),
+                             figsize=(6 * len(dist_names), 4.5))
+    if len(dist_names) == 1:
+        axes = [axes]
+    for col, dn in enumerate(dist_names):
+        ax = axes[col]
+        for chain, color, label in [
+            ('l2r_progressive', '#2ecc71', 'l2r'),
+            ('r2l_progressive', '#e74c3c', 'r2l'),
+        ]:
+            cr = cond_results[dn].get(chain, [])
             if cr:
-                sizes = [r['|S|'] for r in cr]
-                vals = [r['mode_accuracy'] for r in cr]
-                ax.plot(sizes, vals, '-s', color=chain_colors[chain],
-                        label=chain_labels[chain], markersize=5, alpha=0.85)
+                ax.plot([r['|S|'] for r in cr],
+                        [r['true_answer_prob'] for r in cr],
+                        '-o', color=color, label=label,
+                        markersize=5, alpha=0.85)
         ax.set_xlabel('Context size |S|')
-        ax.set_ylabel('Mode accuracy')
-        ax.set_ylim(0, 1.05)
+        ax.set_ylabel('p_θ(true answer)')
+        ax.set_title(dn, fontsize=10); ax.set_ylim(0, 1.05)
         ax.grid(alpha=0.3)
+        if col == 0:
+            ax.legend(fontsize=7)
+    fig.suptitle('Progressive Chain', fontsize=12, y=1.02)
+    fig.tight_layout(); figs['cond_progressive'] = fig
 
-    fig.suptitle('Progressive Chain: l2r vs r2l Context Accumulation',
-                 fontsize=12, y=1.01)
-    fig.tight_layout(); figs['progressive_chain'] = fig
-
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    # FIG 6: Gap Effect (Markov only)
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    gap_cats = ['causal_w2', 'causal_gap1', 'causal_gap2']
-    gap_labels_map = {'causal_w2': 'no gap {t-2,t-1}',
-                      'causal_gap1': '1-gap {t-3,t-1}',
-                      'causal_gap2': '2-gap {t-4,t-1}'}
-    gap_colors = {'causal_w2': '#2ecc71', 'causal_gap1': '#f39c12',
-                  'causal_gap2': '#e74c3c'}
-    markov_dists = [d for d in dist_names if 'Markov' in d]
-
-    if markov_dists:
-        fig, axes = plt.subplots(2, len(markov_dists),
-                                 figsize=(6 * len(markov_dists), 8))
-        if len(markov_dists) == 1:
-            axes = axes.reshape(-1, 1)
-        for col, dn in enumerate(markov_dists):
-            # Top: true answer prob
-            ax = axes[0, col]
-            for cat in gap_cats:
-                cr = results[dn].get(cat, [])
-                if cr:
-                    targets = [r['target'] for r in cr]
-                    vals = [r['true_answer_prob'] for r in cr]
-                    ax.plot(targets, vals, '-o', color=gap_colors[cat],
-                            label=gap_labels_map[cat],
-                            markersize=5, alpha=0.85)
-            ax.set_ylabel('p_θ(true answer)')
-            ax.set_title(dn, fontsize=10)
-            ax.grid(alpha=0.3)
-            if col == 0:
-                ax.legend(fontsize=7)
-
-            # Bottom: mode accuracy
-            ax = axes[1, col]
-            for cat in gap_cats:
-                cr = results[dn].get(cat, [])
-                if cr:
-                    targets = [r['target'] for r in cr]
-                    vals = [r['mode_accuracy'] for r in cr]
-                    ax.plot(targets, vals, '-s', color=gap_colors[cat],
-                            label=gap_labels_map[cat],
-                            markersize=5, alpha=0.85)
-            ax.set_xlabel('Target position t')
-            ax.set_ylabel('Mode accuracy')
-            ax.set_ylim(0, 1.05)
-            ax.grid(alpha=0.3)
-
-        fig.suptitle('Gap Effect: Breaking the Markov Context',
-                     fontsize=12, y=1.01)
-        fig.tight_layout(); figs['gap_effect'] = fig
-
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    # FIG 7: Context Sufficiency (window 1→2→3)
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    suf_cats = ['single_left', 'causal_w2', 'causal_w3']
-    suf_labels = ['w=1', 'w=2 (=order)', 'w=3']
-
-    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
-
-    x_suf = np.arange(len(suf_cats))
-    ax = axes[0]
-    for i, dn in enumerate(dist_names):
-        vals = [avg_metric(results[dn].get(c, []), 'mode_accuracy')
-                for c in suf_cats]
-        ax.bar(x_suf + i * width, vals, width,
-               label=dn, color=dist_colors[dn], alpha=0.85)
-    ax.set_xticks(x_suf + width)
-    ax.set_xticklabels(suf_labels)
-    ax.set_ylabel('Mode accuracy')
-    ax.set_ylim(0, 1.12)
-    ax.legend(fontsize=7); ax.grid(axis='y', alpha=0.3)
-    ax.set_title('Mode Accuracy by Window Size')
-
-    ax = axes[1]
-    for i, dn in enumerate(dist_names):
-        vals = [avg_metric(results[dn].get(c, []), 'true_answer_prob')
-                for c in suf_cats]
-        ax.bar(x_suf + i * width, vals, width,
-               label=dn, color=dist_colors[dn], alpha=0.85)
-    ax.set_xticks(x_suf + width)
-    ax.set_xticklabels(suf_labels)
-    ax.set_ylabel('p_θ(true answer)')
-    ax.set_ylim(0, 1.12)
-    ax.legend(fontsize=7); ax.grid(axis='y', alpha=0.3)
-    ax.set_title('True Answer Prob by Window Size')
-
-    fig.suptitle('Context Sufficiency', fontsize=12, y=1.01)
-    fig.tight_layout(); figs['context_sufficiency'] = fig
-
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    # FIG 8: Leave-one-out per position
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    fig, axes = plt.subplots(1, 3, figsize=(16, 4.5))
-
+    # FIG C6: Leave-one-out per position
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4.5))
     ax = axes[0]
     for dn in dist_names:
-        cr = results[dn].get('leave_one_out', [])
+        cr = cond_results[dn].get('leave_one_out', [])
         if cr:
             ax.plot([r['target'] for r in cr],
                     [r['true_answer_prob'] for r in cr],
-                    '-o', label=dn, markersize=5, alpha=0.85,
-                    color=dist_colors[dn])
+                    '-o', label=dn, markersize=5, color=dist_colors[dn])
     ax.set_xlabel('Position t'); ax.set_ylabel('p_θ(true answer)')
-    ax.set_title('Leave-One-Out: True Answer Prob')
-    ax.legend(fontsize=7); ax.grid(alpha=0.3)
+    ax.set_title('Leave-One-Out'); ax.legend(fontsize=7); ax.grid(alpha=0.3)
 
     ax = axes[1]
     for dn in dist_names:
-        cr = results[dn].get('leave_one_out', [])
-        if cr:
-            ax.plot([r['target'] for r in cr],
-                    [r['mode_accuracy'] for r in cr],
-                    '-s', label=dn, markersize=5, alpha=0.85,
-                    color=dist_colors[dn])
-    ax.set_xlabel('Position t'); ax.set_ylabel('Mode accuracy')
-    ax.set_title('Leave-One-Out: Mode Accuracy')
-    ax.legend(fontsize=7); ax.grid(alpha=0.3)
-
-    ax = axes[2]
-    for dn in dist_names:
-        cr = results[dn].get('leave_one_out', [])
+        cr = cond_results[dn].get('leave_one_out', [])
         if cr:
             ax.plot([r['target'] for r in cr],
                     [r['true_entropy'] for r in cr],
-                    '-^', label=dn, markersize=5, alpha=0.85,
-                    color=dist_colors[dn])
+                    '-s', label=dn, markersize=5, color=dist_colors[dn])
     ax.set_xlabel('Position t'); ax.set_ylabel('H_true(x_t | x_{-t})')
-    ax.set_title('Leave-One-Out: True Difficulty')
-    ax.legend(fontsize=7); ax.grid(alpha=0.3)
+    ax.set_title('True Difficulty'); ax.legend(fontsize=7); ax.grid(alpha=0.3)
+    fig.tight_layout(); figs['cond_leave_one_out'] = fig
 
-    fig.suptitle('Leave-One-Out Analysis', fontsize=12, y=1.01)
-    fig.tight_layout(); figs['leave_one_out'] = fig
+    # ══════════════════════════════════════════════════
+    # PART 2: pass@k
+    # ══════════════════════════════════════════════════
 
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    # FIG 9: Summary heatmap (3 metrics side by side)
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    all_cats = list(patterns.keys())
+    print("\n" + "=" * 70)
+    print("  PART 2: pass@k Analysis")
+    print("=" * 70)
 
-    fig, axes = plt.subplots(1, 3, figsize=(18, 7))
-    metric_cfgs = [
-        ('mode_accuracy', 'Mode Accuracy (↑)', 'RdYlGn'),
-        ('true_answer_prob', 'P(true answer) (↑)', 'RdYlGn'),
-        ('kl_forward', 'KL(true ‖ model) (↓)', 'RdYlGn_r'),
-    ]
+    pass_k_policies = ['confidence', 'low_entropy', 'high_entropy',
+                       'random', 'l2r', 'r2l']
+    k_values = [1, 2, 5, 10, 20, 50, 100]
+    N_SAMPLES_PK = 200     # samples per prefix
+    N_PREFIXES = 50        # number of random prefixes
 
-    for ax_idx, (metric, title, cmap) in enumerate(metric_cfgs):
-        ax = axes[ax_idx]
-        hm = np.full((len(all_cats), len(dist_names)), np.nan)
-        for j, dn in enumerate(dist_names):
-            for i, cat in enumerate(all_cats):
-                cr = results[dn].get(cat, [])
-                if cr:
-                    hm[i, j] = avg_metric(cr, metric)
-        im = ax.imshow(hm, cmap=cmap, aspect='auto')
-        ax.set_xticks(range(len(dist_names)))
-        ax.set_xticklabels([d.split('_', 1)[1] for d in dist_names],
-                           fontsize=8, rotation=20)
-        ax.set_yticks(range(len(all_cats)))
-        ax.set_yticklabels(all_cats, fontsize=7)
-        for i in range(hm.shape[0]):
-            for j in range(hm.shape[1]):
-                if not np.isnan(hm[i, j]):
-                    v = hm[i, j]
-                    fmt = (f"{v:.0%}" if metric != 'kl_forward'
-                           else f"{v:.4f}")
-                    med = np.nanmedian(hm[~np.isnan(hm)])
-                    use_white = (('kl' in metric and v > med) or
-                                 ('kl' not in metric and v < med))
-                    ax.text(j, i, fmt, ha='center', va='center',
-                            fontsize=6,
-                            color='white' if use_white else 'black')
-        plt.colorbar(im, ax=ax, shrink=0.6)
-        ax.set_title(title, fontsize=10)
+    pass_k_results = {}
+    for dist_name, dist in distributions.items():
+        model = models[dist_name]
+        print(f"\n▶ pass@k: {dist_name}")
 
-    fig.suptitle('Summary: All Patterns × All Distributions',
-                 fontsize=12, y=1.01)
-    fig.tight_layout(); figs['summary_heatmap'] = fig
+        # Theoretical baseline for well-calibrated model
+        if isinstance(dist, HardMarkov):
+            p_seq = dist.p_peak ** (L - dist.k)
+            print(f"  Theoretical: P(mode sequence) = {p_seq:.3f}")
+            for k in k_values:
+                th = 1 - (1 - p_seq) ** k
+                print(f"    ideal pass@{k} = {th:.3f} (independent samples)")
+
+        pk = evaluate_pass_k(
+            model, dist, pass_k_policies,
+            n_samples=N_SAMPLES_PK, n_prefixes=N_PREFIXES,
+            k_values=k_values)
+        pass_k_results[dist_name] = pk
+
+    # ── pass@k Figures ──
+
+    pol_colors = {'confidence': '#e74c3c', 'low_entropy': '#e67e22',
+                  'high_entropy': '#9b59b6', 'random': '#95a5a6',
+                  'l2r': '#2ecc71', 'r2l': '#3498db'}
+
+    # FIG P1: pass@k curves
+    fig, axes = plt.subplots(1, len(dist_names),
+                             figsize=(7 * len(dist_names), 5))
+    if len(dist_names) == 1:
+        axes = [axes]
+    for col, dn in enumerate(dist_names):
+        ax = axes[col]
+        pk = pass_k_results[dn]
+
+        # Theoretical independent baseline (for Markov)
+        if isinstance(distributions[dn], HardMarkov):
+            p_seq = distributions[dn].p_peak ** (L - distributions[dn].k)
+            th_k = [1 - (1 - p_seq) ** k for k in k_values]
+            ax.plot(k_values, th_k, 'k--', alpha=0.4,
+                    label='independent (theory)', linewidth=2)
+
+        for pol in pass_k_policies:
+            if pol in pk:
+                ks = sorted(pk[pol]['pass_at_k'].keys())
+                vals = [pk[pol]['pass_at_k'][k] for k in ks]
+                ax.plot(ks, vals, '-o', color=pol_colors[pol],
+                        label=pol, markersize=4, alpha=0.85)
+
+        ax.set_xlabel('k'); ax.set_ylabel('pass@k')
+        ax.set_title(dn, fontsize=10)
+        ax.set_xscale('log'); ax.set_ylim(0, 1.05)
+        ax.grid(alpha=0.3)
+        if col == 0:
+            ax.legend(fontsize=6, loc='lower right')
+    fig.suptitle('pass@k by Decode Policy (log scale)',
+                 fontsize=12, y=1.02)
+    fig.tight_layout(); figs['pass_k_curves'] = fig
+
+    # FIG P2: Diversity vs pass@1 scatter
+    fig, axes = plt.subplots(1, len(dist_names),
+                             figsize=(6 * len(dist_names), 5))
+    if len(dist_names) == 1:
+        axes = [axes]
+    for col, dn in enumerate(dist_names):
+        ax = axes[col]
+        pk = pass_k_results[dn]
+        for pol in pass_k_policies:
+            if pol in pk:
+                p1 = pk[pol]['pass_at_k'].get(1, 0)
+                div = pk[pol]['diversity']
+                ax.scatter(div, p1, color=pol_colors[pol],
+                           s=100, alpha=0.85, zorder=5)
+                ax.annotate(pol, (div, p1), fontsize=7,
+                            textcoords='offset points', xytext=(5, 5))
+        ax.set_xlabel('Sample Diversity (avg Hamming / L)')
+        ax.set_ylabel('pass@1')
+        ax.set_title(dn, fontsize=10)
+        ax.grid(alpha=0.3)
+    fig.suptitle('Diversity vs pass@1: The Tradeoff',
+                 fontsize=12, y=1.02)
+    fig.tight_layout(); figs['diversity_vs_pass1'] = fig
+
+    # FIG P3: pass@k improvement ratio (pass@k / pass@1)
+    fig, axes = plt.subplots(1, len(dist_names),
+                             figsize=(7 * len(dist_names), 5))
+    if len(dist_names) == 1:
+        axes = [axes]
+    for col, dn in enumerate(dist_names):
+        ax = axes[col]
+        pk = pass_k_results[dn]
+        for pol in pass_k_policies:
+            if pol in pk:
+                p1 = pk[pol]['pass_at_k'].get(1, 1e-10)
+                ks = sorted(pk[pol]['pass_at_k'].keys())
+                ratios = [pk[pol]['pass_at_k'][k] / max(p1, 1e-10)
+                          for k in ks]
+                ax.plot(ks, ratios, '-o', color=pol_colors[pol],
+                        label=pol, markersize=4, alpha=0.85)
+        ax.set_xlabel('k'); ax.set_ylabel('pass@k / pass@1 (scaling)')
+        ax.set_title(dn, fontsize=10)
+        ax.set_xscale('log'); ax.grid(alpha=0.3)
+        if col == 0:
+            ax.legend(fontsize=6)
+    fig.suptitle('pass@k Scaling: How Much Does More Sampling Help?',
+                 fontsize=12, y=1.02)
+    fig.tight_layout(); figs['pass_k_scaling'] = fig
+
+    # FIG P4: Summary bar — pass@1 and pass@10 side by side
+    fig, axes = plt.subplots(1, len(dist_names),
+                             figsize=(7 * len(dist_names), 5))
+    if len(dist_names) == 1:
+        axes = [axes]
+    for col, dn in enumerate(dist_names):
+        ax = axes[col]
+        pk = pass_k_results[dn]
+        pols = [p for p in pass_k_policies if p in pk]
+        x_bar = np.arange(len(pols))
+        w = 0.35
+        p1s = [pk[p]['pass_at_k'].get(1, 0) for p in pols]
+        p10s = [pk[p]['pass_at_k'].get(10, 0) for p in pols]
+        ax.bar(x_bar - w/2, p1s, w, label='pass@1',
+               color='#3498db', alpha=0.85)
+        ax.bar(x_bar + w/2, p10s, w, label='pass@10',
+               color='#e74c3c', alpha=0.85)
+        ax.set_xticks(x_bar); ax.set_xticklabels(pols, fontsize=8)
+        ax.set_ylabel('pass@k'); ax.set_ylim(0, 1.1)
+        ax.set_title(dn, fontsize=10)
+        ax.legend(fontsize=7); ax.grid(axis='y', alpha=0.3)
+        # Annotate
+        for i, (v1, v10) in enumerate(zip(p1s, p10s)):
+            ax.text(i - w/2, v1, f'{v1:.2f}', ha='center',
+                    va='bottom', fontsize=6)
+            ax.text(i + w/2, v10, f'{v10:.2f}', ha='center',
+                    va='bottom', fontsize=6)
+    fig.suptitle('pass@1 vs pass@10', fontsize=12, y=1.02)
+    fig.tight_layout(); figs['pass_k_summary'] = fig
 
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     # Save
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-    json_results = {}
+    json_results = {
+        'conditional': {},
+        'pass_k': {},
+    }
     for dn in dist_names:
-        json_results[dn] = {}
-        for cat, cr_list in results[dn].items():
-            json_results[dn][cat] = []
-            for r in cr_list:
-                entry = {k: v for k, v in r.items()
-                         if k != 'per_context'}
-                json_results[dn][cat].append(entry)
+        json_results['conditional'][dn] = {}
+        for cat, cr_list in cond_results[dn].items():
+            json_results['conditional'][dn][cat] = [
+                {k: v for k, v in r.items() if k != 'per_context'}
+                for r in cr_list
+            ]
+        json_results['pass_k'][dn] = pass_k_results[dn]
 
     save_results(EXP_NAME, json_results, figures=figs)
 
@@ -822,7 +885,7 @@ def run():
     print("  SUMMARY")
     print("=" * 70)
 
-    # ── 1. Direction asymmetry ──
+    # Conditional
     print("\n  ── Direction Asymmetry (|S|=2) ──")
     header = f"  {'Pattern':<20}"
     for dn in dist_names:
@@ -831,7 +894,7 @@ def run():
     for cat in ['causal_w2', 'anticausal_w2', 'sandwich']:
         row = f"  {cat:<20}"
         for dn in dist_names:
-            cr = results[dn].get(cat, [])
+            cr = cond_results[dn].get(cat, [])
             if cr:
                 row += (f"  {avg_metric(cr, 'mode_accuracy'):>7.1%}"
                         f" {avg_metric(cr, 'true_answer_prob'):>7.3f}")
@@ -839,81 +902,68 @@ def run():
                 row += f"  {'N/A':>7} {'N/A':>7}"
         print(row)
 
-    # ── 2. Error type ──
-    print("\n  ── Error Breakdown (wrong contexts only) ──")
-    header = f"  {'Pattern':<20}"
-    for dn in dist_names:
-        header += f"  {'→marg':>6} {'→other':>6}"
-    print(header)
+    # Error breakdown
+    print("\n  ── Error Breakdown ──")
     for cat in display_cats:
-        cr_any = any(results[dn].get(cat) for dn in dist_names)
+        cr_any = any(cond_results[dn].get(cat) for dn in dist_names)
         if not cr_any:
             continue
         row = f"  {cat:<20}"
         for dn in dist_names:
-            cr = results[dn].get(cat, [])
+            cr = cond_results[dn].get(cat, [])
             if cr:
                 nc, nf, nw = error_counts(cr)
                 n_wrong = nf + nw
                 if n_wrong > 0:
-                    row += f"  {nf/n_wrong:>6.0%} {nw/n_wrong:>6.0%}"
+                    row += f"  →marg {nf}/{n_wrong}"
                 else:
-                    row += f"  {'—':>6} {'—':>6}"
+                    row += f"  all correct  "
             else:
-                row += f"  {'N/A':>6} {'N/A':>6}"
+                row += f"  {'N/A':>14}"
         print(row)
 
-    # ── 3. Progressive chain ──
-    print("\n  ── Progressive Chain (mode accuracy) ──")
+    # Leave-one-out
+    print("\n  ── Leave-One-Out p_θ(true answer) ──")
     for dn in dist_names:
-        print(f"\n  {dn}:")
-        for chain in ['l2r_progressive', 'r2l_progressive']:
-            cr = results[dn].get(chain, [])
-            if cr:
-                vals = ' '.join(
-                    f"|S|={r['|S|']}:{r['mode_accuracy']:.0%}"
-                    for r in cr)
-                print(f"    {chain}: {vals}")
-
-    # ── 4. Gap effect ──
-    print("\n  ── Gap Effect (avg mode accuracy) ──")
-    for dn in markov_dists:
-        print(f"  {dn}:", end='')
-        for cat in gap_cats:
-            cr = results[dn].get(cat, [])
-            if cr:
-                print(f"  {gap_labels_map.get(cat, cat)}"
-                      f"={avg_metric(cr, 'mode_accuracy'):.1%}", end='')
-        print()
-
-    # ── 5. Leave-one-out ──
-    print("\n  ── Leave-One-Out (p_θ(true answer)) ──")
-    for dn in dist_names:
-        cr = results[dn].get('leave_one_out', [])
+        cr = cond_results[dn].get('leave_one_out', [])
         if cr:
-            vals = ' '.join(
-                f"t{r['target']}={r['true_answer_prob']:.3f}"
-                for r in cr)
+            vals = ' '.join(f"t{r['target']}={r['true_answer_prob']:.3f}"
+                            for r in cr)
             print(f"  {dn}: {vals}")
 
-    # ── 6. Calibration ──
-    print("\n  ── Calibration: entropy_gap = H_model − H_true ──")
-    print(f"  {'Pattern':<20}", end='')
+    # pass@k
+    print("\n  ── pass@k ──")
     for dn in dist_names:
-        print(f"  {dn:>18}", end='')
-    print()
-    for cat in ['causal_w2', 'anticausal_w2', 'leave_one_out', 'marginal']:
-        print(f"  {cat:<20}", end='')
-        for dn in dist_names:
-            cr = results[dn].get(cat, [])
-            if cr:
-                print(f"  {avg_metric(cr, 'entropy_gap'):>+18.4f}", end='')
-            else:
-                print(f"  {'N/A':>18}", end='')
-        print()
+        pk = pass_k_results[dn]
+        print(f"\n  {dn}:")
+        for pol in pass_k_policies:
+            if pol in pk:
+                p1 = pk[pol]['pass_at_k'].get(1, 0)
+                p10 = pk[pol]['pass_at_k'].get(10, 0)
+                p50 = pk[pol]['pass_at_k'].get(50, 0)
+                div = pk[pol]['diversity']
+                uniq = pk[pol]['unique_ratio']
+                print(f"    {pol:<15} "
+                      f"@1={p1:.3f}  @10={p10:.3f}  @50={p50:.3f}  "
+                      f"div={div:.3f}  uniq={uniq:.1%}")
+
+    # Key insight
+    print("\n  ── Key Insight ──")
+    for dn in dist_names:
+        pk = pass_k_results[dn]
+        if 'confidence' in pk and 'l2r' in pk:
+            conf_1 = pk['confidence']['pass_at_k'].get(1, 0)
+            conf_10 = pk['confidence']['pass_at_k'].get(10, 0)
+            l2r_1 = pk['l2r']['pass_at_k'].get(1, 0)
+            l2r_10 = pk['l2r']['pass_at_k'].get(10, 0)
+            print(f"  {dn}:")
+            print(f"    confidence: @1={conf_1:.3f} → @10={conf_10:.3f} "
+                  f"({conf_10/max(conf_1,1e-10):.1f}× scaling)")
+            print(f"    l2r:        @1={l2r_1:.3f} → @10={l2r_10:.3f} "
+                  f"({l2r_10/max(l2r_1,1e-10):.1f}× scaling)")
 
     plt.show()
-    return results
+    return cond_results, pass_k_results
 
 
 if __name__ == '__main__':
