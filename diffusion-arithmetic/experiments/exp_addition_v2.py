@@ -54,7 +54,6 @@ from core.train_utils import (
 #   final_evaluate       — per-position & carry-conditional analysis
 #   _analyse_orders      — position-level decode rank (core's is scratchpad-level)
 #   probe_per_position   — per-position loss/acc/conf probe
-#   probe_partial_mask   — partial-mask confidence analysis
 
 EXP_NAME = 'exp_addition_v2_dynamics'
 
@@ -66,7 +65,7 @@ ND = 8
 ANS_LEN = ND + 1                # 9
 
 N_TRAIN = 2000
-N_TEST = 10000
+N_TEST = 500
 
 # ── Training (epoch-based) ──
 BATCH_SIZE = 200                # 2000 / 200 = 10 batches/epoch
@@ -95,6 +94,11 @@ DECODE_POLICIES = ['confidence', 'lsb']
 GEN_EVAL_EVERY = 200            # generation eval (expensive) frequency
 GEN_EVAL_N = 500                # subset size for generation tracking
 THRESHOLD = 0.99                # per-position "learned" threshold
+
+# PUMA-specific
+PUMA_TAU = 0.9                  # confidence threshold for fast-forwarding
+PUMA_K_START = 3                # initial chain stages (short chains early)
+PUMA_K_END = ANS_LEN            # final chain stages
 
 SEED = 42
 
@@ -313,69 +317,17 @@ def probe_per_position(model, tokenizer, test_samples, objective,
     return result
 
 
-@torch.no_grad()
-def probe_partial_mask(model, tokenizer, test_samples, fmt, max_len,
-                       fracs=None, device=None):
-    """Diffusion: confidence at different masking levels (MSB masked first)."""
-    if device is None: device = DEVICE
-    if fracs is None: fracs = [0.2, 0.4, 0.6, 0.8, 1.0]
-    model.eval()
-    mask_id = tokenizer.special_ids['mask']
-    ids_all, ans_all = encode_samples(test_samples, tokenizer, max_len)
-    ids_all, ans_all = ids_all.to(device), ans_all.to(device)
-
-    results = {}
-    for frac in fracs:
-        nm = max(1, int(math.ceil(frac * ANS_LEN)))
-        conf_s = torch.zeros(ANS_LEN, device=device)
-        acc_s = torch.zeros(ANS_LEN, device=device)
-        cnt = torch.zeros(ANS_LEN, device=device)
-        for st in range(0, len(test_samples), 128):
-            en = min(st+128, len(test_samples))
-            ids, ans = ids_all[st:en], ans_all[st:en]
-            B = ids.shape[0]
-            x = ids.clone()
-            mf = torch.zeros(B, ANS_LEN, dtype=torch.bool, device=device)
-            for b in range(B):
-                a = ans[b].item()
-                if fmt == 'plain':
-                    for j in range(min(nm, ANS_LEN)):
-                        x[b, a+j] = mask_id; mf[b, j] = True
-                else:
-                    for j in range(min(nm, ANS_LEN)):
-                        x[b, a+ANS_LEN-1-j] = mask_id; mf[b, ANS_LEN-1-j] = True
-            logits = model(x)
-            for b in range(B):
-                a = ans[b].item()
-                for j in range(ANS_LEN):
-                    if mf[b, j]:
-                        cl = logits[b, a+j].clone()
-                        cl[mask_id] = -float('inf')
-                        p = F.softmax(cl, dim=-1)
-                        conf_s[j] += p.max().item()
-                        acc_s[j] += float(p.argmax().item() == ids[b, a+j].item())
-                        cnt[j] += 1
-        results[frac] = {
-            'pos_conf': [conf_s[j].item()/cnt[j].item() if cnt[j]>0 else None
-                         for j in range(ANS_LEN)],
-            'pos_acc':  [acc_s[j].item()/cnt[j].item() if cnt[j]>0 else None
-                         for j in range(ANS_LEN)],
-            'n_masked': nm}
-    return results
-
-
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Training (epoch-based, fixed budget)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-def _quick_gen_acc(model, tokenizer, test_samples, objective, fmt,
-                   decode_policy='confidence', n=GEN_EVAL_N, device=None):
-    """Lightweight generation accuracy on a subset."""
+def _quick_gen_eval(model, tokenizer, test_samples, objective, fmt,
+                    decode_policy='confidence', n=GEN_EVAL_N, device=None):
+    """Lightweight generation eval on a subset. Returns full result dict."""
     if device is None: device = DEVICE
     subset = test_samples[:n]
-    r = final_evaluate(model, tokenizer, subset, objective, fmt,
-                       decode_policy=decode_policy)
-    return r['accuracy'], r.get('position_accuracy', [])
+    return final_evaluate(model, tokenizer, subset, objective, fmt,
+                          decode_policy=decode_policy)
 
 
 def train_with_dynamics(
@@ -451,175 +403,237 @@ def train_with_dynamics(
         if epoch % GEN_EVAL_EVERY == 0:
             gen_entry = {'epoch': epoch}
             if objective == 'ar':
-                ga, gpa = _quick_gen_acc(
+                r = _quick_gen_eval(
                     model, tokenizer, test_samples, 'ar', fmt, device=device)
-                gen_entry['gen_acc'] = {'ar': ga}
-                gen_entry['gen_pos_acc'] = {'ar': gpa}
-                print(f"      [gen] ar={ga:.3f}")
+                gen_entry['gen_acc'] = {'ar': r['accuracy']}
+                gen_entry['gen_pos_acc'] = {'ar': r['position_accuracy']}
+                gen_entry['gen_carry_out'] = {'ar': {
+                    'carry': r.get('pos_acc_carry_in', [None]*ANS_LEN),
+                    'no_carry': r.get('pos_acc_no_carry', [None]*ANS_LEN)}}
+                print(f"      [gen] ar={r['accuracy']:.3f}")
             else:
                 ga_strs = []
                 for dp in DECODE_POLICIES:
-                    ga, gpa = _quick_gen_acc(
+                    r = _quick_gen_eval(
                         model, tokenizer, test_samples, 'diffusion', fmt,
                         decode_policy=dp, device=device)
-                    gen_entry.setdefault('gen_acc', {})[dp] = ga
-                    gen_entry.setdefault('gen_pos_acc', {})[dp] = gpa
-                    ga_strs.append(f"{dp}={ga:.3f}")
+                    gen_entry.setdefault('gen_acc', {})[dp] = r['accuracy']
+                    gen_entry.setdefault('gen_pos_acc', {})[dp] = r['position_accuracy']
+                    gen_entry.setdefault('gen_carry_out', {})[dp] = {
+                        'carry': r.get('pos_acc_carry_in', [None]*ANS_LEN),
+                        'no_carry': r.get('pos_acc_no_carry', [None]*ANS_LEN)}
+                    oa = r.get('decode_order_analysis')
+                    if oa:
+                        gen_entry.setdefault('concordance', {})[dp] = oa['pairwise_concordance']
+                        gen_entry.setdefault('mean_rank', {})[dp] = oa['mean_rank']
+                    ga_strs.append(f"{dp}={r['accuracy']:.3f}")
                 print(f"      [gen] {' '.join(ga_strs)}")
             dynamics['gen_checkpoints'].append(gen_entry)
 
     # ── Eval at epoch 0 ──
     model.eval(); _do_eval(0); model.train()
 
+    # ── PUMA streaming buffer (only used if mask_type == 'puma') ──
+    puma_x0 = puma_z = puma_ans = puma_stage = None
+    puma_pool_idx = 0  # index into pre-encoded training data for refreshing
+    if mask_type == 'puma':
+        # Pre-encode all training data for fast refresh
+        puma_all_ids, puma_all_ans = encode_samples(train_samples, tokenizer, max_len)
+        puma_all_ids = puma_all_ids.to(device)
+        puma_all_ans = puma_all_ans.to(device)
+        puma_perm = torch.randperm(len(train_samples))  # shuffle order
+
+    def _puma_refresh(indices):
+        """Initialize or refresh PUMA buffer entries from training pool."""
+        nonlocal puma_x0, puma_z, puma_ans, puma_stage, puma_pool_idx, puma_perm
+        if puma_x0 is None:
+            # First-time init: allocate full buffer
+            B = len(indices)
+            T = puma_all_ids.shape[1]
+            puma_x0 = torch.zeros(B, T, dtype=torch.long, device=device)
+            puma_z = torch.zeros(B, T, dtype=torch.long, device=device)
+            puma_ans = torch.zeros(B, dtype=torch.long, device=device)
+            puma_stage = torch.zeros(B, dtype=torch.long, device=device)
+        for bi in indices:
+            si = puma_perm[puma_pool_idx % len(puma_perm)].item()
+            puma_pool_idx += 1
+            if puma_pool_idx >= len(puma_perm):
+                puma_perm = torch.randperm(len(train_samples))
+                puma_pool_idx = 0
+            puma_x0[bi] = puma_all_ids[si]
+            puma_z[bi] = puma_all_ids[si].clone()
+            puma_ans[bi] = puma_all_ans[si]
+            a_s = puma_all_ans[si].item()
+            puma_z[bi, a_s:min(a_s + ANS_LEN, puma_z.shape[1])] = mask_id
+            puma_stage[bi] = 0
+
+    def _puma_advance(logits_det, K_cur):
+        """Advance PUMA chains using detached logits. Zero overhead."""
+        nonlocal puma_z, puma_stage
+        B = puma_z.shape[0]
+        refresh_list = []
+        for bi in range(B):
+            mpos = (puma_z[bi] == mask_id).nonzero(as_tuple=True)[0]
+            if len(mpos) == 0:
+                refresh_list.append(bi); continue
+            # Vectorized confidence (excl MASK)
+            lp = logits_det[bi, mpos].clone()
+            lp[:, mask_id] = -float('inf')
+            confs = F.softmax(lp, dim=-1).max(dim=-1).values
+            # How many to reveal this step
+            K_rem = max(K_cur - puma_stage[bi].item(), 1)
+            n_reveal = max(1, math.ceil(len(mpos) / K_rem))
+            # Threshold: also reveal positions with conf > τ
+            above_tau = confs > PUMA_TAU
+            _, topk_idx = confs.topk(min(n_reveal, len(mpos)))
+            reveal = torch.zeros(len(mpos), dtype=torch.bool, device=device)
+            reveal[topk_idx] = True
+            reveal = reveal | above_tau
+            # Reveal with ground truth
+            reveal_pos = mpos[reveal]
+            puma_z[bi, reveal_pos] = puma_x0[bi, reveal_pos]
+            puma_stage[bi] += 1
+            # Chain complete?
+            if puma_stage[bi] >= K_cur or not (puma_z[bi] == mask_id).any():
+                refresh_list.append(bi)
+        if refresh_list:
+            _puma_refresh(refresh_list)
+
+    # Initialize PUMA buffer
+    if mask_type == 'puma':
+        _puma_refresh(list(range(BATCH_SIZE)))
+
     for epoch in range(1, MAX_EPOCHS + 1):
         epoch_loss = 0.0
         epoch_n = 0
+        # K scheduling for PUMA
+        puma_K_cur = PUMA_K_START + int((PUMA_K_END - PUMA_K_START)
+                                         * epoch / MAX_EPOCHS) if mask_type == 'puma' else 0
 
-        for batch in loader:
-            for pg in optimizer.param_groups:
-                pg['lr'] = get_lr(it)
+        if mask_type == 'puma':
+            # ── PUMA: streaming buffer iterations ──
+            for _ in range(bpe):
+                for pg in optimizer.param_groups:
+                    pg['lr'] = get_lr(it)
+                # Current mask = wherever z has MASK tokens
+                m = (puma_z == mask_id)
+                if m.sum() == 0:
+                    _puma_refresh(list(range(BATCH_SIZE)))
+                    m = (puma_z == mask_id)
+                # Forward on current chain state
+                logits = model(puma_z)
+                loss = F.cross_entropy(logits[m], puma_x0[m])
+                tg += m.sum().item()
+                # Backward
+                optimizer.zero_grad()
+                loss.backward()
+                nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
+                optimizer.step()
+                # Advance chains using same logits (zero overhead)
+                _puma_advance(logits.detach(), puma_K_cur)
 
-            ids = batch[0].to(device)
-            ans_starts = batch[1].to(device)
-            B, T = ids.shape
+                epoch_loss += loss.item()
+                epoch_n += 1
+                it += 1
+        else:
+            # ── Standard mask types (random/lsb/msb/confidence) ──
+            for batch in loader:
+                for pg in optimizer.param_groups:
+                    pg['lr'] = get_lr(it)
 
-            if objective == 'ar':
-                logits = model(ids[:, :-1])
-                targets = ids[:, 1:]
-                pos = torch.arange(T-1, device=device).unsqueeze(0)
-                lm = pos >= (ans_starts.unsqueeze(1) - 1)
-                lm = lm & (targets != pad_id)
-                if lm.sum() == 0: it += 1; continue
-                loss = F.cross_entropy(logits[lm], targets[lm])
-                tg += lm.sum().item()
+                ids = batch[0].to(device)
+                ans_starts = batch[1].to(device)
+                B, T = ids.shape
 
-            else:  # diffusion
-                pos = torch.arange(T, device=device).unsqueeze(0)
-                ans_mask = pos >= ans_starts.unsqueeze(1)
+                if objective == 'ar':
+                    logits = model(ids[:, :-1])
+                    targets = ids[:, 1:]
+                    pos = torch.arange(T-1, device=device).unsqueeze(0)
+                    lm = pos >= (ans_starts.unsqueeze(1) - 1)
+                    lm = lm & (targets != pad_id)
+                    if lm.sum() == 0: it += 1; continue
+                    loss = F.cross_entropy(logits[lm], targets[lm])
+                    tg += lm.sum().item()
 
-                if mask_type == 'random':
-                    t_ratio = torch.rand(B, device=device)
-                    m_probs = t_ratio.unsqueeze(1) * ans_mask.float()
-                    m = torch.bernoulli(m_probs).bool()
-                    no_m = ~(m.any(dim=1))
-                    for bi in no_m.nonzero(as_tuple=True)[0]:
-                        v = ans_mask[bi].nonzero(as_tuple=True)[0]
-                        if len(v) > 0: m[bi, v[torch.randint(len(v),(1,))]] = True
+                else:  # diffusion (non-PUMA)
+                    pos = torch.arange(T, device=device).unsqueeze(0)
+                    ans_mask = pos >= ans_starts.unsqueeze(1)
 
-                elif mask_type == 'lsb':
-                    t_ratio = torch.rand(B, device=device)
-                    m = torch.zeros(B, T, dtype=torch.bool, device=device)
-                    for bi in range(B):
-                        a_s = ans_starts[bi].item()
-                        a_pos = list(range(a_s, min(a_s + ANS_LEN, T)))
-                        na = len(a_pos)
-                        nm = max(1, int(math.ceil(t_ratio[bi].item() * na)))
-                        if fmt == 'plain':
-                            for p in a_pos[:nm]: m[bi, p] = True
-                        else:
-                            for p in a_pos[na-nm:]: m[bi, p] = True
+                    if mask_type == 'random':
+                        t_ratio = torch.rand(B, device=device)
+                        m_probs = t_ratio.unsqueeze(1) * ans_mask.float()
+                        m = torch.bernoulli(m_probs).bool()
+                        no_m = ~(m.any(dim=1))
+                        for bi in no_m.nonzero(as_tuple=True)[0]:
+                            v = ans_mask[bi].nonzero(as_tuple=True)[0]
+                            if len(v) > 0: m[bi, v[torch.randint(len(v),(1,))]] = True
 
-                elif mask_type == 'msb':
-                    # Anti-oracle: unmask MSB first (opposite of 'lsb')
-                    t_ratio = torch.rand(B, device=device)
-                    m = torch.zeros(B, T, dtype=torch.bool, device=device)
-                    for bi in range(B):
-                        a_s = ans_starts[bi].item()
-                        a_pos = list(range(a_s, min(a_s + ANS_LEN, T)))
-                        na = len(a_pos)
-                        nm = max(1, int(math.ceil(t_ratio[bi].item() * na)))
-                        if fmt == 'plain':
-                            for p in a_pos[na-nm:]: m[bi, p] = True
-                        else:
-                            for p in a_pos[:nm]: m[bi, p] = True
-
-                elif mask_type == 'confidence':
-                    # PUMA-style: mask positions the model is least
-                    # confident about (= unmask high-confidence first).
-                    # Probe in eval mode (no dropout noise) for clean ranking.
-                    xm_probe = ids.clone()
-                    for bi in range(B):
-                        a_s = ans_starts[bi].item()
-                        xm_probe[bi, a_s:min(a_s + ANS_LEN, T)] = mask_id
-                    model.eval()
-                    with torch.no_grad():
-                        logits_probe = model(xm_probe)
-                    model.train()
-
-                    t_ratio = torch.rand(B, device=device)
-                    m = torch.zeros(B, T, dtype=torch.bool, device=device)
-                    for bi in range(B):
-                        a_s = ans_starts[bi].item()
-                        a_pos = list(range(a_s, min(a_s + ANS_LEN, T)))
-                        na = len(a_pos)
-                        nm = max(1, int(math.ceil(t_ratio[bi].item() * na)))
-                        # rank by confidence (ascending) → mask least confident
-                        # Exclude MASK token from confidence to avoid bias
-                        confs = []
-                        for p in a_pos:
-                            lp = logits_probe[bi, p].clone()
-                            lp[mask_id] = -float('inf')
-                            confs.append(F.softmax(lp, dim=-1).max().item())
-                        ranked = sorted(range(na), key=lambda k: confs[k])
-                        for k in range(nm):
-                            m[bi, a_pos[ranked[k]]] = True
-
-                elif mask_type == 'puma':
-                    # PUMA teacher-forced chain: iteratively unmask the
-                    # most confident position with ground truth, re-evaluating
-                    # after each reveal. This captures cascading confidence
-                    # (e.g. revealing LSB carry raises MSB confidence).
-                    # Then sample one intermediate state per sample.
-                    model.eval()
-                    with torch.no_grad():
-                        xm_chain = ids.clone()
-                        still_masked = torch.zeros(B, T, dtype=torch.bool, device=device)
+                    elif mask_type == 'lsb':
+                        t_ratio = torch.rand(B, device=device)
+                        m = torch.zeros(B, T, dtype=torch.bool, device=device)
                         for bi in range(B):
                             a_s = ans_starts[bi].item()
-                            a_end = min(a_s + ANS_LEN, T)
-                            xm_chain[bi, a_s:a_end] = mask_id
-                            still_masked[bi, a_s:a_end] = True
-                        # chain_masks[s] = mask after s positions revealed
-                        # [0] = all masked (ANS_LEN), [ANS_LEN] = none masked
-                        chain_masks = [still_masked.clone()]
-                        for _ in range(ANS_LEN):
-                            logits_c = model(xm_chain)
-                            for bi in range(B):
-                                mpos = still_masked[bi].nonzero(as_tuple=True)[0]
-                                if len(mpos) == 0: continue
-                                best_p, best_c = mpos[0].item(), -1.0
-                                for p in mpos:
-                                    lp = logits_c[bi, p].clone()
-                                    lp[mask_id] = -float('inf')
-                                    c = F.softmax(lp, dim=-1).max().item()
-                                    if c > best_c:
-                                        best_c = c
-                                        best_p = p.item()
-                                xm_chain[bi, best_p] = ids[bi, best_p]
-                                still_masked[bi, best_p] = False
-                            chain_masks.append(still_masked.clone())
-                    model.train()
-                    # Sample one state per sample: uniform over steps 0..ANS_LEN-1
-                    # (step 0 = all masked, step ANS_LEN-1 = 1 remaining)
-                    step_idx = torch.randint(0, ANS_LEN, (B,))
-                    m = torch.zeros(B, T, dtype=torch.bool, device=device)
-                    for bi in range(B):
-                        m[bi] = chain_masks[step_idx[bi].item()][bi]
+                            a_pos = list(range(a_s, min(a_s + ANS_LEN, T)))
+                            na = len(a_pos)
+                            nm = max(1, int(math.ceil(t_ratio[bi].item() * na)))
+                            if fmt == 'plain':
+                                for p in a_pos[:nm]: m[bi, p] = True
+                            else:
+                                for p in a_pos[na-nm:]: m[bi, p] = True
 
-                xm = ids.clone(); xm[m] = mask_id
-                logits = model(xm)
-                if m.sum() == 0: it += 1; continue
-                loss = F.cross_entropy(logits[m], ids[m])
-                tg += m.sum().item()
+                    elif mask_type == 'msb':
+                        # Anti-oracle: unmask MSB first (opposite of 'lsb')
+                        t_ratio = torch.rand(B, device=device)
+                        m = torch.zeros(B, T, dtype=torch.bool, device=device)
+                        for bi in range(B):
+                            a_s = ans_starts[bi].item()
+                            a_pos = list(range(a_s, min(a_s + ANS_LEN, T)))
+                            na = len(a_pos)
+                            nm = max(1, int(math.ceil(t_ratio[bi].item() * na)))
+                            if fmt == 'plain':
+                                for p in a_pos[na-nm:]: m[bi, p] = True
+                            else:
+                                for p in a_pos[:nm]: m[bi, p] = True
 
-            optimizer.zero_grad()
-            loss.backward()
-            nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
-            optimizer.step()
+                    elif mask_type == 'confidence':
+                        # Single-probe adaptive: fully-masked → rank → mask bottom
+                        xm_probe = ids.clone()
+                        for bi in range(B):
+                            a_s = ans_starts[bi].item()
+                            xm_probe[bi, a_s:min(a_s + ANS_LEN, T)] = mask_id
+                        model.eval()
+                        with torch.no_grad():
+                            logits_probe = model(xm_probe)
+                        model.train()
 
-            epoch_loss += loss.item()
-            epoch_n += 1
-            it += 1
+                        t_ratio = torch.rand(B, device=device)
+                        m = torch.zeros(B, T, dtype=torch.bool, device=device)
+                        for bi in range(B):
+                            a_s = ans_starts[bi].item()
+                            a_pos = list(range(a_s, min(a_s + ANS_LEN, T)))
+                            na = len(a_pos)
+                            nm = max(1, int(math.ceil(t_ratio[bi].item() * na)))
+                            lp = logits_probe[bi, torch.tensor(a_pos, device=device)].clone()
+                            lp[:, mask_id] = -float('inf')
+                            confs = F.softmax(lp, dim=-1).max(dim=-1).values
+                            ranked = confs.argsort()  # ascending
+                            for k in range(nm):
+                                m[bi, a_pos[ranked[k].item()]] = True
+
+                    xm = ids.clone(); xm[m] = mask_id
+                    logits = model(xm)
+                    if m.sum() == 0: it += 1; continue
+                    loss = F.cross_entropy(logits[m], ids[m])
+                    tg += m.sum().item()
+
+                optimizer.zero_grad()
+                loss.backward()
+                nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
+                optimizer.step()
+
+                epoch_loss += loss.item()
+                epoch_n += 1
+                it += 1
 
         # ── End of epoch ──
         avg_loss = epoch_loss / max(epoch_n, 1)
@@ -809,7 +823,7 @@ def _fk(obj, fmt, mt='', dp=''):
     return f"{obj}_{fmt}_{mt}_{dp}"
 
 
-def make_figures(all_dyn, all_final, all_partial):
+def make_figures(all_dyn, all_final):
     figs = {}
     cmap = plt.cm.coolwarm
 
@@ -975,25 +989,6 @@ def make_figures(all_dyn, all_final, all_partial):
             fig.suptitle(f'Decode Order — {fmt}', fontsize=13, y=1.02)
             fig.tight_layout(); figs[f'decode_ord_{fmt}'] = fig
 
-        # ── Fig 7: Partial mask ──
-        for mt in MASK_TYPES:
-            key = _fk('diffusion', fmt, mt, 'confidence')
-            pcd = all_partial.get(key)
-            if not pcd: continue
-            fracs = sorted(pcd.keys())
-            fig, axes = plt.subplots(1, 2, figsize=(14, 5))
-            for ax, m, yl in [(axes[0],'pos_conf','Confidence'),(axes[1],'pos_acc','Accuracy')]:
-                for f in fracs:
-                    vals = [v if v is not None else float('nan') for v in pcd[f][m]]
-                    ax.plot(range(ANS_LEN), vals, '-o', ms=3,
-                            label=f'mask={f:.0%}', alpha=0.8)
-                ax.set_xticks(range(ANS_LEN)); ax.set_xticklabels(labels, fontsize=7)
-                ax.set_ylabel(yl)
-                if m=='pos_acc': ax.set_ylim(-0.05, 1.05)
-                ax.legend(fontsize=6); ax.grid(alpha=0.3)
-            fig.suptitle(f'Partial Mask — {fmt}, mask={mt}', fontsize=12, y=1.05)
-            fig.tight_layout(); figs[f'partial_{fmt}_{mt}'] = fig
-
         # ── Fig 8: Training loss ──
         fig, ax = plt.subplots(figsize=(10, 6))
         for obj, mt in conds:
@@ -1121,6 +1116,74 @@ def make_figures(all_dyn, all_final, all_partial):
             ax.legend(); ax.grid(alpha=0.3, axis='y')
             fig.tight_layout(); figs[f'carry_out_{fmt}'] = fig
 
+        # ── Fig 12: Per-position gen accuracy evolution ──
+        for obj, mt in conds:
+            key = _fk(obj, fmt, mt, 'confidence')
+            dyn = all_dyn.get(key)
+            if not dyn or not dyn.get('gen_checkpoints'): continue
+            gc = dyn['gen_checkpoints']
+            dp_key = 'ar' if obj == 'ar' else 'confidence'
+            gcs = [g for g in gc if dp_key in g.get('gen_pos_acc', {})]
+            if not gcs: continue
+            fig, ax = plt.subplots(figsize=(10, 5))
+            xs = [g['epoch'] for g in gcs]
+            for j in range(ANS_LEN):
+                ys = [g['gen_pos_acc'][dp_key][j] for g in gcs]
+                ax.plot(xs, ys, '-o', color=pc(j), label=labels[j], ms=3, lw=1.5)
+            ax.set_xlabel('Epoch'); ax.set_ylabel('Gen. Position Accuracy')
+            ax.set_ylim(-0.05, 1.05)
+            ck = _ck(obj, mt)
+            ax.set_title(f'{ck} — Per-Position Gen Accuracy ({fmt})')
+            ax.legend(fontsize=5, ncol=3); ax.grid(alpha=0.3)
+            fig.tight_layout(); figs[f'gen_pos_evo_{fmt}_{ck}'] = fig
+
+        # ── Fig 13: Decode concordance evolution ──
+        if dconds:
+            fig, ax = plt.subplots(figsize=(10, 5))
+            for mt, key in dconds:
+                dyn = all_dyn[key]
+                gc = dyn.get('gen_checkpoints', [])
+                dp = 'confidence'
+                xs = [g['epoch'] for g in gc if dp in g.get('concordance', {})]
+                ys = [g['concordance'][dp] for g in gc if dp in g.get('concordance', {})]
+                if xs:
+                    ck = _ck('diffusion', mt)
+                    ax.plot(xs, ys, '-o', color=COLORS.get(ck+'con', COLORS.get(ck, '#333')),
+                            label=f'mask={mt}', ms=3, lw=2, alpha=0.8)
+            ax.axhline(0.5, color='grey', ls=':', lw=1, alpha=0.5, label='random')
+            ax.set_xlabel('Epoch'); ax.set_ylabel('Pairwise Concordance (LSB-first)')
+            ax.set_ylim(-0.05, 1.05); ax.set_title(f'Decode Order Evolution — {fmt}')
+            ax.legend(fontsize=7); ax.grid(alpha=0.3)
+            fig.tight_layout(); figs[f'concordance_evo_{fmt}'] = fig
+
+        # ── Fig 14: Carry-out MSB gen accuracy evolution ──
+        msb_j = 0 if fmt == 'plain' else ANS_LEN - 1
+        fig, axes = plt.subplots(1, 2, figsize=(16, 5))
+        for ai, label_dp in enumerate([('carry-out=1', 'carry'), ('carry-out=0', 'no_carry')]):
+            title, carry_key = label_dp
+            ax = axes[ai]
+            for obj, mt in conds:
+                key = _fk(obj, fmt, mt, 'confidence')
+                dyn = all_dyn.get(key)
+                if not dyn or not dyn.get('gen_checkpoints'): continue
+                dp_key = 'ar' if obj == 'ar' else 'confidence'
+                gc = dyn['gen_checkpoints']
+                xs, ys = [], []
+                for g in gc:
+                    co = g.get('gen_carry_out', {}).get(dp_key, {})
+                    val = co.get(carry_key, [None]*ANS_LEN)[msb_j]
+                    if val is not None:
+                        xs.append(g['epoch']); ys.append(val)
+                if xs:
+                    ck = _ck(obj, mt)
+                    ax.plot(xs, ys, '-o', color=COLORS.get(ck+'con', COLORS.get(ck, '#333')),
+                            label=ck, ms=3, lw=1.5, alpha=0.8)
+            ax.set_xlabel('Epoch'); ax.set_ylabel('MSB Gen Accuracy')
+            ax.set_ylim(-0.05, 1.05); ax.set_title(f'{title} — {fmt}')
+            ax.legend(fontsize=6); ax.grid(alpha=0.3)
+        fig.suptitle(f'Carry-Out Effect on MSB During Training — {fmt}', fontsize=12, y=1.02)
+        fig.tight_layout(); figs[f'carry_out_evo_{fmt}'] = fig
+
     return figs
 
 
@@ -1145,7 +1208,7 @@ def run():
           f"= {MAX_EPOCHS * (N_TRAIN//BATCH_SIZE):,} iters")
     print(f"  Eval every {EVAL_EVERY} epochs → {MAX_EPOCHS//EVAL_EVERY} checkpoints")
 
-    all_dyn, all_final, all_partial = {}, {}, {}
+    all_dyn, all_final = {}, {}
 
     for fmt in FORMATS:
         train_data = gen_data(N_TRAIN, fmt, seed=SEED)
@@ -1174,8 +1237,6 @@ def run():
             m, d = train_with_dynamics('diffusion', tok, train_data, test_data,
                                        max_len, fmt, mask_type=mt)
             all_dyn[kb] = d
-            print(f"  Partial mask probe...")
-            all_partial[kb] = probe_partial_mask(m, tok, test_data, fmt, max_len)
 
             for dp in DECODE_POLICIES:
                 key = _fk('diffusion', fmt, mt, dp)
@@ -1192,7 +1253,7 @@ def run():
 
     # ── Figures ──
     print(f"\n{'='*70}\n  Generating figures...\n{'='*70}")
-    figs = make_figures(all_dyn, all_final, all_partial)
+    figs = make_figures(all_dyn, all_final)
 
     # ── Save ──
     sd = {'config': {'ND': ND, 'ANS_LEN': ANS_LEN, 'N_TRAIN': N_TRAIN,
@@ -1206,7 +1267,6 @@ def run():
         oa = r.get('decode_order_analysis')
         if oa: sr['decode_order'] = {kk: vv for kk, vv in oa.items() if kk != 'rank_histogram'}
         sd[f'final_{k}'] = sr
-    for k, p in all_partial.items(): sd[f'partial_{k}'] = p
     save_results(EXP_NAME, sd, figures=figs)
 
     # ── Summary ──
@@ -1267,7 +1327,7 @@ def run():
             print(f"  {_ck(obj,mt,dp):<25} {ci_s:>8}  {nc_s:>8}  {gap:>6}")
 
     plt.show()
-    return all_dyn, all_final, all_partial
+    return all_dyn, all_final
 
 if __name__ == '__main__':
     run()
