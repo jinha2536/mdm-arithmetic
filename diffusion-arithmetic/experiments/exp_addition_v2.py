@@ -119,6 +119,8 @@ def parse_args():
                    help='Skip AR baseline')
 
     # Data
+    p.add_argument('--nd', type=int, default=None,
+                   help='Number of digits (default: 8)')
     p.add_argument('--n-train', type=int, default=None)
     p.add_argument('--n-test', type=int, default=None)
 
@@ -170,6 +172,12 @@ def parse_args():
         g['DECODE_POLICIES'] = args.decode
     if args.no_ar:
         g['RUN_AR'] = False
+    # ND → recalculate derived globals
+    if args.nd is not None:
+        g['ND'] = args.nd
+        g['ANS_LEN'] = args.nd + 1
+        if args.puma_k_end is None:  # only auto-update if not explicitly set
+            g['PUMA_K_END'] = args.nd + 1
     return args
 
 
