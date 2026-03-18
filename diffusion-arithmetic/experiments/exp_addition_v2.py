@@ -58,22 +58,26 @@ from core.train_utils import (
 EXP_NAME = 'exp_addition_v2_dynamics'
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# Config
+# Config (defaults; overridden by CLI args)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 ND = 8
 ANS_LEN = ND + 1                # 9
 
+# These are defaults; parse_args() overrides them as module-level globals
 N_TRAIN = 2000
 N_TEST = 500
-
-# ── Training (epoch-based) ──
-BATCH_SIZE = 200                # 2000 / 200 = 10 batches/epoch
-MAX_EPOCHS = 1500               # fixed budget, no early stopping
-EVAL_EVERY = 50                 # probe eval every 50 epochs
-LOG_EVERY = 20                  # print train loss every 20 epochs
+BATCH_SIZE = 200
+MAX_EPOCHS = 1500
+EVAL_EVERY = 50
+LOG_EVERY = 20
+GEN_EVAL_EVERY = 200
+GEN_EVAL_N = 500
+THRESHOLD = 0.99
 
 FORMATS = ['plain', 'reverse']
+MASK_TYPES = ['random', 'lsb', 'confidence', 'msb', 'puma']
+DECODE_POLICIES = ['confidence', 'lsb']
 
 # Architecture
 N_LAYER = 6
@@ -88,19 +92,85 @@ MIN_LR = 1e-4
 WARMUP_EPOCHS = 10
 GRAD_CLIP = 1.0
 
-MASK_TYPES = ['random', 'lsb', 'confidence', 'msb', 'puma']
-DECODE_POLICIES = ['confidence', 'lsb']
-
-GEN_EVAL_EVERY = 200            # generation eval (expensive) frequency
-GEN_EVAL_N = 500                # subset size for generation tracking
-THRESHOLD = 0.99                # per-position "learned" threshold
-
 # PUMA-specific
-PUMA_TAU = 0.9                  # confidence threshold for fast-forwarding
-PUMA_K_START = 3                # initial chain stages (short chains early)
-PUMA_K_END = ANS_LEN            # final chain stages
+PUMA_TAU = 0.9
+PUMA_K_START = 3
+PUMA_K_END = ANS_LEN
 
 SEED = 42
+
+# Whether to run AR baseline
+RUN_AR = True
+
+
+def parse_args():
+    """Parse CLI args and update module-level config globals."""
+    import argparse
+    p = argparse.ArgumentParser(description='Addition learning dynamics experiment')
+
+    # Experiment scope
+    p.add_argument('--formats', nargs='+', default=None,
+                   help='Formats to run (default: plain reverse)')
+    p.add_argument('--masks', nargs='+', default=None,
+                   help='Mask types to run (default: all)')
+    p.add_argument('--decode', nargs='+', default=None,
+                   help='Decode policies (default: confidence lsb)')
+    p.add_argument('--no-ar', action='store_true',
+                   help='Skip AR baseline')
+
+    # Data
+    p.add_argument('--n-train', type=int, default=None)
+    p.add_argument('--n-test', type=int, default=None)
+
+    # Training
+    p.add_argument('--epochs', type=int, default=None)
+    p.add_argument('--batch-size', type=int, default=None)
+    p.add_argument('--eval-every', type=int, default=None)
+    p.add_argument('--gen-eval-every', type=int, default=None)
+
+    # Architecture
+    p.add_argument('--n-layer', type=int, default=None)
+    p.add_argument('--n-head', type=int, default=None)
+    p.add_argument('--n-embd', type=int, default=None)
+    p.add_argument('--dropout', type=float, default=None)
+
+    # PUMA
+    p.add_argument('--puma-tau', type=float, default=None)
+    p.add_argument('--puma-k-start', type=int, default=None)
+    p.add_argument('--puma-k-end', type=int, default=None)
+
+    # Tag for save directory
+    p.add_argument('--tag', type=str, default='',
+                   help='Suffix for experiment name (e.g. "puma_small")')
+    p.add_argument('--seed', type=int, default=None)
+
+    args = p.parse_args()
+
+    # Update globals
+    g = globals()
+    mapping = {
+        'n_train': 'N_TRAIN', 'n_test': 'N_TEST', 'epochs': 'MAX_EPOCHS',
+        'batch_size': 'BATCH_SIZE', 'eval_every': 'EVAL_EVERY',
+        'gen_eval_every': 'GEN_EVAL_EVERY',
+        'n_layer': 'N_LAYER', 'n_head': 'N_HEAD', 'n_embd': 'N_EMBD',
+        'dropout': 'DROPOUT', 'puma_tau': 'PUMA_TAU',
+        'puma_k_start': 'PUMA_K_START', 'puma_k_end': 'PUMA_K_END',
+        'seed': 'SEED',
+    }
+    for arg_name, global_name in mapping.items():
+        val = getattr(args, arg_name)
+        if val is not None:
+            g[global_name] = val
+
+    if args.formats:
+        g['FORMATS'] = args.formats
+    if args.masks:
+        g['MASK_TYPES'] = args.masks
+    if args.decode:
+        g['DECODE_POLICIES'] = args.decode
+    if args.no_ar:
+        g['RUN_AR'] = False
+    return args
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -1191,9 +1261,13 @@ def make_figures(all_dyn, all_final):
 # Main
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-def run():
+def run(tag=''):
+    exp_name = EXP_NAME + (f'_{tag}' if tag else '')
+
     print("=" * 70)
-    print("  EXP 2: 8-Digit Addition — Learning Dynamics")
+    print(f"  EXP 2: 8-Digit Addition — Learning Dynamics")
+    if tag:
+        print(f"  Tag: {tag}")
     print("=" * 70)
     mount_drive()
     torch.manual_seed(SEED)
@@ -1202,11 +1276,13 @@ def run():
     sample = _fmt_plain(12345678, 87654321)
     max_len = len(tok.encode(sample))
     print(f"  ND={ND}, ANS_LEN={ANS_LEN}, max_len={max_len}")
-    print(f"  Plain:   {sample}")
-    print(f"  Reverse: {_fmt_reverse(12345678, 87654321)}")
-    print(f"  Budget:  {MAX_EPOCHS} epochs × {N_TRAIN//BATCH_SIZE} batches "
+    print(f"  Model: {N_LAYER}L/{N_HEAD}H/{N_EMBD}D, dropout={DROPOUT}")
+    print(f"  Data:  N_TRAIN={N_TRAIN}, N_TEST={N_TEST}")
+    print(f"  Budget: {MAX_EPOCHS} epochs × {N_TRAIN//BATCH_SIZE} batches "
           f"= {MAX_EPOCHS * (N_TRAIN//BATCH_SIZE):,} iters")
-    print(f"  Eval every {EVAL_EVERY} epochs → {MAX_EPOCHS//EVAL_EVERY} checkpoints")
+    print(f"  Eval every {EVAL_EVERY} epochs, gen eval every {GEN_EVAL_EVERY} epochs")
+    print(f"  Formats: {FORMATS}  Masks: {MASK_TYPES}  Decode: {DECODE_POLICIES}")
+    print(f"  AR: {'yes' if RUN_AR else 'skip'}")
 
     all_dyn, all_final = {}, {}
 
@@ -1221,14 +1297,15 @@ def run():
         print(f"  [{fmt}] test  N={len(test_data)} (full {ND}-digit), carries={dict(sorted(cd_test.items()))}")
 
         # ── AR ──
-        key = _fk('ar', fmt)
-        print(f"\n{'━'*60}\n▶ {key}\n{'━'*60}")
-        m, d = train_with_dynamics('ar', tok, train_data, test_data, max_len, fmt)
-        all_dyn[key] = d
-        r = final_evaluate(m, tok, test_data, 'ar', fmt)
-        all_final[key] = r
-        print(f"  Final gen acc: {r['accuracy']:.4f}")
-        del m; torch.cuda.empty_cache() if torch.cuda.is_available() else None
+        if RUN_AR:
+            key = _fk('ar', fmt)
+            print(f"\n{'━'*60}\n▶ {key}\n{'━'*60}")
+            m, d = train_with_dynamics('ar', tok, train_data, test_data, max_len, fmt)
+            all_dyn[key] = d
+            r = final_evaluate(m, tok, test_data, 'ar', fmt)
+            all_final[key] = r
+            print(f"  Final gen acc: {r['accuracy']:.4f}")
+            del m; torch.cuda.empty_cache() if torch.cuda.is_available() else None
 
         # ── Diffusion ──
         for mt in MASK_TYPES:
@@ -1256,18 +1333,24 @@ def run():
     figs = make_figures(all_dyn, all_final)
 
     # ── Save ──
-    sd = {'config': {'ND': ND, 'ANS_LEN': ANS_LEN, 'N_TRAIN': N_TRAIN,
-                     'N_TEST': N_TEST, 'MAX_EPOCHS': MAX_EPOCHS, 'BATCH_SIZE': BATCH_SIZE}}
-    for k, d in all_dyn.items():
-        sd[f'dyn_{k}'] = {'checkpoints': d['checkpoints'],
-                          'gen_checkpoints': d.get('gen_checkpoints', []),
-                          'train_loss': d['train_loss']}
+    sd = {'config': {
+        'ND': ND, 'ANS_LEN': ANS_LEN, 'N_TRAIN': N_TRAIN,
+        'N_TEST': N_TEST, 'MAX_EPOCHS': MAX_EPOCHS, 'BATCH_SIZE': BATCH_SIZE,
+        'N_LAYER': N_LAYER, 'N_HEAD': N_HEAD, 'N_EMBD': N_EMBD,
+        'DROPOUT': DROPOUT, 'MASK_TYPES': MASK_TYPES,
+        'DECODE_POLICIES': DECODE_POLICIES, 'FORMATS': FORMATS,
+        'RUN_AR': RUN_AR, 'tag': tag,
+    }}
+    for k, d_val in all_dyn.items():
+        sd[f'dyn_{k}'] = {'checkpoints': d_val['checkpoints'],
+                          'gen_checkpoints': d_val.get('gen_checkpoints', []),
+                          'train_loss': d_val['train_loss']}
     for k, r in all_final.items():
         sr = {kk: vv for kk, vv in r.items() if kk != 'decode_order_analysis'}
         oa = r.get('decode_order_analysis')
         if oa: sr['decode_order'] = {kk: vv for kk, vv in oa.items() if kk != 'rank_histogram'}
         sd[f'final_{k}'] = sr
-    save_results(EXP_NAME, sd, figures=figs)
+    save_results(exp_name, sd, figures=figs)
 
     # ── Summary ──
     print(f"\n{'='*70}\n  SUMMARY\n{'='*70}")
@@ -1276,7 +1359,8 @@ def run():
         print(f"\n  ━━ {fmt} ━━")
         print(f"  {'Condition':<25} {'Acc':>6}  {'TG':>12}  Position Accuracy")
         print(f"  {'─'*90}")
-        all_conds = [('ar','','')]
+        all_conds = []
+        if RUN_AR: all_conds.append(('ar','',''))
         for mt in MASK_TYPES:
             for dp in DECODE_POLICIES:
                 all_conds.append(('diffusion', mt, dp))
@@ -1291,43 +1375,10 @@ def run():
             print(f"  {_ck(obj,mt,dp):<25} {r['accuracy']:>6.3f}  {tg:>12,}  "
                   f"{' '.join(f'{v:.2f}' for v in pa)}")
 
-    # ── Learning order (probe accuracy) ──
-    print(f"\n  LEARNING ORDER (epoch to {THRESHOLD} per-pos probe acc)")
-    for fmt in FORMATS:
-        labs = _pos_labels(fmt)
-        print(f"\n  [{fmt}]")
-        for obj, mt in [('ar','')]+[('diffusion',mt) for mt in MASK_TYPES]:
-            key = _fk(obj, fmt, mt, 'confidence')
-            dyn = all_dyn.get(key)
-            if not dyn: continue
-            ft = {}
-            for j in range(ANS_LEN):
-                for c in dyn['checkpoints']:
-                    if c['pos_acc'][j] >= THRESHOLD: ft[j] = c['epoch']; break
-            parts = [f"{labs[j]}@ep{ft[j]}" if j in ft else f"{labs[j]}@-"
-                     for j in range(ANS_LEN)]
-            print(f"    {_ck(obj,mt):<20} {' '.join(parts)}")
-
-    # ── Carry-out effect on MSB ──
-    print(f"\n  CARRY-OUT EFFECT (MSB gen accuracy)")
-    for fmt in FORMATS:
-        msb_j = 0 if fmt == 'plain' else ANS_LEN - 1
-        print(f"\n  [{fmt}] MSB = position {msb_j}")
-        print(f"  {'Condition':<25} {'carry=1':>8}  {'carry=0':>8}  {'gap':>6}")
-        print(f"  {'─'*55}")
-        for obj, mt, dp in all_conds:
-            key = _fk(obj, fmt, mt, dp)
-            r = all_final.get(key)
-            if not r: continue
-            ci = r.get('pos_acc_carry_in', [None]*ANS_LEN)[msb_j]
-            nc = r.get('pos_acc_no_carry', [None]*ANS_LEN)[msb_j]
-            ci_s = f"{ci:.3f}" if ci is not None else "  n/a"
-            nc_s = f"{nc:.3f}" if nc is not None else "  n/a"
-            gap = f"{ci-nc:+.3f}" if ci is not None and nc is not None else "  n/a"
-            print(f"  {_ck(obj,mt,dp):<25} {ci_s:>8}  {nc_s:>8}  {gap:>6}")
-
     plt.show()
     return all_dyn, all_final
 
+
 if __name__ == '__main__':
-    run()
+    args = parse_args()
+    run(tag=args.tag)
