@@ -382,8 +382,28 @@ def probe_per_position(model, tokenizer, test_samples, objective,
         'overall_loss': (L.sum()/s.sum()).item(),
         'overall_acc': (C.sum()/s.sum()).item(),
     }
-    # Confidence ranking is only meaningful for diffusion (fully-masked probe).
-    # AR's pos_conf is teacher-forced confidence — a different quantity entirely.
+    # Confidence-derived decode ordering metrics (diffusion only).
+    # From fully-masked probe confidence, compute what ordering the model
+    # would choose if it decoded right now via confidence policy.
+    if objective == 'diffusion':
+        # Confidence ranking: highest confidence = decoded first (rank 0)
+        conf_ranking = sorted(range(ANS_LEN), key=lambda j: pos_conf[j], reverse=True)
+        result['conf_ranking'] = conf_ranking
+        # Pairwise concordance with LSB-first oracle
+        # (same logic as _analyse_orders but from probe confidence, not generation)
+        conc = 0
+        for i in range(ANS_LEN):
+            for j in range(i + 1, ANS_LEN):
+                ri = conf_ranking.index(i)  # rank of position i
+                rj = conf_ranking.index(j)  # rank of position j
+                if fmt == 'plain':
+                    conc += int(rj < ri)   # j (more LSB) decoded first
+                else:
+                    conc += int(ri < rj)   # i (more LSB) decoded first
+        n_pairs = ANS_LEN * (ANS_LEN - 1) // 2
+        result['conf_concordance'] = conc / n_pairs
+        # Confidence spread: max - min (0 = uniform, high = strong ordering)
+        result['conf_spread'] = max(pos_conf) - min(pos_conf)
     return result
 
 
@@ -466,7 +486,10 @@ def train_with_dynamics(
         acc_str = ' '.join(f"{labs[j]}={probe['pos_acc'][j]:.2f}"
                            for j in range(ANS_LEN))
         print(f"    [eval ep {epoch:4d}] loss={probe['overall_loss']:.4f} "
-              f"acc={probe['overall_acc']:.4f} | {time.time()-t0:.0f}s")
+              f"acc={probe['overall_acc']:.4f}"
+              + (f" conc={probe['conf_concordance']:.3f} spread={probe['conf_spread']:.4f}"
+                 if 'conf_concordance' in probe else '')
+              + f" | {time.time()-t0:.0f}s")
         print(f"      {acc_str}")
 
         # Generation accuracy tracking (less frequent, more expensive)
@@ -1009,6 +1032,61 @@ def make_figures(all_dyn, all_final):
                 ax.legend(fontsize=5, ncol=3, loc='lower right'); ax.grid(alpha=0.3)
             fig.suptitle(f'Confidence Evolution — {fmt}', fontsize=13, y=1.02)
             fig.tight_layout(); figs[f'conf_evo_{fmt}'] = fig
+
+        # ── Fig 4b: Probe confidence concordance + spread evolution ──
+        if dconds:
+            fig, axes = plt.subplots(1, 2, figsize=(16, 5))
+
+            # Left: Probe conf concordance (dense) vs actual decode concordance (sparse)
+            ax = axes[0]
+            for mt, key in dconds:
+                dyn = all_dyn[key]
+                ck = _ck('diffusion', mt)
+                col = COLORS.get(ck+'con', COLORS.get(ck, '#333'))
+                # Dense: from probe checkpoints (every EVAL_EVERY)
+                xs_p = [c['epoch'] for c in dyn['checkpoints']
+                        if 'conf_concordance' in c]
+                ys_p = [c['conf_concordance'] for c in dyn['checkpoints']
+                        if 'conf_concordance' in c]
+                if xs_p:
+                    ax.plot(xs_p, ys_p, '-', color=col, label=f'{mt} (probe)',
+                            lw=1.5, alpha=0.7)
+                # Sparse: from gen_checkpoints (every GEN_EVAL_EVERY)
+                gc = dyn.get('gen_checkpoints', [])
+                xs_g = [g['epoch'] for g in gc
+                        if 'confidence' in g.get('concordance', {})]
+                ys_g = [g['concordance']['confidence'] for g in gc
+                        if 'confidence' in g.get('concordance', {})]
+                if xs_g:
+                    ax.plot(xs_g, ys_g, 'o', color=col, ms=6, alpha=0.9,
+                            label=f'{mt} (gen)')
+            ax.axhline(0.5, color='grey', ls=':', lw=1, alpha=0.5)
+            ax.set_xlabel('Epoch')
+            ax.set_ylabel('Pairwise Concordance (LSB-first)')
+            ax.set_ylim(-0.05, 1.05)
+            ax.set_title('Probe vs Actual Decode Concordance')
+            ax.legend(fontsize=5, ncol=2); ax.grid(alpha=0.3)
+
+            # Right: Confidence spread (max - min) over epochs
+            ax = axes[1]
+            for mt, key in dconds:
+                dyn = all_dyn[key]
+                ck = _ck('diffusion', mt)
+                col = COLORS.get(ck+'con', COLORS.get(ck, '#333'))
+                xs = [c['epoch'] for c in dyn['checkpoints']
+                      if 'conf_spread' in c]
+                ys = [c['conf_spread'] for c in dyn['checkpoints']
+                      if 'conf_spread' in c]
+                if xs:
+                    ax.plot(xs, ys, '-', color=col, label=f'mask={mt}',
+                            lw=1.5, alpha=0.8)
+            ax.set_xlabel('Epoch')
+            ax.set_ylabel('Confidence Spread (max − min)')
+            ax.set_title('Confidence Ordering Strength')
+            ax.legend(fontsize=6); ax.grid(alpha=0.3)
+
+            fig.suptitle(f'Confidence Ordering Dynamics — {fmt}', fontsize=13, y=1.02)
+            fig.tight_layout(); figs[f'conf_ordering_{fmt}'] = fig
 
         # ── Fig 5: Final per-position accuracy ──
         fig, axes = plt.subplots(1, 3, figsize=(21, 5))
