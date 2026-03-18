@@ -21,7 +21,7 @@
 
   Conditions (×2 formats = 14 total):
     AR, Diff-random-conf, Diff-random-lsb,
-    Diff-lsb-conf, Diff-lsb-lsb,
+    Diff-oracle_lsb-conf, Diff-oracle_lsb-lsb,    ← LSB-first oracle (PUMA streaming)
     Diff-confidence-conf, Diff-confidence-lsb,   ← single-probe adaptive
     Diff-msb-conf, Diff-msb-lsb                  ← anti-oracle baseline
     Diff-puma-conf, Diff-puma-lsb                 ← teacher-forced chain
@@ -76,7 +76,7 @@ GEN_EVAL_N = 500
 THRESHOLD = 0.99
 
 FORMATS = ['plain', 'reverse']
-MASK_TYPES = ['random', 'lsb', 'confidence', 'msb', 'puma']
+MASK_TYPES = ['random', 'oracle_lsb', 'confidence', 'msb', 'puma']
 DECODE_POLICIES = ['confidence', 'lsb']
 
 # Architecture
@@ -237,6 +237,39 @@ def _carry_at_answer_pos(a, b, fmt):
             if k == 0: ci[k] = False
             elif k-1 < len(flags): ci[k] = flags[k-1]
     return ci
+
+
+def _gkp_at_answer_pos(a, b, fmt):
+    """Classify each answer position as generate/kill/propagate.
+    Based on digit pair sum (without carry):
+      generate (g): a_j + b_j >= 10 → always produces carry
+      propagate (p): a_j + b_j == 9 → carry_out = carry_in
+      kill (k): a_j + b_j <= 8 → never produces carry
+    MSB (carry-out) position is classified as 'carry_out'.
+    Returns list of ANS_LEN strings.
+    """
+    a_s, b_s = _pad(a, ND), _pad(b, ND)
+    # digit_gkp[i] for i in 0..ND-1 (LSB=0)
+    digit_gkp = []
+    for i in range(ND - 1, -1, -1):
+        s = int(a_s[i]) + int(b_s[i])
+        if s >= 10:
+            digit_gkp.append('g')
+        elif s == 9:
+            digit_gkp.append('p')
+        else:
+            digit_gkp.append('k')
+    # digit_gkp[0]=LSB pair, digit_gkp[ND-1]=MSB pair
+    out = ['?'] * ANS_LEN
+    if fmt == 'plain':
+        out[0] = 'carry_out'
+        for j in range(ND):
+            out[ND - j] = digit_gkp[j]
+    else:
+        out[ANS_LEN - 1] = 'carry_out'
+        for j in range(ND):
+            out[j] = digit_gkp[j]
+    return out
 
 def build_tok():
     return CharTokenizer(list('0123456789+='), {'mask': 'M', 'pad': 'P'})
@@ -527,6 +560,10 @@ def train_with_dynamics(
                     if oa:
                         gen_entry.setdefault('concordance', {})[dp] = oa['pairwise_concordance']
                         gen_entry.setdefault('mean_rank', {})[dp] = oa['mean_rank']
+                        if 'gkp_mean_rank' in oa:
+                            gen_entry.setdefault('gkp_mean_rank', {})[dp] = oa['gkp_mean_rank']
+                        if 'easy_before_hard' in oa:
+                            gen_entry.setdefault('easy_before_hard', {})[dp] = oa['easy_before_hard']
                     ga_strs.append(f"{dp}={r['accuracy']:.3f}")
                 print(f"      [gen] {' '.join(ga_strs)}")
             dynamics['gen_checkpoints'].append(gen_entry)
@@ -534,21 +571,20 @@ def train_with_dynamics(
     # ── Eval at epoch 0 ──
     model.eval(); _do_eval(0); model.train()
 
-    # ── PUMA streaming buffer (only used if mask_type == 'puma') ──
+    # ── Streaming buffer (for mask_type in {puma, oracle_lsb}) ──
+    uses_streaming = mask_type in ('puma', 'oracle_lsb')
     puma_x0 = puma_z = puma_ans = puma_stage = None
-    puma_pool_idx = 0  # index into pre-encoded training data for refreshing
-    if mask_type == 'puma':
-        # Pre-encode all training data for fast refresh
+    puma_pool_idx = 0
+    if uses_streaming:
         puma_all_ids, puma_all_ans = encode_samples(train_samples, tokenizer, max_len)
         puma_all_ids = puma_all_ids.to(device)
         puma_all_ans = puma_all_ans.to(device)
-        puma_perm = torch.randperm(len(train_samples))  # shuffle order
+        puma_perm = torch.randperm(len(train_samples))
 
     def _puma_refresh(indices):
-        """Initialize or refresh PUMA buffer entries from training pool."""
+        """Initialize or refresh streaming buffer entries."""
         nonlocal puma_x0, puma_z, puma_ans, puma_stage, puma_pool_idx, puma_perm
         if puma_x0 is None:
-            # First-time init: allocate full buffer
             B = len(indices)
             T = puma_all_ids.shape[1]
             puma_x0 = torch.zeros(B, T, dtype=torch.long, device=device)
@@ -568,8 +604,11 @@ def train_with_dynamics(
             puma_z[bi, a_s:min(a_s + ANS_LEN, puma_z.shape[1])] = mask_id
             puma_stage[bi] = 0
 
-    def _puma_advance(logits_det, K_cur):
-        """Advance PUMA chains using detached logits. Zero overhead."""
+    def _chain_advance(logits_det, K_cur):
+        """Advance chains. Policy depends on mask_type:
+        - puma: reveal highest-confidence positions (adaptive, zero overhead)
+        - oracle_lsb: reveal LSB-first positions (fixed order)
+        """
         nonlocal puma_z, puma_stage
         B = puma_z.shape[0]
         refresh_list = []
@@ -577,67 +616,75 @@ def train_with_dynamics(
             mpos = (puma_z[bi] == mask_id).nonzero(as_tuple=True)[0]
             if len(mpos) == 0:
                 refresh_list.append(bi); continue
-            # Vectorized confidence (excl MASK)
-            lp = logits_det[bi, mpos].clone()
-            lp[:, mask_id] = -float('inf')
-            confs = F.softmax(lp, dim=-1).max(dim=-1).values
             # How many to reveal this step
             K_rem = max(K_cur - puma_stage[bi].item(), 1)
             n_reveal = max(1, math.ceil(len(mpos) / K_rem))
-            # Threshold: also reveal positions with conf > τ
-            above_tau = confs > PUMA_TAU
-            _, topk_idx = confs.topk(min(n_reveal, len(mpos)))
-            reveal = torch.zeros(len(mpos), dtype=torch.bool, device=device)
-            reveal[topk_idx] = True
-            reveal = reveal | above_tau
-            # Reveal with ground truth
+
+            if mask_type == 'puma':
+                # Adaptive: rank by model confidence
+                lp = logits_det[bi, mpos].clone()
+                lp[:, mask_id] = -float('inf')
+                confs = F.softmax(lp, dim=-1).max(dim=-1).values
+                above_tau = confs > PUMA_TAU
+                _, topk_idx = confs.topk(min(n_reveal, len(mpos)))
+                reveal = torch.zeros(len(mpos), dtype=torch.bool, device=device)
+                reveal[topk_idx] = True
+                reveal = reveal | above_tau
+            else:
+                # Oracle LSB-first: reveal by position order
+                # plain: higher abs pos = LSB → reveal first (descending)
+                # reverse: lower abs pos = LSB → reveal first (ascending)
+                if fmt == 'plain':
+                    order = mpos.argsort(descending=True)
+                else:
+                    order = mpos.argsort(descending=False)
+                reveal = torch.zeros(len(mpos), dtype=torch.bool, device=device)
+                reveal[order[:n_reveal]] = True
+
             reveal_pos = mpos[reveal]
             puma_z[bi, reveal_pos] = puma_x0[bi, reveal_pos]
             puma_stage[bi] += 1
-            # Chain complete?
             if puma_stage[bi] >= K_cur or not (puma_z[bi] == mask_id).any():
                 refresh_list.append(bi)
         if refresh_list:
             _puma_refresh(refresh_list)
 
-    # Initialize PUMA buffer
-    if mask_type == 'puma':
+    if uses_streaming:
         _puma_refresh(list(range(BATCH_SIZE)))
 
     for epoch in range(1, MAX_EPOCHS + 1):
         epoch_loss = 0.0
         epoch_n = 0
-        # K scheduling for PUMA
-        puma_K_cur = PUMA_K_START + int((PUMA_K_END - PUMA_K_START)
-                                         * epoch / MAX_EPOCHS) if mask_type == 'puma' else 0
+        # K scheduling for streaming methods
+        if uses_streaming:
+            puma_K_cur = PUMA_K_START + int((PUMA_K_END - PUMA_K_START)
+                                             * epoch / MAX_EPOCHS)
+        else:
+            puma_K_cur = 0
 
-        if mask_type == 'puma':
-            # ── PUMA: streaming buffer iterations ──
+        if uses_streaming:
+            # ── Streaming buffer iterations (PUMA / oracle_lsb) ──
             for _ in range(bpe):
                 for pg in optimizer.param_groups:
                     pg['lr'] = get_lr(it)
-                # Current mask = wherever z has MASK tokens
                 m = (puma_z == mask_id)
                 if m.sum() == 0:
                     _puma_refresh(list(range(BATCH_SIZE)))
                     m = (puma_z == mask_id)
-                # Forward on current chain state
                 logits = model(puma_z)
                 loss = F.cross_entropy(logits[m], puma_x0[m])
                 tg += m.sum().item()
-                # Backward
                 optimizer.zero_grad()
                 loss.backward()
                 nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
                 optimizer.step()
-                # Advance chains using same logits (zero overhead)
-                _puma_advance(logits.detach(), puma_K_cur)
+                _chain_advance(logits.detach(), puma_K_cur)
 
                 epoch_loss += loss.item()
                 epoch_n += 1
                 it += 1
         else:
-            # ── Standard mask types (random/lsb/msb/confidence) ──
+            # ── Standard mask types (random/msb/confidence) ──
             for batch in loader:
                 for pg in optimizer.param_groups:
                     pg['lr'] = get_lr(it)
@@ -656,7 +703,7 @@ def train_with_dynamics(
                     loss = F.cross_entropy(logits[lm], targets[lm])
                     tg += lm.sum().item()
 
-                else:  # diffusion (non-PUMA)
+                else:  # diffusion (non-streaming)
                     pos = torch.arange(T, device=device).unsqueeze(0)
                     ans_mask = pos >= ans_starts.unsqueeze(1)
 
@@ -669,21 +716,8 @@ def train_with_dynamics(
                             v = ans_mask[bi].nonzero(as_tuple=True)[0]
                             if len(v) > 0: m[bi, v[torch.randint(len(v),(1,))]] = True
 
-                    elif mask_type == 'lsb':
-                        t_ratio = torch.rand(B, device=device)
-                        m = torch.zeros(B, T, dtype=torch.bool, device=device)
-                        for bi in range(B):
-                            a_s = ans_starts[bi].item()
-                            a_pos = list(range(a_s, min(a_s + ANS_LEN, T)))
-                            na = len(a_pos)
-                            nm = max(1, int(math.ceil(t_ratio[bi].item() * na)))
-                            if fmt == 'plain':
-                                for p in a_pos[:nm]: m[bi, p] = True
-                            else:
-                                for p in a_pos[na-nm:]: m[bi, p] = True
-
                     elif mask_type == 'msb':
-                        # Anti-oracle: unmask MSB first (opposite of 'lsb')
+                        # Anti-oracle: unmask MSB first (opposite of 'oracle_lsb')
                         t_ratio = torch.rand(B, device=device)
                         m = torch.zeros(B, T, dtype=torch.bool, device=device)
                         for bi in range(B):
@@ -815,9 +849,10 @@ def final_evaluate(model, tokenizer, test_samples, objective, fmt,
             a, b = _parse_operands(batch[i])
             pc = [ps[j]==gs[j] if j<len(ps) else False for j in range(len(gs))]
             ci = _carry_at_answer_pos(a, b, fmt)
+            gkp = _gkp_at_answer_pos(a, b, fmt)
             results.append({'correct': ps==gs, 'pos_correct': pc,
                            'n_carries': _count_carries(a, b),
-                           'carry_flags': ci})
+                           'carry_flags': ci, 'gkp': gkp})
 
     n = len(results)
     acc = sum(r['correct'] for r in results) / max(n, 1)
@@ -839,7 +874,8 @@ def final_evaluate(model, tokenizer, test_samples, objective, fmt,
     if all_orders:
         oc = torch.cat(all_orders, dim=0)
         pl = len(tokenizer.encode(test_samples[0].split('=')[0]+'='))
-        oa = _analyse_orders(oc, pl, fmt)
+        gkp_all = [r['gkp'] for r in results]
+        oa = _analyse_orders(oc, pl, fmt, gkp_all)
 
     return {'accuracy': acc, 'n_samples': n, 'position_accuracy': pos_acc,
             'carry_accuracy': carry_acc, 'decode_order_analysis': oa,
@@ -847,13 +883,13 @@ def final_evaluate(model, tokenizer, test_samples, objective, fmt,
             'pos_acc_no_carry': pos_acc_no_carry}
 
 
-def _analyse_orders(decode_orders, prefix_len, fmt):
+def _analyse_orders(decode_orders, prefix_len, fmt, gkp_per_sample=None):
     """Per-position decode rank analysis.
     Computes:
-      mean_rank:     mean decode step per position (over all samples)
-      pairwise_conc: fraction of position pairs decoded in LSB→MSB order,
-                     averaged over all 36 pairs × all samples
-      rank_histogram: (ANS_LEN, S) count matrix
+      mean_rank:        mean decode step per position (over all samples)
+      pairwise_conc:    fraction of position pairs decoded in LSB→MSB order
+      rank_histogram:   (ANS_LEN, S) count matrix
+      gkp_mean_rank:    mean decode rank by g/k/p category (if gkp provided)
     """
     N, S = decode_orders.shape
     rop = torch.full((N, ANS_LEN), float('nan'))
@@ -867,9 +903,6 @@ def _analyse_orders(decode_orders, prefix_len, fmt):
         mr.append(v.mean().item() if len(v) > 0 else -1)
 
     # Pairwise concordance with LSB-first oracle.
-    # For each pair (i, j), oracle says the more-LSB position decodes first.
-    # plain:   higher index = more LSB → oracle: j before i (for i<j)
-    # reverse: lower index  = more LSB → oracle: i before j (for i<j)
     total_conc = 0.0
     total_valid = 0
     for n in range(N):
@@ -885,14 +918,49 @@ def _analyse_orders(decode_orders, prefix_len, fmt):
                     conc += int(row[i].item() < row[j].item())
         total_conc += conc
         total_valid += 1
-    n_pairs = ANS_LEN * (ANS_LEN - 1) // 2  # 36
+    n_pairs = ANS_LEN * (ANS_LEN - 1) // 2
     pw_conc = total_conc / (total_valid * n_pairs) if total_valid > 0 else -1
 
     rh = torch.zeros(ANS_LEN, S)
     for j in range(ANS_LEN):
         for r in range(S): rh[j, r] = (rop[:, j] == r).sum()
-    return {'mean_rank': mr, 'pairwise_concordance': pw_conc,
-            'rank_histogram': rh}
+
+    result = {'mean_rank': mr, 'pairwise_concordance': pw_conc,
+              'rank_histogram': rh}
+
+    # Generate/Kill/Propagate decode rank analysis
+    if gkp_per_sample is not None and len(gkp_per_sample) >= N:
+        gkp_ranks = {'g': [], 'k': [], 'p': [], 'carry_out': []}
+        for i in range(min(N, len(gkp_per_sample))):
+            row = rop[i]
+            if row.isnan().any(): continue
+            gkp = gkp_per_sample[i]
+            for j in range(ANS_LEN):
+                cat = gkp[j]
+                if cat in gkp_ranks:
+                    gkp_ranks[cat].append(row[j].item())
+        result['gkp_mean_rank'] = {
+            cat: sum(ranks)/len(ranks) if ranks else None
+            for cat, ranks in gkp_ranks.items()
+        }
+        # Also: do easy (g/k) positions get decoded before hard (p) ones?
+        easy_before_hard = 0
+        easy_hard_total = 0
+        for i in range(min(N, len(gkp_per_sample))):
+            row = rop[i]
+            if row.isnan().any(): continue
+            gkp = gkp_per_sample[i]
+            for j1 in range(ANS_LEN):
+                for j2 in range(ANS_LEN):
+                    if j1 == j2: continue
+                    if gkp[j1] in ('g', 'k') and gkp[j2] == 'p':
+                        easy_hard_total += 1
+                        if row[j1].item() < row[j2].item():
+                            easy_before_hard += 1
+        result['easy_before_hard'] = (easy_before_hard / easy_hard_total
+                                       if easy_hard_total > 0 else None)
+
+    return result
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -907,7 +975,7 @@ def _pos_labels(fmt):
 COLORS = {
     'ar': '#e74c3c',
     'diff-ran-con': '#3498db', 'diff-ran-lsb': '#2ecc71',
-    'diff-lsb-con': '#9b59b6', 'diff-lsb-lsb': '#e67e22',
+    'diff-ora-con': '#9b59b6', 'diff-ora-lsb': '#e67e22',
     'diff-con-con': '#1abc9c', 'diff-con-lsb': '#16a085',
     'diff-msb-con': '#c0392b', 'diff-msb-lsb': '#d35400',
     'diff-pum-con': '#8e44ad', 'diff-pum-lsb': '#6c3483',
@@ -1100,15 +1168,15 @@ def make_figures(all_dyn, all_final):
         fig, axes = plt.subplots(1, 3, figsize=(21, 5))
         for ai, (title, cs) in enumerate([
             ('AR vs Diffusion (conf decode)', [('ar','',''),
-             ('diffusion','random','confidence'), ('diffusion','lsb','confidence'),
+             ('diffusion','random','confidence'), ('diffusion','oracle_lsb','confidence'),
              ('diffusion','confidence','confidence'), ('diffusion','msb','confidence'),
              ('diffusion','puma','confidence')]),
             ('Training mask comparison (conf decode)', [
-             ('diffusion','random','confidence'), ('diffusion','lsb','confidence'),
+             ('diffusion','random','confidence'), ('diffusion','oracle_lsb','confidence'),
              ('diffusion','confidence','confidence'), ('diffusion','msb','confidence'),
              ('diffusion','puma','confidence')]),
             ('LSB decode comparison', [
-             ('diffusion','random','lsb'), ('diffusion','lsb','lsb'),
+             ('diffusion','random','lsb'), ('diffusion','oracle_lsb','lsb'),
              ('diffusion','confidence','lsb'), ('diffusion','msb','lsb'),
              ('diffusion','puma','lsb')]),
         ]):
@@ -1412,6 +1480,13 @@ def run(tag=''):
                     labs = _pos_labels(fmt); mr = oa['mean_rank']
                     print(f"    LSB concordance: {oa['pairwise_concordance']:.3f}")
                     print(f"    Rank: {' '.join(f'{labs[j]}={mr[j]:.1f}' for j in range(ANS_LEN))}")
+                    gkp_mr = oa.get('gkp_mean_rank')
+                    ebh = oa.get('easy_before_hard')
+                    if gkp_mr:
+                        parts = [f"{cat}={v:.2f}" if v is not None else f"{cat}=n/a"
+                                 for cat, v in gkp_mr.items()]
+                        print(f"    GKP rank: {' '.join(parts)}"
+                              + (f"  easy→hard: {ebh:.3f}" if ebh is not None else ''))
             del m; torch.cuda.empty_cache() if torch.cuda.is_available() else None
 
     # ── Figures ──
