@@ -274,6 +274,42 @@ def _gkp_at_answer_pos(a, b, fmt):
 def build_tok():
     return CharTokenizer(list('0123456789+='), {'mask': 'M', 'pad': 'P'})
 
+
+def _carry_chain_length_at_pos(a, b, fmt):
+    """For each answer position, compute the propagate chain length
+    that must be resolved to determine carry-in at that position.
+    Chain length 0: position is g or k (carry decided locally)
+    Chain length n: n consecutive propagate positions below must be traced
+    Returns list of ANS_LEN ints.
+    """
+    a_s, b_s = _pad(a, ND), _pad(b, ND)
+    gkp = []
+    for i in range(ND - 1, -1, -1):
+        s = int(a_s[i]) + int(b_s[i])
+        if s >= 10: gkp.append('g')
+        elif s == 9: gkp.append('p')
+        else: gkp.append('k')
+    # gkp[0]=LSB, gkp[ND-1]=MSB
+    chain_len = [0] * ND
+    for d in range(ND):
+        if gkp[d] in ('g', 'k'):
+            chain_len[d] = 0
+        else:  # propagate
+            length = 0
+            pos = d - 1
+            while pos >= 0 and gkp[pos] == 'p':
+                length += 1
+                pos -= 1
+            chain_len[d] = length + 1
+    out = [0] * ANS_LEN
+    if fmt == 'plain':
+        out[0] = 0  # carry_out position
+        for j in range(ND): out[ND - j] = chain_len[j]
+    else:
+        out[ANS_LEN - 1] = 0
+        for j in range(ND): out[j] = chain_len[j]
+    return out
+
 def gen_pairs_balanced(n, seed):
     rng = random.Random(seed)
     pool = defaultdict(list)
@@ -446,6 +482,72 @@ def probe_per_position(model, tokenizer, test_samples, objective,
         # Confidence spread: max - min (0 = uniform, high = strong ordering)
         result['conf_spread'] = max(pos_conf) - min(pos_conf)
     return result
+
+
+@torch.no_grad()
+def probe_directional(model, tokenizer, test_samples, fmt, max_len, device=None):
+    """Directional masking probe: can the model predict MSB positions
+    when LSB output positions are masked?
+
+    Tests whether the model uses input-to-output direct reasoning
+    (carry-lookahead) vs output-to-output sequential reasoning.
+
+    For each threshold k (0..ANS_LEN-1), mask the k lowest output
+    positions (LSB side), keep the rest visible as ground truth,
+    and measure accuracy on the masked positions.
+
+    Returns dict: {k: {'masked_acc': [...], 'masked_conf': [...]}}
+    where lists have ANS_LEN entries (None for non-masked positions).
+    """
+    if device is None: device = DEVICE
+    model.eval()
+    mask_id = tokenizer.special_ids['mask']
+    ids_all, ans_all = encode_samples(test_samples, tokenizer, max_len)
+    ids_all, ans_all = ids_all.to(device), ans_all.to(device)
+
+    results = {}
+    for n_mask in range(1, ANS_LEN + 1):
+        acc_s = torch.zeros(ANS_LEN, device=device)
+        conf_s = torch.zeros(ANS_LEN, device=device)
+        cnt = torch.zeros(ANS_LEN, device=device)
+        for st in range(0, len(test_samples), 128):
+            en = min(st+128, len(test_samples))
+            ids, ans = ids_all[st:en], ans_all[st:en]
+            B = ids.shape[0]
+            x = ids.clone()
+            for b in range(B):
+                a_s = ans[b].item()
+                # Mask the n_mask lowest (LSB-side) positions
+                if fmt == 'plain':
+                    # plain: [MSB..LSB], LSB side = rightmost = highest indices
+                    for j in range(n_mask):
+                        pos = a_s + ANS_LEN - 1 - j
+                        if pos < x.shape[1]: x[b, pos] = mask_id
+                else:
+                    # reverse: [LSB..MSB], LSB side = leftmost = lowest indices
+                    for j in range(n_mask):
+                        pos = a_s + j
+                        if pos < x.shape[1]: x[b, pos] = mask_id
+            logits = model(x)
+            for b in range(B):
+                a_s = ans[b].item()
+                for j in range(ANS_LEN):
+                    pos = a_s + j
+                    # Check if this position was masked
+                    if x[b, pos].item() == mask_id:
+                        cl = logits[b, pos].clone()
+                        cl[mask_id] = -float('inf')
+                        p = F.softmax(cl, dim=-1)
+                        acc_s[j] += float(p.argmax().item() == ids[b, pos].item())
+                        conf_s[j] += p.max().item()
+                        cnt[j] += 1
+        results[n_mask] = {
+            'masked_acc': [acc_s[j].item()/cnt[j].item() if cnt[j]>0 else None
+                           for j in range(ANS_LEN)],
+            'masked_conf': [conf_s[j].item()/cnt[j].item() if cnt[j]>0 else None
+                            for j in range(ANS_LEN)],
+        }
+    return results
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -850,9 +952,10 @@ def final_evaluate(model, tokenizer, test_samples, objective, fmt,
             pc = [ps[j]==gs[j] if j<len(ps) else False for j in range(len(gs))]
             ci = _carry_at_answer_pos(a, b, fmt)
             gkp = _gkp_at_answer_pos(a, b, fmt)
+            ccl = _carry_chain_length_at_pos(a, b, fmt)
             results.append({'correct': ps==gs, 'pos_correct': pc,
                            'n_carries': _count_carries(a, b),
-                           'carry_flags': ci, 'gkp': gkp})
+                           'carry_flags': ci, 'gkp': gkp, 'chain_len': ccl})
 
     n = len(results)
     acc = sum(r['correct'] for r in results) / max(n, 1)
@@ -875,7 +978,8 @@ def final_evaluate(model, tokenizer, test_samples, objective, fmt,
         oc = torch.cat(all_orders, dim=0)
         pl = len(tokenizer.encode(test_samples[0].split('=')[0]+'='))
         gkp_all = [r['gkp'] for r in results]
-        oa = _analyse_orders(oc, pl, fmt, gkp_all)
+        ccl_all = [r['chain_len'] for r in results]
+        oa = _analyse_orders(oc, pl, fmt, gkp_all, ccl_all)
 
     return {'accuracy': acc, 'n_samples': n, 'position_accuracy': pos_acc,
             'carry_accuracy': carry_acc, 'decode_order_analysis': oa,
@@ -883,13 +987,16 @@ def final_evaluate(model, tokenizer, test_samples, objective, fmt,
             'pos_acc_no_carry': pos_acc_no_carry}
 
 
-def _analyse_orders(decode_orders, prefix_len, fmt, gkp_per_sample=None):
+def _analyse_orders(decode_orders, prefix_len, fmt,
+                    gkp_per_sample=None, chain_len_per_sample=None):
     """Per-position decode rank analysis.
     Computes:
-      mean_rank:        mean decode step per position (over all samples)
-      pairwise_conc:    fraction of position pairs decoded in LSB→MSB order
-      rank_histogram:   (ANS_LEN, S) count matrix
-      gkp_mean_rank:    mean decode rank by g/k/p category (if gkp provided)
+      mean_rank:          mean decode step per position
+      pairwise_conc:      fraction of position pairs decoded in LSB→MSB order
+      rank_histogram:     (ANS_LEN, S) count matrix
+      gkp_mean_rank:      mean decode rank by g/k/p category
+      easy_before_hard:   fraction of (g/k, p) pairs where g/k decoded first
+      chain_len_vs_rank:  {chain_len: mean_decode_rank} — key analysis
     """
     N, S = decode_orders.shape
     rop = torch.full((N, ANS_LEN), float('nan'))
@@ -902,13 +1009,12 @@ def _analyse_orders(decode_orders, prefix_len, fmt, gkp_per_sample=None):
         v = rop[:, j][~rop[:, j].isnan()]
         mr.append(v.mean().item() if len(v) > 0 else -1)
 
-    # Pairwise concordance with LSB-first oracle.
+    # Pairwise concordance
     total_conc = 0.0
     total_valid = 0
     for n in range(N):
         row = rop[n]
-        if row.isnan().any():
-            continue
+        if row.isnan().any(): continue
         conc = 0
         for i in range(ANS_LEN):
             for j in range(i + 1, ANS_LEN):
@@ -928,7 +1034,7 @@ def _analyse_orders(decode_orders, prefix_len, fmt, gkp_per_sample=None):
     result = {'mean_rank': mr, 'pairwise_concordance': pw_conc,
               'rank_histogram': rh}
 
-    # Generate/Kill/Propagate decode rank analysis
+    # G/K/P analysis
     if gkp_per_sample is not None and len(gkp_per_sample) >= N:
         gkp_ranks = {'g': [], 'k': [], 'p': [], 'carry_out': []}
         for i in range(min(N, len(gkp_per_sample))):
@@ -943,7 +1049,6 @@ def _analyse_orders(decode_orders, prefix_len, fmt, gkp_per_sample=None):
             cat: sum(ranks)/len(ranks) if ranks else None
             for cat, ranks in gkp_ranks.items()
         }
-        # Also: do easy (g/k) positions get decoded before hard (p) ones?
         easy_before_hard = 0
         easy_hard_total = 0
         for i in range(min(N, len(gkp_per_sample))):
@@ -959,6 +1064,21 @@ def _analyse_orders(decode_orders, prefix_len, fmt, gkp_per_sample=None):
                             easy_before_hard += 1
         result['easy_before_hard'] = (easy_before_hard / easy_hard_total
                                        if easy_hard_total > 0 else None)
+
+    # Carry chain length vs decode rank
+    # Key question: do positions with longer chains get decoded later?
+    if chain_len_per_sample is not None and len(chain_len_per_sample) >= N:
+        cl_ranks = defaultdict(list)  # chain_len → list of decode ranks
+        for i in range(min(N, len(chain_len_per_sample))):
+            row = rop[i]
+            if row.isnan().any(): continue
+            ccl = chain_len_per_sample[i]
+            for j in range(ANS_LEN):
+                cl_ranks[ccl[j]].append(row[j].item())
+        result['chain_len_vs_rank'] = {
+            cl: sum(ranks)/len(ranks)
+            for cl, ranks in sorted(cl_ranks.items()) if ranks
+        }
 
     return result
 
@@ -1487,6 +1607,20 @@ def run(tag=''):
                                  for cat, v in gkp_mr.items()]
                         print(f"    GKP rank: {' '.join(parts)}"
                               + (f"  easy→hard: {ebh:.3f}" if ebh is not None else ''))
+
+            # Directional masking probe (once per trained model)
+            print(f"  Directional probe (mask LSB side, predict MSB)...")
+            dp_result = probe_directional(m, tok, test_data, fmt, max_len, device=DEVICE)
+            all_final[_fk('diffusion', fmt, mt, 'directional')] = dp_result
+            # Print summary: fully-masked accuracy vs MSB-only-masked accuracy
+            full_mask = dp_result.get(ANS_LEN, {}).get('masked_acc', [])
+            half_mask = dp_result.get(ANS_LEN // 2, {}).get('masked_acc', [])
+            if full_mask and half_mask:
+                full_avg = sum(v for v in full_mask if v is not None) / max(sum(1 for v in full_mask if v is not None), 1)
+                half_avg = sum(v for v in half_mask if v is not None) / max(sum(1 for v in half_mask if v is not None), 1)
+                print(f"    full mask avg acc: {full_avg:.3f}, "
+                      f"half-LSB mask avg acc: {half_avg:.3f}")
+
             del m; torch.cuda.empty_cache() if torch.cuda.is_available() else None
 
     # ── Figures ──
