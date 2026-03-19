@@ -302,108 +302,65 @@ def generate_diffusion(model, prefix_ids, n_tokens, mask_id,
     orders = []
     n_steps = 0
 
-    def _pick_token(logits_pos):
-        """Greedy or sample from a single position's logits."""
-        if greedy:
-            tok = logits_pos.argmax(-1)
-        else:
-            tok = torch.multinomial(F.softmax(logits_pos, dim=-1), 1).squeeze(-1)
-        lp = F.log_softmax(logits_pos, dim=-1)
-        return tok, lp[torch.arange(tok.shape[0], device=device), tok]
-
-    # ── Parallel ──
-    if policy.startswith('parallel'):
-        while not unmasked[:, T_pre:].all():
-            logits = model(x)
-            # For position selection: exclude MASK
-            sel_logits = logits.clone()
-            sel_logits[:, :, mask_id] = -float('inf')
-            probs = F.softmax(sel_logits, dim=-1)
-            step_positions = torch.full((B,), -1, dtype=torch.long)  # track first
-            for b in range(B):
-                mp = (~unmasked[b]).nonzero(as_tuple=True)[0]
-                if len(mp) == 0:
-                    continue
-                k = min(parallel_k, len(mp))
-                if policy == 'parallel_random':
-                    sel = mp[torch.randperm(len(mp), device=device)[:k]]
-                elif policy == 'parallel_confidence':
-                    sel = mp[probs[b, mp].max(-1).values.topk(k).indices]
-                elif policy == 'parallel_low_dep':
-                    ln = F.normalize(logits[b, mp], dim=-1)
-                    conf = probs[b, mp].max(-1).values
-                    chosen = [conf.argmax().item()]
-                    for _ in range(k - 1):
-                        sims = (ln @ ln[chosen].T).max(-1).values
-                        for c in chosen:
-                            sims[c] = float('inf')
-                        chosen.append(sims.argmin().item())
-                    sel = mp[torch.tensor(chosen, device=device)]
-                else:
-                    raise ValueError(policy)
-                for pos in sel:
-                    pos_logits = logits[b, pos].clone()
-                    pos_logits[mask_id] = -float('inf')
-                    if greedy:
-                        tok = pos_logits.argmax()
-                    else:
-                        tok = torch.multinomial(
-                            F.softmax(pos_logits.unsqueeze(0), dim=-1), 1).item()
-                        tok = torch.tensor(tok, device=device)
-                    scores[b] += F.log_softmax(pos_logits, dim=-1)[tok]
-                    x[b, pos] = tok
-                    unmasked[b, pos] = True
-            n_steps += 1
-        return x, scores.cpu(), {'n_steps': n_steps, 'orders': None}
-
     # ── Sequential ──
     for t in range(n_tokens):
         logits = model(x)
-        # For position selection: exclude MASK from confidence/entropy
-        sel_logits = logits.clone()
-        sel_logits[:, :, mask_id] = -float('inf')
-        probs = F.softmax(sel_logits, dim=-1)
 
         if policy == 'confidence':
-            sc = probs.max(-1).values.clone(); sc[unmasked] = -1; pos = sc.argmax(-1)
-        elif policy == 'low_entropy':
-            e = -(probs * (probs + 1e-10).log()).sum(-1)
-            e[unmasked] = 1e9; pos = e.argmin(-1)
-        elif policy == 'high_entropy':
-            e = -(probs * (probs + 1e-10).log()).sum(-1)
-            e[unmasked] = -1e9; pos = e.argmax(-1)
-        elif policy == 'margin':
-            t2 = probs.topk(2, dim=-1).values
-            mg = t2[:, :, 0] - t2[:, :, 1]
-            mg[unmasked] = -1; pos = mg.argmax(-1)
-        elif policy == 'random':
-            pos = torch.zeros(B, dtype=torch.long, device=device)
-            for b in range(B):
-                mp = (~unmasked[b]).nonzero(as_tuple=True)[0]
-                pos[b] = mp[torch.randint(len(mp), (1,))]
+            # Only compute max confidence at masked positions — skip full softmax
+            sel_logits = logits.clone()
+            sel_logits[:, :, mask_id] = -float('inf')
+            # Compute max logit (proxy for confidence) — avoids softmax entirely
+            max_logit = sel_logits.max(dim=-1).values  # [B, T]
+            max_logit[unmasked] = -float('inf')
+            pos = max_logit.argmax(-1)
         elif policy == 'l2r':
             pos = torch.full((B,), T_pre + t, dtype=torch.long, device=device)
         elif policy == 'r2l':
             pos = torch.full((B,), T_pre + n_tokens - 1 - t, dtype=torch.long, device=device)
+        elif policy == 'random':
+            # Vectorized random selection from masked positions
+            masked_flags = ~unmasked  # [B, T]
+            # Set uniform random scores for masked, -inf for unmasked
+            rand_scores = torch.rand(B, T_total, device=device)
+            rand_scores[unmasked] = -float('inf')
+            pos = rand_scores.argmax(-1)
         else:
-            raise ValueError(f"Unknown policy: {policy}")
+            # Fallback: full softmax for exotic policies
+            sel_logits = logits.clone()
+            sel_logits[:, :, mask_id] = -float('inf')
+            probs = F.softmax(sel_logits, dim=-1)
+            if policy == 'low_entropy':
+                e = -(probs * (probs + 1e-10).log()).sum(-1)
+                e[unmasked] = 1e9; pos = e.argmin(-1)
+            elif policy == 'high_entropy':
+                e = -(probs * (probs + 1e-10).log()).sum(-1)
+                e[unmasked] = -1e9; pos = e.argmax(-1)
+            elif policy == 'margin':
+                t2 = probs.topk(2, dim=-1).values
+                mg = t2[:, :, 0] - t2[:, :, 1]
+                mg[unmasked] = -1; pos = mg.argmax(-1)
+            else:
+                raise ValueError(f"Unknown policy: {policy}")
 
-        lp_at_pos = logits[torch.arange(B, device=device), pos]
-        # exclude MASK from token selection (PAD remains valid for diffusion)
+        batch_arange = torch.arange(B, device=device)
+        lp_at_pos = logits[batch_arange, pos]
         lp_at_pos[:, mask_id] = -float('inf')
         if greedy:
             tok = lp_at_pos.argmax(-1)
         else:
             tok = torch.multinomial(F.softmax(lp_at_pos, dim=-1), 1).squeeze(-1)
-        scores += F.log_softmax(lp_at_pos, dim=-1)[torch.arange(B, device=device), tok]
-        x[torch.arange(B, device=device), pos] = tok
-        unmasked[torch.arange(B, device=device), pos] = True
-        orders.append(pos.cpu())
+        scores += F.log_softmax(lp_at_pos, dim=-1)[batch_arange, tok]
+        x[batch_arange, pos] = tok
+        unmasked[batch_arange, pos] = True
+        orders.append(pos)  # keep on GPU, move to CPU at the end
         n_steps += 1
 
+    # Stack and move to CPU once (not per-step)
+    orders_t = torch.stack(orders, dim=1).cpu() if orders else None
     return x, scores.cpu(), {
         'n_steps': n_steps,
-        'orders': torch.stack(orders, dim=1) if orders else None,
+        'orders': orders_t,
     }
 
 

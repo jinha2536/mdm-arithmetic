@@ -61,14 +61,8 @@ class SelfAttention(nn.Module):
 
         self.c_attn = nn.Linear(n_embd, 3 * n_embd)
         self.c_proj = nn.Linear(n_embd, n_embd)
-        self.attn_drop = nn.Dropout(dropout)
+        self.attn_drop_p = dropout
         self.resid_drop = nn.Dropout(dropout)
-
-        if is_causal:
-            self.register_buffer(
-                "causal_mask",
-                torch.tril(torch.ones(block_size, block_size))
-                     .view(1, 1, block_size, block_size))
 
         if pos_enc == 'rope':
             cos, sin = _rope_freqs(self.head_dim, block_size)
@@ -86,11 +80,12 @@ class SelfAttention(nn.Module):
             q = _apply_rope(q, self.rope_cos, self.rope_sin)
             k = _apply_rope(k, self.rope_cos, self.rope_sin)
 
-        att = (q @ k.transpose(-2, -1)) * (self.head_dim ** -0.5)
-        if self.is_causal:
-            att = att.masked_fill(self.causal_mask[:, :, :T, :T] == 0, float('-inf'))
-        att = self.attn_drop(F.softmax(att, dim=-1))
-        y = (att @ v).transpose(1, 2).contiguous().view(B, T, C)
+        # Use PyTorch SDPA — automatically dispatches to Flash Attention
+        # on supported hardware (A100, H100, etc.)
+        drop_p = self.attn_drop_p if self.training else 0.0
+        y = F.scaled_dot_product_attention(
+            q, k, v, is_causal=self.is_causal, dropout_p=drop_p)
+        y = y.transpose(1, 2).contiguous().view(B, T, C)
         return self.resid_drop(self.c_proj(y))
 
 
@@ -154,6 +149,10 @@ class Transformer(nn.Module):
         self.wte.weight = self.lm_head.weight
 
         self.apply(self._init_weights)
+        # Cache position indices to avoid re-creation every forward
+        self.register_buffer('_pos_idx',
+                             torch.arange(block_size, dtype=torch.long),
+                             persistent=False)
 
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):
@@ -167,7 +166,7 @@ class Transformer(nn.Module):
         B, T = idx.size()
         x = self.wte(idx)
         if self.wpe is not None:
-            x = x + self.wpe(torch.arange(T, device=idx.device))
+            x = x + self.wpe(self._pos_idx[:T])
         x = self.drop(x)
         for block in self.blocks:
             x = block(x)
