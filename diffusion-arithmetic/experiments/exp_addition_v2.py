@@ -35,7 +35,6 @@ import sys, os, time, math, json, random
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, TensorDataset
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
@@ -1042,9 +1041,11 @@ def train_with_dynamics(
     if device is None: device = DEVICE
 
     train_ids, train_ans = encode_samples(train_samples, tokenizer, max_len)
-    loader = DataLoader(TensorDataset(train_ids, train_ans),
-                        batch_size=BATCH_SIZE, shuffle=True, drop_last=False)
-    bpe = len(loader)  # batches per epoch
+    # Pre-move to GPU — eliminates CPU→GPU transfer every batch
+    train_ids = train_ids.to(device)
+    train_ans = train_ans.to(device)
+    N = train_ids.shape[0]
+    bpe = (N + BATCH_SIZE - 1) // BATCH_SIZE  # batches per epoch
     total_iters = MAX_EPOCHS * bpe
 
     mask_id = tokenizer.special_ids['mask']
@@ -1077,6 +1078,13 @@ def train_with_dynamics(
     it = 0
     tg = 0  # token-gradient count
     t0 = time.time()
+
+    # Precompute constant tensors (avoid re-creation every iteration)
+    T = train_ids.shape[1]
+    _arange_ans = torch.arange(ANS_LEN, device=device)
+    _arange_T = torch.arange(T, device=device)
+    _arange_Tm1 = torch.arange(T - 1, device=device)
+    _refresh_all = list(range(BATCH_SIZE))
 
     def _pos_labels():
         if fmt == 'plain':
@@ -1275,7 +1283,8 @@ def train_with_dynamics(
         _puma_refresh(list(range(BATCH_SIZE)))
 
     for epoch in range(1, MAX_EPOCHS + 1):
-        epoch_loss = 0.0
+        epoch_loss_t = torch.tensor(0.0, device=device)
+        epoch_tg = torch.tensor(0, dtype=torch.long, device=device)
         epoch_n = 0
         # K scheduling for streaming methods
         if uses_streaming:
@@ -1295,24 +1304,27 @@ def train_with_dynamics(
                     m = (puma_z == mask_id)
                 logits = model(puma_z)
                 loss = F.cross_entropy(logits[m], puma_x0[m])
-                tg += m.sum().item()
-                optimizer.zero_grad()
+                epoch_tg += m.sum()
+                optimizer.zero_grad(set_to_none=True)
                 loss.backward()
                 nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
                 optimizer.step()
                 _chain_advance(logits.detach(), puma_K_cur)
 
-                epoch_loss += loss.item()
+                epoch_loss_t += loss.detach()
                 epoch_n += 1
                 it += 1
         else:
             # ── Standard mask types (random/confidence) ──
-            for batch in loader:
+            # GPU-side shuffle — no DataLoader, no CPU→GPU transfer
+            perm = torch.randperm(N, device=device)
+            for bi in range(bpe):
                 for pg in optimizer.param_groups:
                     pg['lr'] = get_lr(it)
 
-                ids = batch[0].to(device)
-                ans_starts = batch[1].to(device)
+                idx = perm[bi*BATCH_SIZE : min((bi+1)*BATCH_SIZE, N)]
+                ids = train_ids[idx]
+                ans_starts = train_ans[idx]
                 B, T = ids.shape
 
                 if objective == 'ar':
@@ -1323,7 +1335,7 @@ def train_with_dynamics(
                     lm = lm & (targets != pad_id)
                     if lm.sum() == 0: it += 1; continue
                     loss = F.cross_entropy(logits[lm], targets[lm])
-                    tg += lm.sum().item()
+                    epoch_tg += lm.sum()
 
                 else:  # diffusion (non-streaming)
                     pos = torch.arange(T, device=device).unsqueeze(0)
@@ -1375,19 +1387,20 @@ def train_with_dynamics(
                     logits = model(xm)
                     if m.sum() == 0: it += 1; continue
                     loss = F.cross_entropy(logits[m], ids[m])
-                    tg += m.sum().item()
+                    epoch_tg += m.sum()
 
-                optimizer.zero_grad()
+                optimizer.zero_grad(set_to_none=True)
                 loss.backward()
                 nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
                 optimizer.step()
 
-                epoch_loss += loss.item()
+                epoch_loss_t += loss.detach()
                 epoch_n += 1
                 it += 1
 
-        # ── End of epoch ──
-        avg_loss = epoch_loss / max(epoch_n, 1)
+        # ── End of epoch (single .item() call here, not per-iteration) ──
+        tg += epoch_tg.item()
+        avg_loss = epoch_loss_t.item() / max(epoch_n, 1)
 
         if epoch % LOG_EVERY == 0:
             dynamics['train_loss'].append((epoch, avg_loss))
