@@ -1,34 +1,29 @@
 """
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  Experiment 2 — 8-Digit Addition: Learning Dynamics Analysis
+  Experiment 2 — Addition: Carry Dependency Learning Dynamics
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
+  Core question: does the model learn the carry dependency graph?
+
   Fair comparison design:
+    Training unit: EPOCH (1 epoch = 1 full pass over N samples)
+    Both AR and Diffusion train for exactly MAX_EPOCHS
+    Best model selected by held-out probe loss (fair across mask types)
+    Three x-axes: epoch, iteration, token_gradients
 
-    Training unit: EPOCH (1 epoch = 1 full pass over N=2000 samples)
-      - BATCH_SIZE=200 → 10 batches/epoch, no data waste
-      - Both AR and Diffusion train for exactly MAX_EPOCHS
-      - Logging, eval, everything in epoch units
-
-    Three x-axes tracked per checkpoint:
-      epoch           : data exposure (same for both)
-      iteration       : gradient updates (same for both, = epoch × 10)
-      token_gradients : actual supervised signals
-                        AR ≈ 9/sample, Diff ≈ 4.5/sample → AR gets ~2×
-
-    Plotting: default x=epoch, secondary x=token_gradients
-    Stopping: fixed budget (no early stopping) + best model by train loss
-
-  Training conditions (×2 formats = 10 total):
+  Training conditions:
     AR, Diff-random, Diff-oracle_lsb, Diff-confidence, Diff-puma
-    Each diffusion model evaluated with 2 decode policies: confidence, lsb
+    Each diffusion model evaluated with decode policies: confidence, lsb
+    Decode order analysis (GKP, chain→rank, easy→hard) for confidence only
 
-  Carry-dependency analyses (post-training, per trained model):
-    - Regression: reveal_step ~ β_pos + β_chain_len + β_propagate
-    - Chain length → decode rank evolution
+  Carry-dependency analyses (post-training):
+    - Confidence cascade: Δconf of dependent position when g/k/p is revealed
+      (chain_end vs chain_mid — the key dependency graph test)
+    - Chain length → decode rank / confidence
     - Counterfactual carry intervention (matched pairs, carry-in flip)
-    - Carry-heavy adversarial test set (long propagation chains)
-    - G/K/P mean rank + easy-before-hard ordering
+    - Carry-heavy adversarial test (long propagation chains)
+    - No-propagate one-step solvability
+    - Dependency context (p_above_g, p_above_k, p_above_p) confidence/accuracy
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 """
 import sys, os, time, math, json, random
@@ -38,7 +33,6 @@ import torch.nn.functional as F
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-import numpy as np
 from collections import defaultdict
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -1012,6 +1006,186 @@ def probe_gkp_detailed(model, tokenizer, test_samples, fmt, max_len, device=None
 
 
 
+@torch.no_grad()
+def analyse_confidence_cascade(model, tokenizer, test_samples, fmt, max_len,
+                                n_samples=200, device=None):
+    """Step-by-step generation with confidence tracking at each decode step.
+
+    The core question: when position j (g or k) is revealed, does the
+    confidence of the position ABOVE it (toward MSB, which receives j's carry)
+    jump up? And when a p is revealed, does it NOT jump?
+
+    This directly tests whether the model's generation dynamics reflect
+    the carry dependency graph.
+
+    Carry direction:
+      plain:   carry flows right→left, so "above j" = position j-1
+      reverse: carry flows left→right, so "above j" = position j+1
+
+    Returns dict with:
+      'delta_by_revealed_type': {g/k/p: mean Δconf of position above}
+      'delta_by_revealed_type_all': {g/k/p: mean Δconf of ALL other positions}
+      'step_confs': list of (step, {position: conf}) for trajectory visualization
+      'cascade_pairs': list of (revealed_type, delta_above, delta_others) per event
+    """
+    if device is None: device = DEVICE
+    model.eval()
+    mask_id = tokenizer.special_ids['mask']
+    pad_id = tokenizer.special_ids['pad']
+
+    samples = test_samples[:n_samples]
+
+    # Precompute metadata
+    all_gkp = []
+    all_dep = []
+    for s in samples:
+        a, b = _parse_operands(s)
+        all_gkp.append(_gkp_at_answer_pos(a, b, fmt))
+        all_dep.append(_dependency_context_at_pos(a, b, fmt))
+
+    # "Above" direction: position that RECEIVES carry from position j
+    # plain:  carry flows LSB(right)→MSB(left), above j = j-1
+    # reverse: carry flows LSB(left)→MSB(right), above j = j+1
+    def _above(j):
+        if fmt == 'plain':
+            return j - 1 if j > 0 else None
+        else:
+            return j + 1 if j < ANS_LEN - 1 else None
+
+    # Accumulators
+    delta_above = {'g': [], 'k': [], 'p': []}       # by type of revealed position
+    delta_others = {'g': [], 'k': [], 'p': []}
+    # Refined: by dep context of revealed position
+    # "chain_end" = g, k, p_above_g, p_above_k, p_bottom → revealing resolves carry
+    # "chain_mid" = p_above_p → revealing does NOT resolve carry (still ambiguous above)
+    delta_above_resolved = []    # revealed position is chain terminator
+    delta_above_unresolved = []  # revealed position is mid-chain p
+
+    # Per-sample step-by-step generation
+    for si, s in enumerate(samples):
+        gkp = all_gkp[si]
+        prefix = s.split('=')[0] + '='
+        penc = tokenizer.encode(prefix)
+        T_pre = len(penc)
+
+        # Build input: prefix + MASK * ANS_LEN
+        x = torch.full((1, T_pre + ANS_LEN), mask_id, dtype=torch.long, device=device)
+        x[0, :T_pre] = torch.tensor(penc, device=device)
+        unmasked = torch.zeros(T_pre + ANS_LEN, dtype=torch.bool, device=device)
+        unmasked[:T_pre] = True
+
+        prev_conf = torch.zeros(ANS_LEN, device=device)
+
+        # Get initial confidence
+        logits = model(x)
+        for j in range(ANS_LEN):
+            pos = T_pre + j
+            cl = logits[0, pos].clone()
+            cl[mask_id] = -float('inf')
+            prev_conf[j] = F.softmax(cl, dim=-1).max()
+
+        # Step-by-step decode (confidence policy)
+        for step in range(ANS_LEN):
+            logits = model(x)
+
+            # Find highest-confidence masked position
+            best_conf = -1.0
+            best_j = -1
+            for j in range(ANS_LEN):
+                if unmasked[T_pre + j]:
+                    continue
+                pos = T_pre + j
+                cl = logits[0, pos].clone()
+                cl[mask_id] = -float('inf')
+                c = F.softmax(cl, dim=-1).max().item()
+                if c > best_conf:
+                    best_conf = c
+                    best_j = j
+
+            if best_j < 0:
+                break
+
+            # Reveal this position
+            pos = T_pre + best_j
+            cl = logits[0, pos].clone()
+            cl[mask_id] = -float('inf')
+            tok = cl.argmax()
+            x[0, pos] = tok
+            unmasked[pos] = True
+
+            # Get new confidences for remaining masked positions
+            logits_new = model(x)
+            new_conf = torch.zeros(ANS_LEN, device=device)
+            for j in range(ANS_LEN):
+                if unmasked[T_pre + j]:
+                    new_conf[j] = 1.0  # already revealed
+                    continue
+                p = T_pre + j
+                cl2 = logits_new[0, p].clone()
+                cl2[mask_id] = -float('inf')
+                new_conf[j] = F.softmax(cl2, dim=-1).max()
+
+            # Record Δconf
+            revealed_type = gkp[best_j]
+            revealed_dep = all_dep[si][best_j]
+            if revealed_type in ('g', 'k', 'p'):
+                above_j = _above(best_j)
+
+                # Δconf of the position directly above (dependent on carry)
+                if above_j is not None and not unmasked[T_pre + above_j]:
+                    d_above = (new_conf[above_j] - prev_conf[above_j]).item()
+                    delta_above[revealed_type].append(d_above)
+
+                    # Chain resolution grouping:
+                    # g, k → carry-out known from input alone (chain terminator)
+                    # p_above_g, p_above_k, p_bottom → carry resolved (chain end)
+                    # p_above_p → carry NOT resolved (mid-chain)
+                    if revealed_dep in ('g', 'k', 'p_above_g', 'p_above_k', 'p_bottom'):
+                        delta_above_resolved.append(d_above)
+                    elif revealed_dep == 'p_above_p':
+                        delta_above_unresolved.append(d_above)
+
+                # Δconf of all OTHER masked positions (not the one above)
+                for j in range(ANS_LEN):
+                    if unmasked[T_pre + j] or j == above_j:
+                        continue
+                    d = (new_conf[j] - prev_conf[j]).item()
+                    delta_others[revealed_type].append(d)
+
+            prev_conf = new_conf
+
+    # Summarise
+    def _mean(lst):
+        return sum(lst) / len(lst) if lst else 0.0
+
+    return {
+        'delta_conf_above_by_type': {
+            t: {'mean': _mean(v), 'n': len(v)} for t, v in delta_above.items()
+        },
+        'delta_conf_others_by_type': {
+            t: {'mean': _mean(v), 'n': len(v)} for t, v in delta_others.items()
+        },
+        'delta_conf_above_resolved': {
+            'chain_end': {'mean': _mean(delta_above_resolved),
+                          'n': len(delta_above_resolved)},
+            'chain_mid': {'mean': _mean(delta_above_unresolved),
+                          'n': len(delta_above_unresolved)},
+        },
+        'summary': (
+            f"By revealed type (Δconf of position above):\n"
+            f"  g: {_mean(delta_above['g']):+.4f} (n={len(delta_above['g'])}), "
+            f"  k: {_mean(delta_above['k']):+.4f} (n={len(delta_above['k'])}), "
+            f"  p: {_mean(delta_above['p']):+.4f} (n={len(delta_above['p'])})\n"
+            f"By chain resolution:\n"
+            f"  chain_end (g/k/p_above_gk): {_mean(delta_above_resolved):+.4f} "
+            f"(n={len(delta_above_resolved)})\n"
+            f"  chain_mid (p_above_p):      {_mean(delta_above_unresolved):+.4f} "
+            f"(n={len(delta_above_unresolved)})"
+        ),
+    }
+
+
+
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Training (epoch-based, fixed budget)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -1163,8 +1337,8 @@ def train_with_dynamics(
                             gen_entry.setdefault('easy_before_hard', {})[dp] = oa['easy_before_hard']
                         if 'chain_len_vs_rank' in oa:
                             gen_entry.setdefault('chain_len_vs_rank', {})[dp] = oa['chain_len_vs_rank']
-                        if 'regression' in oa:
-                            gen_entry.setdefault('regression', {})[dp] = oa['regression']
+                        if 'carry_source_rank' in oa:
+                            gen_entry.setdefault('carry_source_rank', {})[dp] = oa['carry_source_rank']
                     ga_strs.append(f"{dp}={r['accuracy']:.3f}")
                 print(f"      [gen] {' '.join(ga_strs)}")
             dynamics['gen_checkpoints'].append(gen_entry)
@@ -1630,44 +1804,39 @@ def _analyse_orders(decode_orders, prefix_len, fmt,
             cl_vs_rank[cl_val] = rank_v[mask].mean().item()
         result['chain_len_vs_rank'] = cl_vs_rank
 
-    # Regression: reveal_step ~ β₁·position + β₂·chain_len + β₃·is_propagate
-    if (gkp_per_sample is not None and chain_len_per_sample is not None
-            and len(gkp_per_sample) >= N and len(chain_len_per_sample) >= N
-            and n_valid > 0):
-        gkp_ids_v = gkp_ids[valid_mask]  # [N_valid, ANS_LEN]
-        ccl_v = torch.tensor([c[:ANS_LEN] for c in chain_len_per_sample[:N]])[valid_mask]
-        rank_flat = rop_valid.reshape(-1).numpy()
-        nv = rop_valid.shape[0]
-        # Position feature
-        pos_idx = torch.arange(ANS_LEN).unsqueeze(0).expand(nv, -1).reshape(-1).float().numpy()
-        if fmt == 'plain':
-            lsb_dist = pos_idx / max(ANS_LEN - 1, 1)
-        else:
-            lsb_dist = 1.0 - pos_idx / max(ANS_LEN - 1, 1)
-        chain_flat = ccl_v.reshape(-1).float().numpy()
-        is_prop = (gkp_ids_v == 2).reshape(-1).float().numpy()  # p=2
+    # Carry-source-type → decode rank
+    # For each position j, what is the g/k/p of its carry SOURCE (below)?
+    # This tests: "does model decode j earlier when its source is g/k (carry resolved)
+    # vs p (carry unresolved)?"
+    # Key difference from gkp_mean_rank: that groups by j's OWN type,
+    # this groups by j's DEPENDENCY (what determines j's difficulty).
+    if gkp_per_sample is not None and len(gkp_per_sample) >= N and n_valid > 0:
+        # Carry source: plain → j+1 (LSB is at high index),
+        #               reverse → j-1 (LSB is at low index)
+        source_type = torch.full((n_valid, ANS_LEN), -1, dtype=torch.long)  # -1 = no source
+        for i in range(n_valid):
+            orig_i = valid_mask.nonzero(as_tuple=True)[0][i].item()
+            gkp = gkp_per_sample[orig_i]
+            for j in range(ANS_LEN):
+                if fmt == 'plain':
+                    src_j = j + 1  # carry comes from more-LSB = higher index
+                else:
+                    src_j = j - 1  # carry comes from more-LSB = lower index
+                if 0 <= src_j < ANS_LEN and gkp[src_j] in ('g', 'k', 'p'):
+                    source_type[i, j] = gkp_to_id[gkp[src_j]]
 
-        X = np.column_stack([lsb_dist, chain_flat, is_prop])
-        y = rank_flat
-        if len(X) >= 10:
-            X_mean = X.mean(axis=0)
-            X_std = X.std(axis=0)
-            X_std[X_std == 0] = 1.0
-            X_z = (X - X_mean) / X_std
-            X_z = np.column_stack([np.ones(len(X_z)), X_z])
-            beta, residuals, _, _ = np.linalg.lstsq(X_z, y, rcond=None)
-            y_pred = X_z @ beta
-            ss_res = ((y - y_pred) ** 2).sum()
-            ss_tot = ((y - y.mean()) ** 2).sum()
-            r_squared = 1 - ss_res / ss_tot if ss_tot > 0 else 0
-            result['regression'] = {
-                'beta_position': float(beta[1]),
-                'beta_chain_len': float(beta[2]),
-                'beta_is_propagate': float(beta[3]),
-                'intercept': float(beta[0]),
-                'r_squared': float(r_squared),
-                'n_obs': len(X),
-            }
+        src_flat = source_type.reshape(-1)
+        rank_flat_all = rop_valid.reshape(-1)
+        source_rank = {}
+        for gi, gname in enumerate(gkp_names):
+            mask = (src_flat == gi)
+            if mask.any():
+                source_rank[f'source_{gname}'] = rank_flat_all[mask].mean().item()
+        # Also: positions with no carry source (LSB or carry_out)
+        no_src = (src_flat == -1)
+        if no_src.any():
+            source_rank['source_none'] = rank_flat_all[no_src].mean().item()
+        result['carry_source_rank'] = source_rank
 
     return result
 
@@ -2203,50 +2372,6 @@ def make_figures(all_dyn, all_final):
         fig.suptitle(f'Carry-Out Effect on MSB During Training — {fmt}', fontsize=12, y=1.02)
         fig.tight_layout(); figs[f'carry_out_evo_{fmt}'] = fig
 
-        # ── Fig 15: Regression β evolution (position vs chain_len vs propagate) ──
-        if dconds:
-            fig, axes = plt.subplots(1, 4, figsize=(22, 5))
-            beta_names = ['beta_position', 'beta_chain_len', 'beta_is_propagate']
-            beta_labels = ['β_position', 'β_chain_len', 'β_propagate']
-            for ai, (bname, blabel) in enumerate(zip(beta_names, beta_labels)):
-                ax = axes[ai]
-                for mt, key in dconds:
-                    dyn = all_dyn[key]
-                    gc = dyn.get('gen_checkpoints', [])
-                    dp = 'confidence'
-                    xs, ys = [], []
-                    for g in gc:
-                        reg = g.get('regression', {}).get(dp)
-                        if reg and bname in reg:
-                            xs.append(g['epoch']); ys.append(reg[bname])
-                    if xs:
-                        ck = _ck('diffusion', mt)
-                        ax.plot(xs, ys, '-o', color=COLORS.get(ck+'con', COLORS.get(ck, '#333')),
-                                label=f'mask={mt}', ms=3, lw=1.5, alpha=0.8)
-                ax.axhline(0, color='grey', ls=':', lw=1, alpha=0.5)
-                ax.set_xlabel('Epoch'); ax.set_ylabel(f'{blabel} (standardised)')
-                ax.set_title(blabel); ax.legend(fontsize=6); ax.grid(alpha=0.3)
-            # R² panel
-            ax = axes[3]
-            for mt, key in dconds:
-                dyn = all_dyn[key]
-                gc = dyn.get('gen_checkpoints', [])
-                dp = 'confidence'
-                xs, ys = [], []
-                for g in gc:
-                    reg = g.get('regression', {}).get(dp)
-                    if reg and 'r_squared' in reg:
-                        xs.append(g['epoch']); ys.append(reg['r_squared'])
-                if xs:
-                    ck = _ck('diffusion', mt)
-                    ax.plot(xs, ys, '-o', color=COLORS.get(ck+'con', COLORS.get(ck, '#333')),
-                            label=f'mask={mt}', ms=3, lw=1.5, alpha=0.8)
-            ax.set_xlabel('Epoch'); ax.set_ylabel('R²')
-            ax.set_ylim(-0.05, 1.05); ax.set_title('Regression R²')
-            ax.legend(fontsize=6); ax.grid(alpha=0.3)
-            fig.suptitle(f'Decode Order Regression Evolution — {fmt}', fontsize=12, y=1.02)
-            fig.tight_layout(); figs[f'regression_evo_{fmt}'] = fig
-
         # ── Fig 15b: Easy-before-hard evolution ──
         if dconds:
             fig, ax = plt.subplots(figsize=(10, 5))
@@ -2267,6 +2392,37 @@ def make_figures(all_dyn, all_final):
             ax.set_title(f'Easy (g/k) Before Hard (p) Evolution — {fmt}')
             ax.legend(fontsize=6); ax.grid(alpha=0.3)
             fig.tight_layout(); figs[f'easy_hard_evo_{fmt}'] = fig
+
+        # ── Fig 15c: Carry source type → decode rank evolution ──
+        # Key test: does the model decode positions earlier when their
+        # carry source is g/k (resolved) vs p (unresolved)?
+        if dconds:
+            fig, axes = plt.subplots(1, len(dconds), figsize=(7*len(dconds), 5), squeeze=False)
+            axes = axes[0]
+            src_colors = {'source_g': '#2ecc71', 'source_k': '#3498db', 'source_p': '#e74c3c'}
+            for ai, (mt, key) in enumerate(dconds):
+                ax = axes[ai]
+                dyn = all_dyn[key]
+                gc = dyn.get('gen_checkpoints', [])
+                dp = 'confidence'
+                for src_type in ['source_g', 'source_k', 'source_p']:
+                    xs, ys = [], []
+                    for g in gc:
+                        csr = g.get('carry_source_rank', {}).get(dp, {})
+                        if src_type in csr:
+                            xs.append(g['epoch']); ys.append(csr[src_type])
+                    if xs:
+                        ax.plot(xs, ys, '-o', color=src_colors.get(src_type, '#333'),
+                                label=src_type, ms=3, lw=1.5, alpha=0.8)
+                ax.set_xlabel('Epoch'); ax.set_ylabel('Mean Decode Rank')
+                ax.set_title(f'mask={mt}')
+                ax.legend(fontsize=7); ax.grid(alpha=0.3)
+            fig.suptitle(
+                f'Decode Rank by Carry Source Type — {fmt}\n'
+                'source_g/k = carry resolved (should be decoded earlier) '
+                'vs source_p = unresolved',
+                fontsize=11, y=1.05)
+            fig.tight_layout(); figs[f'source_rank_evo_{fmt}'] = fig
 
         # ── Fig 16: Chain length → decode rank evolution ──
         if dconds:
@@ -2484,6 +2640,61 @@ def make_figures(all_dyn, all_final):
                          fontsize=12, y=1.02)
             fig.tight_layout(); figs[f'no_prop_acc_{fmt}'] = fig
 
+        # ── Fig 22: Confidence cascade — the key dependency graph test ──
+        cascade_data = {}
+        for mt in MASK_TYPES:
+            key = _fk('diffusion', fmt, mt, 'cascade')
+            c = all_final.get(key)
+            if c:
+                cascade_data[mt] = c
+        if cascade_data:
+            n_mt = len(cascade_data)
+            fig, axes = plt.subplots(2, n_mt, figsize=(7*n_mt, 9), squeeze=False)
+            for ai, (mt, cd) in enumerate(cascade_data.items()):
+                # Top row: by g/k/p type of revealed position
+                ax = axes[0][ai]
+                types = ['g', 'k', 'p']
+                type_colors = {'g': '#2ecc71', 'k': '#3498db', 'p': '#e74c3c'}
+                x = range(len(types))
+                above_vals = [cd['delta_conf_above_by_type'].get(t, {}).get('mean', 0) for t in types]
+                above_n = [cd['delta_conf_above_by_type'].get(t, {}).get('n', 0) for t in types]
+                other_vals = [cd['delta_conf_others_by_type'].get(t, {}).get('mean', 0) for t in types]
+                w = 0.35
+                ax.bar([xi-w/2 for xi in x], above_vals, w,
+                       color=[type_colors[t] for t in types], alpha=0.9,
+                       label='position above')
+                ax.bar([xi+w/2 for xi in x], other_vals, w,
+                       color=[type_colors[t] for t in types], alpha=0.3,
+                       label='other positions')
+                ax.set_xticks(list(x))
+                ax.set_xticklabels([f'{t} (n={above_n[i]})' for i, t in enumerate(types)])
+                ax.axhline(0, color='grey', ls='-', lw=0.5)
+                ax.set_ylabel('Mean Δconf'); ax.set_title(f'mask={mt} — by revealed type')
+                ax.legend(fontsize=7); ax.grid(alpha=0.3, axis='y')
+
+                # Bottom row: chain_end vs chain_mid (the key test)
+                ax = axes[1][ai]
+                cr = cd.get('delta_conf_above_resolved', {})
+                cats = ['chain_end', 'chain_mid']
+                cat_labels = ['chain end\n(g/k/p_above_gk)', 'chain mid\n(p_above_p)']
+                cat_colors = ['#2ecc71', '#e74c3c']
+                vals = [cr.get(c, {}).get('mean', 0) for c in cats]
+                ns = [cr.get(c, {}).get('n', 0) for c in cats]
+                ax.bar(range(2), vals, color=cat_colors, alpha=0.8)
+                ax.set_xticks(range(2))
+                ax.set_xticklabels([f'{cat_labels[i]}\n(n={ns[i]})' for i in range(2)],
+                                   fontsize=8)
+                ax.axhline(0, color='grey', ls='-', lw=0.5)
+                ax.set_ylabel('Mean Δconf of position above')
+                ax.set_title(f'mask={mt} — chain end vs mid')
+                ax.grid(alpha=0.3, axis='y')
+
+            fig.suptitle(
+                f'Confidence Cascade Analysis — {fmt}\n'
+                'Top: Δconf by g/k/p type | Bottom: chain_end (carry resolved) vs chain_mid (still ambiguous)',
+                fontsize=11, y=1.03)
+            fig.tight_layout(); figs[f'cascade_{fmt}'] = fig
+
     return figs
 
 
@@ -2566,7 +2777,9 @@ def run(tag=''):
                 all_final[key] = r
                 print(f"  Acc: {r['accuracy']:.4f}")
                 oa = r.get('decode_order_analysis')
-                if oa:
+                # Decode order analysis only meaningful for confidence decode
+                # (for fixed-order policies like lsb, the order is tautological)
+                if oa and dp == 'confidence':
                     labs = _pos_labels(fmt); mr = oa['mean_rank']
                     print(f"    LSB concordance: {oa['pairwise_concordance']:.3f}")
                     print(f"    Rank: {' '.join(f'{labs[j]}={mr[j]:.1f}' for j in range(ANS_LEN))}")
@@ -2581,12 +2794,10 @@ def run(tag=''):
                     if clvr:
                         parts = [f"cl={cl}→{r:.2f}" for cl, r in sorted(clvr.items())]
                         print(f"    Chain→rank: {' '.join(parts)}")
-                    reg = oa.get('regression')
-                    if reg:
-                        print(f"    Regression (std β): pos={reg['beta_position']:.3f} "
-                              f"chain={reg['beta_chain_len']:.3f} "
-                              f"prop={reg['beta_is_propagate']:.3f} "
-                              f"R²={reg['r_squared']:.3f} (n={reg['n_obs']})")
+                    csr = oa.get('carry_source_rank')
+                    if csr:
+                        parts = [f"{k}={v:.2f}" for k, v in sorted(csr.items())]
+                        print(f"    Source→rank: {' '.join(parts)}")
 
             # ── Counterfactual carry eval (once per trained model) ──
             print(f"  Counterfactual carry eval...")
@@ -2636,6 +2847,13 @@ def run(tag=''):
                 print(f"    No-p dedicated test (n={len(nop_data)}): "
                       f"one-step exact={npi['one_step_exact_acc']:.3f} "
                       f"digit={npi['one_step_digit_acc']:.3f}")
+
+            # ── Confidence cascade analysis ──
+            print(f"  Confidence cascade analysis...")
+            cascade = analyse_confidence_cascade(
+                m, tok, test_data, fmt, max_len, n_samples=200, device=DEVICE)
+            all_final[_fk('diffusion', fmt, mt, 'cascade')] = cascade
+            print(f"    {cascade['summary']}")
 
             del m; torch.cuda.empty_cache() if torch.cuda.is_available() else None
 
