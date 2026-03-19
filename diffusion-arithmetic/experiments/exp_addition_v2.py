@@ -19,12 +19,16 @@
     Plotting: default x=epoch, secondary x=token_gradients
     Stopping: fixed budget (no early stopping) + best model by train loss
 
-  Conditions (×2 formats = 14 total):
-    AR, Diff-random-conf, Diff-random-lsb,
-    Diff-oracle_lsb-conf, Diff-oracle_lsb-lsb,    ← LSB-first oracle (PUMA streaming)
-    Diff-confidence-conf, Diff-confidence-lsb,   ← single-probe adaptive
-    Diff-msb-conf, Diff-msb-lsb                  ← anti-oracle baseline
-    Diff-puma-conf, Diff-puma-lsb                 ← teacher-forced chain
+  Training conditions (×2 formats = 10 total):
+    AR, Diff-random, Diff-oracle_lsb, Diff-confidence, Diff-puma
+    Each diffusion model evaluated with 2 decode policies: confidence, lsb
+
+  Carry-dependency analyses (post-training, per trained model):
+    - Regression: reveal_step ~ β_pos + β_chain_len + β_propagate
+    - Chain length → decode rank evolution
+    - Counterfactual carry intervention (matched pairs, carry-in flip)
+    - Carry-heavy adversarial test set (long propagation chains)
+    - G/K/P mean rank + easy-before-hard ordering
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 """
 import sys, os, time, math, json, random
@@ -76,7 +80,7 @@ GEN_EVAL_N = 500
 THRESHOLD = 0.99
 
 FORMATS = ['plain', 'reverse']
-MASK_TYPES = ['random', 'oracle_lsb', 'confidence', 'msb', 'puma']
+MASK_TYPES = ['random', 'oracle_lsb', 'confidence', 'puma']
 DECODE_POLICIES = ['confidence', 'lsb']
 
 # Architecture
@@ -368,6 +372,180 @@ def gen_test_data(n, fmt, seed):
     return [FMT_FN[fmt](a, b) for a, b in gen_test_pairs_full(n, seed)]
 
 
+def gen_counterfactual_pairs(n, seed):
+    """Generate matched (a1,b1)/(a2,b2) pairs where at a target position j:
+      - local digit pair (a_j, b_j) is identical
+      - carry-in differs (0 vs 1)
+    This isolates the causal effect of carry on model predictions.
+
+    Returns list of dicts with keys:
+      target_j: int (0=LSB digit position)
+      pair: ((a1,b1), (a2,b2))
+      carry_in: (bool, bool) — carry-in at target for each pair member
+    """
+    rng = random.Random(seed)
+    lo = 10**(ND - 1)
+    hi = 10**ND - 1
+    results = []
+    attempts = 0
+    max_attempts = n * 500
+
+    while len(results) < n and attempts < max_attempts:
+        attempts += 1
+        # Pick a target digit position (0=LSB, ND-1=MSB input digit)
+        target_d = rng.randint(1, ND - 1)  # skip LSB (no carry-in) and MSB carry-out
+
+        # Generate first operand pair
+        a1 = rng.randint(lo, hi)
+        b1 = rng.randint(lo, hi)
+        a1_s, b1_s = _pad(a1, ND), _pad(b1, ND)
+
+        # Get the digit pair at target position
+        # target_d in 0..ND-1 where 0=LSB → string index = ND-1-target_d
+        si = ND - 1 - target_d
+        da, db = int(a1_s[si]), int(b1_s[si])
+
+        # Compute carry-in at target_d for pair 1
+        carry1 = 0
+        for i in range(ND - 1, si, -1):  # from LSB up to (but not including) target
+            s = int(a1_s[i]) + int(b1_s[i]) + carry1
+            carry1 = s // 10
+
+        # Now construct pair 2: same digits at target and above, different suffix
+        # so that carry-in at target flips
+        want_carry2 = 1 - carry1
+
+        # Keep digits from target position upward the same, randomise below
+        for _ in range(200):
+            # Build new suffix (below target)
+            a2_digits = list(a1_s[:si+1])  # keep target and above
+            b2_digits = list(b1_s[:si+1])
+            for i in range(si + 1, ND):
+                a2_digits.append(str(rng.randint(0, 9)))
+                b2_digits.append(str(rng.randint(0, 9)))
+            a2 = int(''.join(a2_digits))
+            b2 = int(''.join(b2_digits))
+            a2_s, b2_s = _pad(a2, ND), _pad(b2, ND)
+
+            # Check carry-in at target
+            carry2 = 0
+            for i in range(ND - 1, si, -1):
+                s = int(a2_s[i]) + int(b2_s[i]) + carry2
+                carry2 = s // 10
+            if carry2 == want_carry2:
+                results.append({
+                    'target_d': target_d,
+                    'digit_pair': (da, db),
+                    'pair': ((a1, b1), (a2, b2)),
+                    'carry_in': (bool(carry1), bool(carry2)),
+                })
+                break
+
+    return results
+
+
+@torch.no_grad()
+def eval_counterfactual(model, tokenizer, cf_pairs, fmt, max_len, device=None):
+    """Evaluate counterfactual carry pairs on a trained diffusion model.
+
+    For each matched pair, compare fully-masked predictions at the target position.
+    Measures:
+      - confidence_delta: how much carry-in changes model confidence
+      - prediction_flip: whether the predicted digit changes
+      - accuracy per carry-in condition
+    """
+    if device is None: device = DEVICE
+    model.eval()
+    mask_id = tokenizer.special_ids['mask']
+
+    deltas = []  # per-pair confidence difference
+    flips = 0
+    correct_c0, correct_c1 = 0, 0
+    total_c0, total_c1 = 0, 0
+
+    for cf in cf_pairs:
+        target_d = cf['target_d']
+        for mi, (a, b) in enumerate(cf['pair']):
+            s = FMT_FN[fmt](a, b)
+            ids = torch.tensor(tokenizer.encode(s), device=device).unsqueeze(0)
+            ans_start = s.index('=') + 1
+
+            # Fully mask answer
+            xm = ids.clone()
+            xm[0, ans_start:ans_start+ANS_LEN] = mask_id
+            logits = model(xm)
+
+            # Map target_d (0=LSB) to answer position index
+            if fmt == 'plain':
+                ans_j = ND - target_d  # plain: [MSB(0), ..., LSB(ND)]
+            else:
+                ans_j = target_d       # reverse: [LSB(0), ..., MSB(ND)]
+
+            pos = ans_start + ans_j
+            cl = logits[0, pos].clone()
+            cl[mask_id] = -float('inf')
+            probs = F.softmax(cl, dim=-1)
+            pred = probs.argmax().item()
+            conf = probs.max().item()
+            gold = ids[0, pos].item()
+
+            if mi == 0:
+                pred0, conf0, correct0 = pred, conf, (pred == gold)
+            else:
+                pred1, conf1, correct1 = pred, conf, (pred == gold)
+
+        ci0, ci1 = cf['carry_in']
+        # ci0=False → no carry-in for pair 0
+        if not ci0:
+            correct_c0 += correct0; total_c0 += 1
+            correct_c1 += correct1; total_c1 += 1
+        else:
+            correct_c1 += correct0; total_c1 += 1
+            correct_c0 += correct1; total_c0 += 1
+
+        deltas.append(abs(conf1 - conf0))
+        if pred0 != pred1:
+            flips += 1
+
+    n = len(cf_pairs)
+    return {
+        'n_pairs': n,
+        'mean_conf_delta': sum(deltas) / max(n, 1),
+        'median_conf_delta': sorted(deltas)[n//2] if n > 0 else 0,
+        'prediction_flip_rate': flips / max(n, 1),
+        'acc_carry_in_0': correct_c0 / max(total_c0, 1),
+        'acc_carry_in_1': correct_c1 / max(total_c1, 1),
+    }
+
+
+def gen_carry_heavy_test(n, fmt, seed, min_max_chain=3):
+    """Generate test samples with long carry-propagation chains.
+    Filters for samples where max carry chain length >= min_max_chain.
+    Useful as adversarial eval: if model truly learns carry structure,
+    performance should degrade gracefully on these vs random test.
+    """
+    rng = random.Random(seed)
+    lo = 10**(ND - 1)
+    hi = 10**ND - 1
+    results = []
+    attempts = 0
+    while len(results) < n and attempts < n * 200:
+        attempts += 1
+        a = rng.randint(lo, hi)
+        b = rng.randint(lo, hi)
+        ccl = _carry_chain_length_at_pos(a, b, fmt)
+        if max(ccl) >= min_max_chain:
+            results.append(FMT_FN[fmt](a, b))
+    # If not enough, relax threshold
+    if len(results) < n:
+        rng2 = random.Random(seed + 7777)
+        while len(results) < n:
+            a = rng2.randint(lo, hi)
+            b = rng2.randint(lo, hi)
+            results.append(FMT_FN[fmt](a, b))
+    return results[:n]
+
+
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Per-position eval probe
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -483,71 +661,6 @@ def probe_per_position(model, tokenizer, test_samples, objective,
         result['conf_spread'] = max(pos_conf) - min(pos_conf)
     return result
 
-
-@torch.no_grad()
-def probe_directional(model, tokenizer, test_samples, fmt, max_len, device=None):
-    """Directional masking probe: can the model predict MSB positions
-    when LSB output positions are masked?
-
-    Tests whether the model uses input-to-output direct reasoning
-    (carry-lookahead) vs output-to-output sequential reasoning.
-
-    For each threshold k (0..ANS_LEN-1), mask the k lowest output
-    positions (LSB side), keep the rest visible as ground truth,
-    and measure accuracy on the masked positions.
-
-    Returns dict: {k: {'masked_acc': [...], 'masked_conf': [...]}}
-    where lists have ANS_LEN entries (None for non-masked positions).
-    """
-    if device is None: device = DEVICE
-    model.eval()
-    mask_id = tokenizer.special_ids['mask']
-    ids_all, ans_all = encode_samples(test_samples, tokenizer, max_len)
-    ids_all, ans_all = ids_all.to(device), ans_all.to(device)
-
-    results = {}
-    for n_mask in range(1, ANS_LEN + 1):
-        acc_s = torch.zeros(ANS_LEN, device=device)
-        conf_s = torch.zeros(ANS_LEN, device=device)
-        cnt = torch.zeros(ANS_LEN, device=device)
-        for st in range(0, len(test_samples), 128):
-            en = min(st+128, len(test_samples))
-            ids, ans = ids_all[st:en], ans_all[st:en]
-            B = ids.shape[0]
-            x = ids.clone()
-            for b in range(B):
-                a_s = ans[b].item()
-                # Mask the n_mask lowest (LSB-side) positions
-                if fmt == 'plain':
-                    # plain: [MSB..LSB], LSB side = rightmost = highest indices
-                    for j in range(n_mask):
-                        pos = a_s + ANS_LEN - 1 - j
-                        if pos < x.shape[1]: x[b, pos] = mask_id
-                else:
-                    # reverse: [LSB..MSB], LSB side = leftmost = lowest indices
-                    for j in range(n_mask):
-                        pos = a_s + j
-                        if pos < x.shape[1]: x[b, pos] = mask_id
-            logits = model(x)
-            for b in range(B):
-                a_s = ans[b].item()
-                for j in range(ANS_LEN):
-                    pos = a_s + j
-                    # Check if this position was masked
-                    if x[b, pos].item() == mask_id:
-                        cl = logits[b, pos].clone()
-                        cl[mask_id] = -float('inf')
-                        p = F.softmax(cl, dim=-1)
-                        acc_s[j] += float(p.argmax().item() == ids[b, pos].item())
-                        conf_s[j] += p.max().item()
-                        cnt[j] += 1
-        results[n_mask] = {
-            'masked_acc': [acc_s[j].item()/cnt[j].item() if cnt[j]>0 else None
-                           for j in range(ANS_LEN)],
-            'masked_conf': [conf_s[j].item()/cnt[j].item() if cnt[j]>0 else None
-                            for j in range(ANS_LEN)],
-        }
-    return results
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -666,6 +779,10 @@ def train_with_dynamics(
                             gen_entry.setdefault('gkp_mean_rank', {})[dp] = oa['gkp_mean_rank']
                         if 'easy_before_hard' in oa:
                             gen_entry.setdefault('easy_before_hard', {})[dp] = oa['easy_before_hard']
+                        if 'chain_len_vs_rank' in oa:
+                            gen_entry.setdefault('chain_len_vs_rank', {})[dp] = oa['chain_len_vs_rank']
+                        if 'regression' in oa:
+                            gen_entry.setdefault('regression', {})[dp] = oa['regression']
                     ga_strs.append(f"{dp}={r['accuracy']:.3f}")
                 print(f"      [gen] {' '.join(ga_strs)}")
             dynamics['gen_checkpoints'].append(gen_entry)
@@ -786,7 +903,7 @@ def train_with_dynamics(
                 epoch_n += 1
                 it += 1
         else:
-            # ── Standard mask types (random/msb/confidence) ──
+            # ── Standard mask types (random/confidence) ──
             for batch in loader:
                 for pg in optimizer.param_groups:
                     pg['lr'] = get_lr(it)
@@ -817,20 +934,6 @@ def train_with_dynamics(
                         for bi in no_m.nonzero(as_tuple=True)[0]:
                             v = ans_mask[bi].nonzero(as_tuple=True)[0]
                             if len(v) > 0: m[bi, v[torch.randint(len(v),(1,))]] = True
-
-                    elif mask_type == 'msb':
-                        # Anti-oracle: unmask MSB first (opposite of 'oracle_lsb')
-                        t_ratio = torch.rand(B, device=device)
-                        m = torch.zeros(B, T, dtype=torch.bool, device=device)
-                        for bi in range(B):
-                            a_s = ans_starts[bi].item()
-                            a_pos = list(range(a_s, min(a_s + ANS_LEN, T)))
-                            na = len(a_pos)
-                            nm = max(1, int(math.ceil(t_ratio[bi].item() * na)))
-                            if fmt == 'plain':
-                                for p in a_pos[na-nm:]: m[bi, p] = True
-                            else:
-                                for p in a_pos[:nm]: m[bi, p] = True
 
                     elif mask_type == 'confidence':
                         # Single-probe adaptive: fully-masked → rank → mask bottom
@@ -1080,6 +1183,51 @@ def _analyse_orders(decode_orders, prefix_len, fmt,
             for cl, ranks in sorted(cl_ranks.items()) if ranks
         }
 
+    # Regression: reveal_step ~ β₁·position + β₂·chain_len + β₃·is_propagate
+    # Disentangles whether decode order is driven by position or dependency.
+    # β₂ > β₁ → dependency-driven;  β₁ > β₂ → position-driven.
+    if (gkp_per_sample is not None and chain_len_per_sample is not None
+            and len(gkp_per_sample) >= N and len(chain_len_per_sample) >= N):
+        X_rows, y_rows = [], []
+        for i in range(min(N, len(gkp_per_sample))):
+            row = rop[i]
+            if row.isnan().any(): continue
+            gkp = gkp_per_sample[i]
+            ccl = chain_len_per_sample[i]
+            for j in range(ANS_LEN):
+                # Normalise position to [0,1]: 0=MSB, 1=LSB (plain) or 0=LSB, 1=MSB (reverse)
+                # Use "LSB distance" so higher = more LSB regardless of format
+                if fmt == 'plain':
+                    lsb_dist = j / max(ANS_LEN - 1, 1)
+                else:
+                    lsb_dist = 1.0 - j / max(ANS_LEN - 1, 1)
+                is_prop = 1.0 if gkp[j] == 'p' else 0.0
+                X_rows.append([lsb_dist, ccl[j], is_prop])
+                y_rows.append(row[j].item())
+        if len(X_rows) >= 10:
+            X = np.array(X_rows)
+            y = np.array(y_rows)
+            # Standardise for comparable β magnitudes
+            X_mean = X.mean(axis=0)
+            X_std = X.std(axis=0)
+            X_std[X_std == 0] = 1.0
+            X_z = (X - X_mean) / X_std
+            # Add intercept
+            X_z = np.column_stack([np.ones(len(X_z)), X_z])
+            beta, residuals, _, _ = np.linalg.lstsq(X_z, y, rcond=None)
+            y_pred = X_z @ beta
+            ss_res = ((y - y_pred) ** 2).sum()
+            ss_tot = ((y - y.mean()) ** 2).sum()
+            r_squared = 1 - ss_res / ss_tot if ss_tot > 0 else 0
+            result['regression'] = {
+                'beta_position': float(beta[1]),  # standardised
+                'beta_chain_len': float(beta[2]),
+                'beta_is_propagate': float(beta[3]),
+                'intercept': float(beta[0]),
+                'r_squared': float(r_squared),
+                'n_obs': len(X_rows),
+            }
+
     return result
 
 
@@ -1097,7 +1245,6 @@ COLORS = {
     'diff-ran-con': '#3498db', 'diff-ran-lsb': '#2ecc71',
     'diff-ora-con': '#9b59b6', 'diff-ora-lsb': '#e67e22',
     'diff-con-con': '#1abc9c', 'diff-con-lsb': '#16a085',
-    'diff-msb-con': '#c0392b', 'diff-msb-lsb': '#d35400',
     'diff-pum-con': '#8e44ad', 'diff-pum-lsb': '#6c3483',
 }
 
@@ -1286,19 +1433,12 @@ def make_figures(all_dyn, all_final):
 
         # ── Fig 5: Final per-position accuracy ──
         fig, axes = plt.subplots(1, 3, figsize=(21, 5))
+        diff_conf = [('diffusion', mt, 'confidence') for mt in MASK_TYPES]
+        diff_lsb = [('diffusion', mt, 'lsb') for mt in MASK_TYPES]
         for ai, (title, cs) in enumerate([
-            ('AR vs Diffusion (conf decode)', [('ar','',''),
-             ('diffusion','random','confidence'), ('diffusion','oracle_lsb','confidence'),
-             ('diffusion','confidence','confidence'), ('diffusion','msb','confidence'),
-             ('diffusion','puma','confidence')]),
-            ('Training mask comparison (conf decode)', [
-             ('diffusion','random','confidence'), ('diffusion','oracle_lsb','confidence'),
-             ('diffusion','confidence','confidence'), ('diffusion','msb','confidence'),
-             ('diffusion','puma','confidence')]),
-            ('LSB decode comparison', [
-             ('diffusion','random','lsb'), ('diffusion','oracle_lsb','lsb'),
-             ('diffusion','confidence','lsb'), ('diffusion','msb','lsb'),
-             ('diffusion','puma','lsb')]),
+            ('AR vs Diffusion (conf decode)', [('ar','','')] + diff_conf),
+            ('Training mask comparison (conf decode)', diff_conf),
+            ('LSB decode comparison', diff_lsb),
         ]):
             ax = axes[ai]
             for obj, mt, dp in cs:
@@ -1528,6 +1668,177 @@ def make_figures(all_dyn, all_final):
         fig.suptitle(f'Carry-Out Effect on MSB During Training — {fmt}', fontsize=12, y=1.02)
         fig.tight_layout(); figs[f'carry_out_evo_{fmt}'] = fig
 
+        # ── Fig 15: Regression β evolution (position vs chain_len vs propagate) ──
+        if dconds:
+            fig, axes = plt.subplots(1, 4, figsize=(22, 5))
+            beta_names = ['beta_position', 'beta_chain_len', 'beta_is_propagate']
+            beta_labels = ['β_position', 'β_chain_len', 'β_propagate']
+            for ai, (bname, blabel) in enumerate(zip(beta_names, beta_labels)):
+                ax = axes[ai]
+                for mt, key in dconds:
+                    dyn = all_dyn[key]
+                    gc = dyn.get('gen_checkpoints', [])
+                    dp = 'confidence'
+                    xs, ys = [], []
+                    for g in gc:
+                        reg = g.get('regression', {}).get(dp)
+                        if reg and bname in reg:
+                            xs.append(g['epoch']); ys.append(reg[bname])
+                    if xs:
+                        ck = _ck('diffusion', mt)
+                        ax.plot(xs, ys, '-o', color=COLORS.get(ck+'con', COLORS.get(ck, '#333')),
+                                label=f'mask={mt}', ms=3, lw=1.5, alpha=0.8)
+                ax.axhline(0, color='grey', ls=':', lw=1, alpha=0.5)
+                ax.set_xlabel('Epoch'); ax.set_ylabel(f'{blabel} (standardised)')
+                ax.set_title(blabel); ax.legend(fontsize=6); ax.grid(alpha=0.3)
+            # R² panel
+            ax = axes[3]
+            for mt, key in dconds:
+                dyn = all_dyn[key]
+                gc = dyn.get('gen_checkpoints', [])
+                dp = 'confidence'
+                xs, ys = [], []
+                for g in gc:
+                    reg = g.get('regression', {}).get(dp)
+                    if reg and 'r_squared' in reg:
+                        xs.append(g['epoch']); ys.append(reg['r_squared'])
+                if xs:
+                    ck = _ck('diffusion', mt)
+                    ax.plot(xs, ys, '-o', color=COLORS.get(ck+'con', COLORS.get(ck, '#333')),
+                            label=f'mask={mt}', ms=3, lw=1.5, alpha=0.8)
+            ax.set_xlabel('Epoch'); ax.set_ylabel('R²')
+            ax.set_ylim(-0.05, 1.05); ax.set_title('Regression R²')
+            ax.legend(fontsize=6); ax.grid(alpha=0.3)
+            fig.suptitle(f'Decode Order Regression Evolution — {fmt}', fontsize=12, y=1.02)
+            fig.tight_layout(); figs[f'regression_evo_{fmt}'] = fig
+
+        # ── Fig 15b: Easy-before-hard evolution ──
+        if dconds:
+            fig, ax = plt.subplots(figsize=(10, 5))
+            for mt, key in dconds:
+                dyn = all_dyn[key]
+                gc = dyn.get('gen_checkpoints', [])
+                dp = 'confidence'
+                xs = [g['epoch'] for g in gc if dp in g.get('easy_before_hard', {})]
+                ys = [g['easy_before_hard'][dp] for g in gc
+                      if dp in g.get('easy_before_hard', {})]
+                if xs:
+                    ck = _ck('diffusion', mt)
+                    ax.plot(xs, ys, '-o', color=COLORS.get(ck+'con', COLORS.get(ck, '#333')),
+                            label=f'mask={mt}', ms=3, lw=1.5, alpha=0.8)
+            ax.axhline(0.5, color='grey', ls=':', lw=1, alpha=0.5, label='random')
+            ax.set_xlabel('Epoch'); ax.set_ylabel('P(easy before hard)')
+            ax.set_ylim(-0.05, 1.05)
+            ax.set_title(f'Easy (g/k) Before Hard (p) Evolution — {fmt}')
+            ax.legend(fontsize=6); ax.grid(alpha=0.3)
+            fig.tight_layout(); figs[f'easy_hard_evo_{fmt}'] = fig
+
+        # ── Fig 16: Chain length → decode rank evolution ──
+        if dconds:
+            fig, axes = plt.subplots(1, len(dconds), figsize=(7*len(dconds), 5), squeeze=False)
+            axes = axes[0]
+            chain_cmap = plt.cm.viridis
+            for ai, (mt, key) in enumerate(dconds):
+                ax = axes[ai]
+                dyn = all_dyn[key]
+                gc = dyn.get('gen_checkpoints', [])
+                dp = 'confidence'
+                # Collect all chain lengths seen across epochs
+                all_cls = set()
+                for g in gc:
+                    clvr = g.get('chain_len_vs_rank', {}).get(dp, {})
+                    all_cls.update(clvr.keys())
+                all_cls = sorted(all_cls)
+                if all_cls:
+                    max_cl = max(max(all_cls), 1)
+                    for cl in all_cls:
+                        xs, ys = [], []
+                        for g in gc:
+                            clvr = g.get('chain_len_vs_rank', {}).get(dp, {})
+                            if cl in clvr:
+                                xs.append(g['epoch']); ys.append(clvr[cl])
+                        if xs:
+                            ax.plot(xs, ys, '-o', color=chain_cmap(cl / max_cl),
+                                    label=f'chain={cl}', ms=3, lw=1.5, alpha=0.8)
+                ax.set_xlabel('Epoch'); ax.set_ylabel('Mean Decode Rank')
+                ax.set_title(f'mask={mt}')
+                ax.legend(fontsize=5, ncol=2); ax.grid(alpha=0.3)
+            fig.suptitle(f'Chain Length → Decode Rank Evolution — {fmt}', fontsize=12, y=1.02)
+            fig.tight_layout(); figs[f'chain_rank_evo_{fmt}'] = fig
+
+        # ── Fig 17: Counterfactual carry analysis ──
+        cf_data = []
+        for mt in MASK_TYPES:
+            key = _fk('diffusion', fmt, mt, 'counterfactual')
+            cf = all_final.get(key)
+            if cf:
+                cf_data.append((mt, cf))
+        if cf_data:
+            fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+            mts = [d[0] for d in cf_data]
+            x = range(len(mts))
+
+            # Panel 1: prediction flip rate
+            ax = axes[0]
+            vals = [d[1]['prediction_flip_rate'] for d in cf_data]
+            colors = [COLORS.get(_ck('diffusion', mt)+'con',
+                      COLORS.get(_ck('diffusion', mt), '#333')) for mt in mts]
+            ax.bar(x, vals, color=colors, alpha=0.8)
+            ax.set_xticks(list(x)); ax.set_xticklabels(mts, fontsize=8, rotation=20)
+            ax.set_ylabel('Prediction Flip Rate')
+            ax.set_title('How often carry-in flips the prediction')
+            ax.set_ylim(0, 1.05); ax.grid(alpha=0.3, axis='y')
+
+            # Panel 2: confidence delta
+            ax = axes[1]
+            vals = [d[1]['mean_conf_delta'] for d in cf_data]
+            ax.bar(x, vals, color=colors, alpha=0.8)
+            ax.set_xticks(list(x)); ax.set_xticklabels(mts, fontsize=8, rotation=20)
+            ax.set_ylabel('Mean |Δconfidence|')
+            ax.set_title('Confidence shift from carry-in change')
+            ax.grid(alpha=0.3, axis='y')
+
+            # Panel 3: accuracy by carry-in condition
+            ax = axes[2]
+            w = 0.35
+            c0 = [d[1]['acc_carry_in_0'] for d in cf_data]
+            c1 = [d[1]['acc_carry_in_1'] for d in cf_data]
+            ax.bar([xi-w/2 for xi in x], c0, w, label='carry-in=0', color='#3498db', alpha=0.8)
+            ax.bar([xi+w/2 for xi in x], c1, w, label='carry-in=1', color='#e74c3c', alpha=0.8)
+            ax.set_xticks(list(x)); ax.set_xticklabels(mts, fontsize=8, rotation=20)
+            ax.set_ylim(0, 1.05); ax.set_ylabel('Accuracy')
+            ax.set_title('Accuracy by carry-in condition')
+            ax.legend(); ax.grid(alpha=0.3, axis='y')
+
+            fig.suptitle(f'Counterfactual Carry Analysis — {fmt}', fontsize=12, y=1.02)
+            fig.tight_layout(); figs[f'counterfactual_{fmt}'] = fig
+
+        # ── Fig 18: Standard vs carry-heavy comparison ──
+        heavy_data = []
+        for mt in MASK_TYPES:
+            for dp in DECODE_POLICIES:
+                key_std = _fk('diffusion', fmt, mt, dp)
+                key_hvy = _fk('diffusion', fmt, mt, f'heavy_{dp}')
+                r_std = all_final.get(key_std)
+                r_hvy = all_final.get(key_hvy)
+                if r_std and r_hvy:
+                    heavy_data.append((_ck('diffusion', mt, dp),
+                                       r_std['accuracy'], r_hvy['accuracy']))
+        if heavy_data:
+            fig, ax = plt.subplots(figsize=(12, 5))
+            x = range(len(heavy_data))
+            w = 0.35
+            ax.bar([xi-w/2 for xi in x], [d[1] for d in heavy_data], w,
+                   label='Standard test', color='#3498db', alpha=0.8)
+            ax.bar([xi+w/2 for xi in x], [d[2] for d in heavy_data], w,
+                   label='Carry-heavy test', color='#e74c3c', alpha=0.8)
+            ax.set_xticks(list(x))
+            ax.set_xticklabels([d[0] for d in heavy_data], fontsize=7, rotation=30)
+            ax.set_ylim(0, 1.05); ax.set_ylabel('Exact Match Accuracy')
+            ax.set_title(f'Standard vs Carry-Heavy — {fmt}')
+            ax.legend(); ax.grid(alpha=0.3, axis='y')
+            fig.tight_layout(); figs[f'carry_heavy_{fmt}'] = fig
+
     return figs
 
 
@@ -1607,19 +1918,39 @@ def run(tag=''):
                                  for cat, v in gkp_mr.items()]
                         print(f"    GKP rank: {' '.join(parts)}"
                               + (f"  easy→hard: {ebh:.3f}" if ebh is not None else ''))
+                    clvr = oa.get('chain_len_vs_rank')
+                    if clvr:
+                        parts = [f"cl={cl}→{r:.2f}" for cl, r in sorted(clvr.items())]
+                        print(f"    Chain→rank: {' '.join(parts)}")
+                    reg = oa.get('regression')
+                    if reg:
+                        print(f"    Regression (std β): pos={reg['beta_position']:.3f} "
+                              f"chain={reg['beta_chain_len']:.3f} "
+                              f"prop={reg['beta_is_propagate']:.3f} "
+                              f"R²={reg['r_squared']:.3f} (n={reg['n_obs']})")
 
-            # Directional masking probe (once per trained model)
-            print(f"  Directional probe (mask LSB side, predict MSB)...")
-            dp_result = probe_directional(m, tok, test_data, fmt, max_len, device=DEVICE)
-            all_final[_fk('diffusion', fmt, mt, 'directional')] = dp_result
-            # Print summary: fully-masked accuracy vs MSB-only-masked accuracy
-            full_mask = dp_result.get(ANS_LEN, {}).get('masked_acc', [])
-            half_mask = dp_result.get(ANS_LEN // 2, {}).get('masked_acc', [])
-            if full_mask and half_mask:
-                full_avg = sum(v for v in full_mask if v is not None) / max(sum(1 for v in full_mask if v is not None), 1)
-                half_avg = sum(v for v in half_mask if v is not None) / max(sum(1 for v in half_mask if v is not None), 1)
-                print(f"    full mask avg acc: {full_avg:.3f}, "
-                      f"half-LSB mask avg acc: {half_avg:.3f}")
+            # ── Counterfactual carry eval (once per trained model) ──
+            print(f"  Counterfactual carry eval...")
+            cf_pairs = gen_counterfactual_pairs(200, seed=SEED + 42)
+            cf_result = eval_counterfactual(m, tok, cf_pairs, fmt, max_len, device=DEVICE)
+            all_final[_fk('diffusion', fmt, mt, 'counterfactual')] = cf_result
+            print(f"    pairs={cf_result['n_pairs']} "
+                  f"flip_rate={cf_result['prediction_flip_rate']:.3f} "
+                  f"Δconf={cf_result['mean_conf_delta']:.4f} "
+                  f"acc(c=0)={cf_result['acc_carry_in_0']:.3f} "
+                  f"acc(c=1)={cf_result['acc_carry_in_1']:.3f}")
+
+            # ── Carry-heavy adversarial eval ──
+            print(f"  Carry-heavy eval...")
+            heavy_data = gen_carry_heavy_test(N_TEST, fmt, seed=7000, min_max_chain=3)
+            for dp in DECODE_POLICIES:
+                key_h = _fk('diffusion', fmt, mt, f'heavy_{dp}')
+                r_h = final_evaluate(m, tok, heavy_data, 'diffusion', fmt, decode_policy=dp)
+                all_final[key_h] = r_h
+                key_std = _fk('diffusion', fmt, mt, dp)
+                std_acc = all_final[key_std]['accuracy']
+                print(f"    heavy {dp}: {r_h['accuracy']:.4f} (standard: {std_acc:.4f}, "
+                      f"Δ={r_h['accuracy']-std_acc:+.4f})")
 
             del m; torch.cuda.empty_cache() if torch.cuda.is_available() else None
 
