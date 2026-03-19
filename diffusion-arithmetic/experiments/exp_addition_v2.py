@@ -314,6 +314,86 @@ def _carry_chain_length_at_pos(a, b, fmt):
         for j in range(ND): out[j] = chain_len[j]
     return out
 
+
+def _dependency_context_at_pos(a, b, fmt):
+    """Classify each answer position by its dependency context.
+
+    Instead of flat g/k/p, captures what's BELOW each position:
+      'g':           generate (carry-out=1 always, locally determined)
+      'k':           kill (carry-out=0 always, locally determined)
+      'p_above_g':   propagate, but chain terminates at g below → carry-in=1 certain
+      'p_above_k':   propagate, but chain terminates at k below → carry-in=0 certain
+      'p_above_p':   propagate, below is also p → must trace further
+      'p_bottom':    propagate at LSB digit (no carry-in, so carry-in=0 → acts like k)
+      'carry_out':   MSB overflow position
+
+    The key insight: p_above_g and p_above_k are actually easy (carry resolved),
+    while p_above_p is the hard case (uncertainty propagates).
+    Returns list of ANS_LEN strings.
+    """
+    a_s, b_s = _pad(a, ND), _pad(b, ND)
+    # gkp[d] for d=0(LSB)..ND-1(MSB)
+    gkp = []
+    for i in range(ND - 1, -1, -1):
+        s = int(a_s[i]) + int(b_s[i])
+        if s >= 10: gkp.append('g')
+        elif s == 9: gkp.append('p')
+        else: gkp.append('k')
+
+    dep = ['?'] * ND
+    for d in range(ND):
+        if gkp[d] in ('g', 'k'):
+            dep[d] = gkp[d]
+        else:  # propagate
+            if d == 0:
+                dep[d] = 'p_bottom'  # LSB, no carry-in possible
+            elif gkp[d-1] == 'g':
+                dep[d] = 'p_above_g'
+            elif gkp[d-1] == 'k':
+                dep[d] = 'p_above_k'
+            else:
+                dep[d] = 'p_above_p'
+
+    out = ['?'] * ANS_LEN
+    if fmt == 'plain':
+        out[0] = 'carry_out'
+        for j in range(ND): out[ND - j] = dep[j]
+    else:
+        out[ANS_LEN - 1] = 'carry_out'
+        for j in range(ND): out[j] = dep[j]
+    return out
+
+
+def _has_no_propagate(a, b):
+    """Check if a pair has zero propagate positions (all g or k)."""
+    a_s, b_s = _pad(a, ND), _pad(b, ND)
+    for i in range(ND):
+        if int(a_s[i]) + int(b_s[i]) == 9:
+            return False
+    return True
+
+
+def gen_no_propagate_test(n, fmt, seed):
+    """Generate test samples with NO propagate (p) positions.
+    All digit pairs sum to ≤8 or ≥10, so every carry is locally determined.
+    If the model can solve these in one step (fully-masked), it demonstrates
+    that carry ambiguity (not position) is the real bottleneck.
+    """
+    rng = random.Random(seed)
+    lo = 10**(ND - 1)
+    hi = 10**ND - 1
+    results = []
+    attempts = 0
+    while len(results) < n and attempts < n * 500:
+        attempts += 1
+        a = rng.randint(lo, hi)
+        b = rng.randint(lo, hi)
+        if _has_no_propagate(a, b):
+            results.append(FMT_FN[fmt](a, b))
+    if len(results) < n:
+        print(f"    WARNING: only found {len(results)}/{n} no-propagate samples")
+    return results
+
 def gen_pairs_balanced(n, seed):
     rng = random.Random(seed)
     pool = defaultdict(list)
@@ -556,6 +636,10 @@ def probe_per_position(model, tokenizer, test_samples, objective,
     """
     AR: teacher-forced loss per position.
     Diffusion: fully-masked loss per position.
+
+    For diffusion, also tracks dependency-context-level confidence and accuracy
+    (piggybacks on the same forward pass — zero additional GPU cost).
+    This enables tracking carry chain recognition vs accuracy over training.
     """
     if device is None: device = DEVICE
     model.eval()
@@ -566,6 +650,10 @@ def probe_per_position(model, tokenizer, test_samples, objective,
 
     ci_flags = [_carry_at_answer_pos(*_parse_operands(s), fmt) for s in test_samples]
 
+    # Precompute dependency contexts for all test samples (cheap, CPU)
+    dep_ctxs = [_dependency_context_at_pos(*_parse_operands(s), fmt) for s in test_samples]
+    ccl_all = [_carry_chain_length_at_pos(*_parse_operands(s), fmt) for s in test_samples]
+
     L  = torch.zeros(ANS_LEN, device=device)
     C  = torch.zeros(ANS_LEN, device=device)
     CF = torch.zeros(ANS_LEN, device=device)
@@ -573,6 +661,15 @@ def probe_per_position(model, tokenizer, test_samples, objective,
     Lc, Ln = torch.zeros(ANS_LEN, device=device), torch.zeros(ANS_LEN, device=device)
     Cc, Cn = torch.zeros(ANS_LEN, device=device), torch.zeros(ANS_LEN, device=device)
     Nc, Nn = torch.zeros(ANS_LEN, device=device), torch.zeros(ANS_LEN, device=device)
+
+    # Dependency context accumulators (diffusion only, same forward pass)
+    dep_conf_sum = defaultdict(float)
+    dep_acc_sum = defaultdict(float)
+    dep_count = defaultdict(int)
+    # Chain length accumulators (p positions only)
+    cl_conf_sum = defaultdict(float)
+    cl_acc_sum = defaultdict(float)
+    cl_count = defaultdict(int)
 
     for st in range(0, len(test_samples), 128):
         en = min(st+128, len(test_samples))
@@ -604,6 +701,8 @@ def probe_per_position(model, tokenizer, test_samples, objective,
             for b in range(B):
                 a_s = ans[b].item()
                 ci = ci_flags[st+b]
+                dep = dep_ctxs[st+b]
+                ccl = ccl_all[st+b]
                 for j in range(ANS_LEN):
                     pos = a_s + j
                     tgt = ids[b, pos]
@@ -614,9 +713,22 @@ def probe_per_position(model, tokenizer, test_samples, objective,
                     cl = logits[b, pos].clone()
                     cl[mask_id] = -float('inf')
                     cj = F.softmax(cl, dim=-1).max().item()
-                    L[j] += lj; C[j] += float(pred == tgt.item()); CF[j] += cj; N[j] += 1
-                    if ci[j]: Lc[j] += lj; Cc[j] += float(pred == tgt.item()); Nc[j] += 1
-                    else:     Ln[j] += lj; Cn[j] += float(pred == tgt.item()); Nn[j] += 1
+                    correct = float(pred == tgt.item())
+                    L[j] += lj; C[j] += correct; CF[j] += cj; N[j] += 1
+                    if ci[j]: Lc[j] += lj; Cc[j] += correct; Nc[j] += 1
+                    else:     Ln[j] += lj; Cn[j] += correct; Nn[j] += 1
+
+                    # Dependency context tracking (free — reuses same logits)
+                    ctx = dep[j]
+                    dep_conf_sum[ctx] += cj
+                    dep_acc_sum[ctx] += correct
+                    dep_count[ctx] += 1
+                    # Chain length tracking for p positions
+                    chain = ccl[j]
+                    if chain > 0:  # p position
+                        cl_conf_sum[chain] += cj
+                        cl_acc_sum[chain] += correct
+                        cl_count[chain] += 1
 
     s = N.clamp(1)
     pos_conf = (CF/s).cpu().tolist()
@@ -637,6 +749,29 @@ def probe_per_position(model, tokenizer, test_samples, objective,
         'overall_loss': (L.sum()/s.sum()).item(),
         'overall_acc': (C.sum()/s.sum()).item(),
     }
+
+    # Dependency-context stats (diffusion only, piggybacked on existing pass)
+    if objective == 'diffusion' and dep_count:
+        dep_stats = {}
+        for ctx in dep_count:
+            n = dep_count[ctx]
+            dep_stats[ctx] = {
+                'conf': dep_conf_sum[ctx] / n,
+                'acc': dep_acc_sum[ctx] / n,
+                'n': n,
+            }
+        result['dep_context'] = dep_stats
+        # Chain length stats (p positions only)
+        cl_stats = {}
+        for chain in sorted(cl_count):
+            n = cl_count[chain]
+            cl_stats[chain] = {
+                'conf': cl_conf_sum[chain] / n,
+                'acc': cl_acc_sum[chain] / n,
+                'n': n,
+            }
+        result['chain_len_stats'] = cl_stats
+
     # Confidence-derived decode ordering metrics (diffusion only).
     # From fully-masked probe confidence, compute what ordering the model
     # would choose if it decoded right now via confidence policy.
@@ -660,6 +795,136 @@ def probe_per_position(model, tokenizer, test_samples, objective,
         # Confidence spread: max - min (0 = uniform, high = strong ordering)
         result['conf_spread'] = max(pos_conf) - min(pos_conf)
     return result
+
+
+@torch.no_grad()
+def probe_gkp_detailed(model, tokenizer, test_samples, fmt, max_len, device=None):
+    """Sample-level fully-masked confidence analysis by dependency context.
+
+    For each sample and position, records the model's confidence in the
+    fully-masked setting, tagged with:
+      - g/k/p category
+      - dependency context (p_above_g, p_above_k, p_above_p, etc.)
+      - carry chain length
+      - accuracy (correct or not)
+
+    Returns dict with:
+      'by_dep_context': {context: {'conf': [...], 'acc': [...]}}
+      'by_chain_len':   {chain_len: {'conf': [...], 'acc': [...]}}
+      'by_gkp':         {gkp: {'conf': [...], 'acc': [...]}}
+      'chain_conf_corr': Pearson correlation(chain_len, confidence) across all p positions
+      'no_p_samples':   {'n': int, 'one_step_acc': float, 'one_step_digit_acc': float}
+    """
+    if device is None: device = DEVICE
+    model.eval()
+    mask_id = tokenizer.special_ids['mask']
+
+    ids_all, ans_all = encode_samples(test_samples, tokenizer, max_len)
+    ids_all, ans_all = ids_all.to(device), ans_all.to(device)
+
+    by_dep = defaultdict(lambda: {'conf': [], 'acc': []})
+    by_cl = defaultdict(lambda: {'conf': [], 'acc': []})
+    by_gkp = defaultdict(lambda: {'conf': [], 'acc': []})
+    # For chain_len vs confidence correlation (p positions only)
+    p_chain_lens = []
+    p_confs = []
+    # No-propagate sample tracking
+    no_p_correct = 0
+    no_p_digit_correct = 0
+    no_p_digit_total = 0
+    no_p_count = 0
+
+    for st in range(0, len(test_samples), 128):
+        en = min(st + 128, len(test_samples))
+        ids, ans = ids_all[st:en], ans_all[st:en]
+        B = ids.shape[0]
+
+        # Fully mask all answer positions
+        xm = ids.clone()
+        for b in range(B):
+            a_s = ans[b].item()
+            xm[b, a_s:a_s + ANS_LEN] = mask_id
+        logits = model(xm)
+
+        for b in range(B):
+            a, bb = _parse_operands(test_samples[st + b])
+            a_s = ans[b].item()
+            dep_ctx = _dependency_context_at_pos(a, bb, fmt)
+            gkp = _gkp_at_answer_pos(a, bb, fmt)
+            ccl = _carry_chain_length_at_pos(a, bb, fmt)
+
+            sample_all_correct = True
+            sample_has_p = any(g == 'p' for g in gkp[:ANS_LEN])
+
+            for j in range(ANS_LEN):
+                pos = a_s + j
+                tgt = ids[b, pos].item()
+
+                cl = logits[b, pos].clone()
+                cl[mask_id] = -float('inf')
+                probs = F.softmax(cl, dim=-1)
+                conf = probs.max().item()
+                pred = probs.argmax().item()
+                correct = float(pred == tgt)
+
+                ctx = dep_ctx[j]
+                cat = gkp[j]
+                chain = ccl[j]
+
+                by_dep[ctx]['conf'].append(conf)
+                by_dep[ctx]['acc'].append(correct)
+                by_gkp[cat]['conf'].append(conf)
+                by_gkp[cat]['acc'].append(correct)
+                by_cl[chain]['conf'].append(conf)
+                by_cl[chain]['acc'].append(correct)
+
+                if cat == 'p':
+                    p_chain_lens.append(chain)
+                    p_confs.append(conf)
+
+                if not correct:
+                    sample_all_correct = False
+
+            if not sample_has_p:
+                no_p_count += 1
+                no_p_correct += int(sample_all_correct)
+                for j in range(ANS_LEN):
+                    pos = a_s + j
+                    tgt = ids[b, pos].item()
+                    cl2 = logits[b, pos].clone()
+                    cl2[mask_id] = -float('inf')
+                    no_p_digit_correct += int(cl2.argmax().item() == tgt)
+                    no_p_digit_total += 1
+
+    # Summarise
+    def _summarise(d):
+        return {k: {'mean_conf': sum(v['conf'])/max(len(v['conf']),1),
+                     'mean_acc': sum(v['acc'])/max(len(v['acc']),1),
+                     'n': len(v['conf'])}
+                for k, v in sorted(d.items(), key=lambda x: str(x[0]))}
+
+    # Pearson correlation for p positions: chain_len vs confidence
+    chain_conf_corr = None
+    if len(p_chain_lens) >= 10:
+        x = np.array(p_chain_lens, dtype=float)
+        y = np.array(p_confs, dtype=float)
+        xm, ym = x.mean(), y.mean()
+        cov = ((x - xm) * (y - ym)).sum()
+        sx = np.sqrt(((x - xm)**2).sum())
+        sy = np.sqrt(((y - ym)**2).sum())
+        chain_conf_corr = float(cov / (sx * sy)) if sx > 0 and sy > 0 else 0.0
+
+    return {
+        'by_dep_context': _summarise(by_dep),
+        'by_chain_len': _summarise(by_cl),
+        'by_gkp': _summarise(by_gkp),
+        'chain_conf_corr': chain_conf_corr,
+        'no_p_samples': {
+            'n': no_p_count,
+            'one_step_exact_acc': no_p_correct / max(no_p_count, 1),
+            'one_step_digit_acc': no_p_digit_correct / max(no_p_digit_total, 1),
+        },
+    }
 
 
 
@@ -747,6 +1012,15 @@ def train_with_dynamics(
                  if 'conf_concordance' in probe else '')
               + f" | {time.time()-t0:.0f}s")
         print(f"      {acc_str}")
+        # Compact dependency context summary (diffusion only)
+        dc = probe.get('dep_context')
+        if dc:
+            parts = []
+            for ctx in ['g', 'k', 'p_above_g', 'p_above_k', 'p_above_p']:
+                if ctx in dc:
+                    parts.append(f"{ctx}={dc[ctx]['conf']:.2f}/{dc[ctx]['acc']:.2f}")
+            if parts:
+                print(f"      dep(conf/acc): {' '.join(parts)}")
 
         # Generation accuracy tracking (less frequent, more expensive)
         if epoch % GEN_EVAL_EVERY == 0:
@@ -1431,6 +1705,100 @@ def make_figures(all_dyn, all_final):
             fig.suptitle(f'Confidence Ordering Dynamics — {fmt}', fontsize=13, y=1.02)
             fig.tight_layout(); figs[f'conf_ordering_{fmt}'] = fig
 
+        # ── Fig 4c: Dependency context confidence & accuracy evolution ──
+        # Tracks whether carry chain RECOGNITION forms before/after ACCURACY
+        if dconds:
+            ctx_order = ['g', 'k', 'p_above_g', 'p_above_k', 'p_above_p', 'p_bottom']
+            ctx_colors = {'g': '#2ecc71', 'k': '#3498db', 'p_above_g': '#27ae60',
+                          'p_above_k': '#2980b9', 'p_above_p': '#e74c3c',
+                          'p_bottom': '#f39c12', 'carry_out': '#95a5a6'}
+            n_dc = len(dconds)
+            fig, axes = plt.subplots(2, n_dc, figsize=(7*n_dc, 10), squeeze=False)
+            for ai, (mt, key) in enumerate(dconds):
+                dyn = all_dyn[key]
+                cps = dyn['checkpoints']
+                xs = [c['epoch'] for c in cps if 'dep_context' in c]
+                if not xs: continue
+                # Top row: confidence by context
+                ax = axes[0][ai]
+                for ctx in ctx_order:
+                    ys = [c['dep_context'][ctx]['conf']
+                          for c in cps if 'dep_context' in c and ctx in c['dep_context']]
+                    if ys and len(ys) == len(xs):
+                        ax.plot(xs, ys, '-', color=ctx_colors.get(ctx, '#333'),
+                                label=ctx, lw=1.5, alpha=0.8)
+                ax.set_xlabel('Epoch'); ax.set_ylabel('Mean Confidence')
+                ax.set_ylim(0, 1.05); ax.set_title(f'mask={mt} — Confidence')
+                ax.legend(fontsize=5, ncol=2); ax.grid(alpha=0.3)
+                # Bottom row: accuracy by context
+                ax = axes[1][ai]
+                for ctx in ctx_order:
+                    ys = [c['dep_context'][ctx]['acc']
+                          for c in cps if 'dep_context' in c and ctx in c['dep_context']]
+                    if ys and len(ys) == len(xs):
+                        ax.plot(xs, ys, '-', color=ctx_colors.get(ctx, '#333'),
+                                label=ctx, lw=1.5, alpha=0.8)
+                ax.set_xlabel('Epoch'); ax.set_ylabel('Mean Accuracy')
+                ax.set_ylim(-0.05, 1.05); ax.set_title(f'mask={mt} — Accuracy')
+                ax.legend(fontsize=5, ncol=2); ax.grid(alpha=0.3)
+            fig.suptitle(f'Carry Chain Recognition vs Accuracy Over Training — {fmt}',
+                         fontsize=13, y=1.02)
+            fig.tight_layout(); figs[f'dep_ctx_evo_{fmt}'] = fig
+
+        # ── Fig 4d: Recognition gap evolution ──
+        # conf(g/k) − conf(p_above_p): when does the model learn to distinguish?
+        if dconds:
+            fig, axes = plt.subplots(1, 2, figsize=(16, 5))
+            # Left: confidence gap
+            ax = axes[0]
+            for mt, key in dconds:
+                dyn = all_dyn[key]
+                cps = dyn['checkpoints']
+                xs, ys = [], []
+                for c in cps:
+                    dc = c.get('dep_context')
+                    if dc and 'g' in dc and 'p_above_p' in dc:
+                        gk_conf = (dc['g']['conf'] * dc['g']['n']
+                                   + dc['k']['conf'] * dc['k']['n']) / (dc['g']['n'] + dc['k']['n'])
+                        gap = gk_conf - dc['p_above_p']['conf']
+                        xs.append(c['epoch']); ys.append(gap)
+                if xs:
+                    ck = _ck('diffusion', mt)
+                    ax.plot(xs, ys, '-', color=COLORS.get(ck+'con', COLORS.get(ck, '#333')),
+                            label=f'mask={mt}', lw=1.5, alpha=0.8)
+            ax.axhline(0, color='grey', ls=':', lw=1, alpha=0.5)
+            ax.set_xlabel('Epoch')
+            ax.set_ylabel('conf(g/k) − conf(p_above_p)')
+            ax.set_title('Confidence Recognition Gap')
+            ax.legend(fontsize=6); ax.grid(alpha=0.3)
+            # Right: accuracy gap
+            ax = axes[1]
+            for mt, key in dconds:
+                dyn = all_dyn[key]
+                cps = dyn['checkpoints']
+                xs, ys = [], []
+                for c in cps:
+                    dc = c.get('dep_context')
+                    if dc and 'g' in dc and 'p_above_p' in dc:
+                        gk_acc = (dc['g']['acc'] * dc['g']['n']
+                                  + dc['k']['acc'] * dc['k']['n']) / (dc['g']['n'] + dc['k']['n'])
+                        gap = gk_acc - dc['p_above_p']['acc']
+                        xs.append(c['epoch']); ys.append(gap)
+                if xs:
+                    ck = _ck('diffusion', mt)
+                    ax.plot(xs, ys, '-', color=COLORS.get(ck+'con', COLORS.get(ck, '#333')),
+                            label=f'mask={mt}', lw=1.5, alpha=0.8)
+            ax.axhline(0, color='grey', ls=':', lw=1, alpha=0.5)
+            ax.set_xlabel('Epoch')
+            ax.set_ylabel('acc(g/k) − acc(p_above_p)')
+            ax.set_title('Accuracy Gap')
+            ax.legend(fontsize=6); ax.grid(alpha=0.3)
+            fig.suptitle(f'Recognition vs Computation Gap — {fmt}\n'
+                         '(conf gap rises → model knows what\'s hard; '
+                         'acc gap rises → model can\'t yet solve hard cases)',
+                         fontsize=11, y=1.05)
+            fig.tight_layout(); figs[f'recognition_gap_{fmt}'] = fig
+
         # ── Fig 5: Final per-position accuracy ──
         fig, axes = plt.subplots(1, 3, figsize=(21, 5))
         diff_conf = [('diffusion', mt, 'confidence') for mt in MASK_TYPES]
@@ -1839,6 +2207,116 @@ def make_figures(all_dyn, all_final):
             ax.legend(); ax.grid(alpha=0.3, axis='y')
             fig.tight_layout(); figs[f'carry_heavy_{fmt}'] = fig
 
+        # ── Fig 19: Dependency context confidence + accuracy ──
+        gkp_results = {}
+        for mt in MASK_TYPES:
+            key = _fk('diffusion', fmt, mt, 'gkp_detail')
+            gkp_d = all_final.get(key)
+            if gkp_d:
+                gkp_results[mt] = gkp_d
+        if gkp_results:
+            n_mt = len(gkp_results)
+            fig, axes = plt.subplots(2, n_mt, figsize=(7*n_mt, 10), squeeze=False)
+            ctx_order = ['g', 'k', 'p_above_g', 'p_above_k', 'p_above_p', 'p_bottom', 'carry_out']
+            ctx_colors = {'g': '#2ecc71', 'k': '#3498db', 'p_above_g': '#27ae60',
+                          'p_above_k': '#2980b9', 'p_above_p': '#e74c3c',
+                          'p_bottom': '#f39c12', 'carry_out': '#95a5a6'}
+            for ai, (mt, gd) in enumerate(gkp_results.items()):
+                bdc = gd['by_dep_context']
+                cats = [c for c in ctx_order if c in bdc]
+                x = range(len(cats))
+                confs = [bdc[c]['mean_conf'] for c in cats]
+                accs = [bdc[c]['mean_acc'] for c in cats]
+                colors = [ctx_colors.get(c, '#333') for c in cats]
+
+                ax = axes[0][ai]
+                ax.bar(x, confs, color=colors, alpha=0.8)
+                ax.set_xticks(list(x)); ax.set_xticklabels(cats, fontsize=7, rotation=30)
+                ax.set_ylim(0, 1.05); ax.set_ylabel('Mean Confidence')
+                ax.set_title(f'mask={mt}'); ax.grid(alpha=0.3, axis='y')
+
+                ax = axes[1][ai]
+                ax.bar(x, accs, color=colors, alpha=0.8)
+                ax.set_xticks(list(x)); ax.set_xticklabels(cats, fontsize=7, rotation=30)
+                ax.set_ylim(0, 1.05); ax.set_ylabel('Mean Accuracy')
+                ax.set_title(f'mask={mt}'); ax.grid(alpha=0.3, axis='y')
+
+            fig.suptitle(f'Fully-Masked Confidence & Accuracy by Dependency Context — {fmt}',
+                         fontsize=12, y=1.02)
+            fig.tight_layout(); figs[f'dep_context_{fmt}'] = fig
+
+        # ── Fig 20: Chain length vs confidence for p positions ──
+        if gkp_results:
+            fig, axes = plt.subplots(1, len(gkp_results), figsize=(7*len(gkp_results), 5),
+                                     squeeze=False)
+            axes = axes[0]
+            for ai, (mt, gd) in enumerate(gkp_results.items()):
+                ax = axes[ai]
+                bcl = gd['by_chain_len']
+                # Only chain_len >= 1 (p positions)
+                cls = sorted([cl for cl in bcl if cl >= 1])
+                if cls:
+                    confs = [bcl[cl]['mean_conf'] for cl in cls]
+                    accs = [bcl[cl]['mean_acc'] for cl in cls]
+                    ax.plot(cls, confs, '-o', color='#e74c3c', label='confidence', lw=2, ms=5)
+                    ax.plot(cls, accs, '-s', color='#3498db', label='accuracy', lw=2, ms=5)
+                    # Also show chain=0 (g/k) as reference
+                    if 0 in bcl:
+                        ax.axhline(bcl[0]['mean_conf'], color='#e74c3c', ls=':', alpha=0.5,
+                                   label=f'g/k conf={bcl[0]["mean_conf"]:.3f}')
+                        ax.axhline(bcl[0]['mean_acc'], color='#3498db', ls=':', alpha=0.5,
+                                   label=f'g/k acc={bcl[0]["mean_acc"]:.3f}')
+                corr = gd.get('chain_conf_corr')
+                corr_str = f' (r={corr:.3f})' if corr is not None else ''
+                ax.set_xlabel('Carry Chain Length')
+                ax.set_ylabel('Value')
+                ax.set_ylim(0, 1.05)
+                ax.set_title(f'mask={mt}{corr_str}')
+                ax.legend(fontsize=7); ax.grid(alpha=0.3)
+            fig.suptitle(f'Chain Length → Confidence & Accuracy (p positions) — {fmt}',
+                         fontsize=12, y=1.02)
+            fig.tight_layout(); figs[f'chain_conf_{fmt}'] = fig
+
+        # ── Fig 21: No-propagate one-step accuracy ──
+        nop_data_fig = []
+        for mt in MASK_TYPES:
+            # From standard test (no_p_samples within test set)
+            key = _fk('diffusion', fmt, mt, 'gkp_detail')
+            gd = all_final.get(key)
+            if gd:
+                nps = gd['no_p_samples']
+                nop_data_fig.append((mt, nps['one_step_exact_acc'],
+                                     nps['one_step_digit_acc'], nps['n'], 'in-test'))
+            # From dedicated no-p test
+            key_np = _fk('diffusion', fmt, mt, 'no_prop')
+            gd_np = all_final.get(key_np)
+            if gd_np:
+                nps = gd_np['no_p_samples']
+                nop_data_fig.append((mt, nps['one_step_exact_acc'],
+                                     nps['one_step_digit_acc'], nps['n'], 'dedicated'))
+        if nop_data_fig:
+            fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+            # Group by source
+            for ai, source in enumerate(['in-test', 'dedicated']):
+                ax = axes[ai]
+                items = [(mt, ex, dg, n) for mt, ex, dg, n, src in nop_data_fig if src == source]
+                if not items: continue
+                x = range(len(items))
+                w = 0.35
+                ax.bar([xi-w/2 for xi in x], [it[1] for it in items], w,
+                       label='Exact match', color='#e74c3c', alpha=0.8)
+                ax.bar([xi+w/2 for xi in x], [it[2] for it in items], w,
+                       label='Digit acc', color='#3498db', alpha=0.8)
+                ax.set_xticks(list(x))
+                ax.set_xticklabels([f'{it[0]}\n(n={it[3]})' for it in items],
+                                   fontsize=7)
+                ax.set_ylim(0, 1.05); ax.set_ylabel('Accuracy')
+                ax.set_title(f'No-Propagate One-Step ({source})')
+                ax.legend(); ax.grid(alpha=0.3, axis='y')
+            fig.suptitle(f'Can the Model Solve Without Carry Ambiguity? — {fmt}',
+                         fontsize=12, y=1.02)
+            fig.tight_layout(); figs[f'no_prop_acc_{fmt}'] = fig
+
     return figs
 
 
@@ -1951,6 +2429,32 @@ def run(tag=''):
                 std_acc = all_final[key_std]['accuracy']
                 print(f"    heavy {dp}: {r_h['accuracy']:.4f} (standard: {std_acc:.4f}, "
                       f"Δ={r_h['accuracy']-std_acc:+.4f})")
+
+            # ── GKP dependency-context probe (sample-level) ──
+            print(f"  GKP dependency probe...")
+            gkp_detail = probe_gkp_detailed(m, tok, test_data, fmt, max_len, device=DEVICE)
+            all_final[_fk('diffusion', fmt, mt, 'gkp_detail')] = gkp_detail
+            # Print dependency context summary
+            for ctx, stats in sorted(gkp_detail['by_dep_context'].items()):
+                print(f"    {ctx:<12s}: conf={stats['mean_conf']:.3f} "
+                      f"acc={stats['mean_acc']:.3f} (n={stats['n']})")
+            corr = gkp_detail['chain_conf_corr']
+            print(f"    chain_len↔confidence corr: {corr:.3f}" if corr is not None else
+                  f"    chain_len↔confidence corr: n/a")
+            np_info = gkp_detail['no_p_samples']
+            print(f"    No-p samples in test: n={np_info['n']} "
+                  f"one-step exact={np_info['one_step_exact_acc']:.3f} "
+                  f"digit={np_info['one_step_digit_acc']:.3f}")
+
+            # ── No-propagate dedicated test set ──
+            nop_data = gen_no_propagate_test(N_TEST, fmt, seed=8888)
+            if nop_data:
+                nop_detail = probe_gkp_detailed(m, tok, nop_data, fmt, max_len, device=DEVICE)
+                all_final[_fk('diffusion', fmt, mt, 'no_prop')] = nop_detail
+                npi = nop_detail['no_p_samples']
+                print(f"    No-p dedicated test (n={len(nop_data)}): "
+                      f"one-step exact={npi['one_step_exact_acc']:.3f} "
+                      f"digit={npi['one_step_digit_acc']:.3f}")
 
             del m; torch.cuda.empty_cache() if torch.cuda.is_available() else None
 
