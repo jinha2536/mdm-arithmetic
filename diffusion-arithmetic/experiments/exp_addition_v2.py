@@ -148,7 +148,10 @@ def parse_args():
     # Tag for save directory
     p.add_argument('--tag', type=str, default='',
                    help='Suffix for experiment name (e.g. "puma_small")')
-    p.add_argument('--seed', type=int, default=None)
+    p.add_argument('--seed', type=int, default=None,
+                   help='Single seed (default: 42)')
+    p.add_argument('--seeds', nargs='+', type=int, default=None,
+                   help='Multiple seeds for repeated runs (e.g. --seeds 42 43 44)')
 
     args = p.parse_args()
 
@@ -394,6 +397,27 @@ def gen_no_propagate_test(n, fmt, seed):
         print(f"    WARNING: only found {len(results)}/{n} no-propagate samples")
     return results
 
+def _max_chain_len(a, b):
+    """Max propagate chain length for a pair (format-independent, digit-level)."""
+    a_s, b_s = _pad(a, ND), _pad(b, ND)
+    gkp = []
+    for i in range(ND - 1, -1, -1):
+        s = int(a_s[i]) + int(b_s[i])
+        if s >= 10: gkp.append('g')
+        elif s == 9: gkp.append('p')
+        else: gkp.append('k')
+    # gkp[0]=LSB
+    max_cl = 0
+    cur_run = 0
+    for d in range(ND):
+        if gkp[d] == 'p':
+            cur_run += 1
+            max_cl = max(max_cl, cur_run)
+        else:
+            cur_run = 0
+    return max_cl
+
+
 def gen_pairs_balanced(n, seed):
     rng = random.Random(seed)
     pool = defaultdict(list)
@@ -427,8 +451,8 @@ def gen_test_pairs_full(n, seed):
     Carry-balanced like gen_pairs_balanced, but no short operands.
     """
     rng = random.Random(seed)
-    lo = 10**(ND - 1)    # 10000000 for ND=8
-    hi = 10**ND - 1       # 99999999
+    lo = 10**(ND - 1)
+    hi = 10**ND - 1
     pool = defaultdict(list)
     seen = set()
     for _ in range(max(n * 200, 100000)):
@@ -671,64 +695,111 @@ def probe_per_position(model, tokenizer, test_samples, objective,
     cl_acc_sum = defaultdict(float)
     cl_count = defaultdict(int)
 
+    # Precompute carry/dep/chain as tensors for vectorized accumulation
+    ci_tensor = torch.tensor(ci_flags, dtype=torch.bool, device=device)  # [N_test, ANS_LEN]
+    # Encode dep contexts and chain lengths as integers for efficient grouping
+    dep_ctx_names = ['g', 'k', 'p_above_g', 'p_above_k', 'p_above_p', 'p_bottom', 'carry_out']
+    dep_to_id = {name: i for i, name in enumerate(dep_ctx_names)}
+    dep_ids = torch.tensor([[dep_to_id.get(d, 0) for d in dep] for dep in dep_ctxs],
+                           dtype=torch.long, device=device)  # [N_test, ANS_LEN]
+    ccl_tensor = torch.tensor(ccl_all, dtype=torch.long, device=device)  # [N_test, ANS_LEN]
+
     for st in range(0, len(test_samples), 128):
         en = min(st+128, len(test_samples))
         ids, ans = ids_all[st:en], ans_all[st:en]
         B = ids.shape[0]
+        T = ids.shape[1]
+
+        # Build answer position indices [B, ANS_LEN]
+        ans_pos = ans.unsqueeze(1) + torch.arange(ANS_LEN, device=device)
+        ans_pos = ans_pos.clamp(max=T-1)
+        batch_idx = torch.arange(B, device=device).unsqueeze(1).expand_as(ans_pos)
 
         if objective == 'ar':
             logits = model(ids[:, :-1])
-            for b in range(B):
-                a_s = ans[b].item()
-                ci = ci_flags[st+b]
-                for j in range(ANS_LEN):
-                    sp = a_s + j - 1
-                    if sp < 0 or sp >= logits.shape[1]: continue
-                    tgt = ids[b, a_s+j]
-                    lp = F.log_softmax(logits[b, sp], dim=-1)
-                    lj = -lp[tgt].item()
-                    pred = logits[b, sp].argmax().item()
-                    cj = F.softmax(logits[b, sp], dim=-1).max().item()
-                    L[j] += lj; C[j] += float(pred == tgt.item()); CF[j] += cj; N[j] += 1
-                    if ci[j]: Lc[j] += lj; Cc[j] += float(pred == tgt.item()); Nc[j] += 1
-                    else:     Ln[j] += lj; Cn[j] += float(pred == tgt.item()); Nn[j] += 1
-        else:
-            xm = ids.clone()
-            for b in range(B):
-                a_s = ans[b].item()
-                xm[b, a_s:a_s+ANS_LEN] = mask_id
-            logits = model(xm)
-            for b in range(B):
-                a_s = ans[b].item()
-                ci = ci_flags[st+b]
-                dep = dep_ctxs[st+b]
-                ccl = ccl_all[st+b]
-                for j in range(ANS_LEN):
-                    pos = a_s + j
-                    tgt = ids[b, pos]
-                    lp = F.log_softmax(logits[b, pos], dim=-1)
-                    lj = -lp[tgt].item()
-                    pred = logits[b, pos].argmax().item()
-                    # Exclude MASK token from confidence
-                    cl = logits[b, pos].clone()
-                    cl[mask_id] = -float('inf')
-                    cj = F.softmax(cl, dim=-1).max().item()
-                    correct = float(pred == tgt.item())
-                    L[j] += lj; C[j] += correct; CF[j] += cj; N[j] += 1
-                    if ci[j]: Lc[j] += lj; Cc[j] += correct; Nc[j] += 1
-                    else:     Ln[j] += lj; Cn[j] += correct; Nn[j] += 1
+            # For AR: predict position a_s+j from logits at a_s+j-1
+            pred_pos = ans_pos - 1  # [B, ANS_LEN]
+            valid = (pred_pos >= 0) & (pred_pos < logits.shape[1])
+            pred_pos = pred_pos.clamp(min=0, max=logits.shape[1]-1)
 
-                    # Dependency context tracking (free — reuses same logits)
-                    ctx = dep[j]
-                    dep_conf_sum[ctx] += cj
-                    dep_acc_sum[ctx] += correct
-                    dep_count[ctx] += 1
-                    # Chain length tracking for p positions
-                    chain = ccl[j]
-                    if chain > 0:  # p position
-                        cl_conf_sum[chain] += cj
-                        cl_acc_sum[chain] += correct
-                        cl_count[chain] += 1
+            tgt_ids = ids[batch_idx, ans_pos]  # [B, ANS_LEN]
+            log_probs = F.log_softmax(logits[batch_idx, pred_pos], dim=-1)  # [B, ANS_LEN, V]
+            losses = -log_probs.gather(2, tgt_ids.unsqueeze(2)).squeeze(2)  # [B, ANS_LEN]
+            preds = logits[batch_idx, pred_pos].argmax(dim=-1)  # [B, ANS_LEN]
+            corrects = (preds == tgt_ids).float()  # [B, ANS_LEN]
+            confs = F.softmax(logits[batch_idx, pred_pos], dim=-1).max(dim=-1).values
+
+            # Zero out invalid positions
+            losses = losses * valid.float()
+            corrects = corrects * valid.float()
+            confs = confs * valid.float()
+            v_count = valid.float()
+
+            for j in range(ANS_LEN):
+                n_v = v_count[:, j].sum()
+                L[j] += losses[:, j].sum(); C[j] += corrects[:, j].sum()
+                CF[j] += confs[:, j].sum(); N[j] += n_v
+            # Carry-conditioned (batched)
+            ci_batch = ci_tensor[st:en]  # [B, ANS_LEN]
+            for j in range(ANS_LEN):
+                vm = valid[:, j]
+                ci_j = ci_batch[:, j] & vm
+                nc_j = ~ci_batch[:, j] & vm
+                Lc[j] += losses[ci_j, j].sum(); Cc[j] += corrects[ci_j, j].sum(); Nc[j] += ci_j.sum()
+                Ln[j] += losses[nc_j, j].sum(); Cn[j] += corrects[nc_j, j].sum(); Nn[j] += nc_j.sum()
+
+        else:  # diffusion
+            xm = ids.clone()
+            xm[batch_idx, ans_pos] = mask_id
+            logits = model(xm)
+
+            # Extract logits at answer positions [B, ANS_LEN, V]
+            ans_logits = logits[batch_idx, ans_pos]
+            tgt_ids = ids[batch_idx, ans_pos]  # [B, ANS_LEN]
+
+            log_probs = F.log_softmax(ans_logits, dim=-1)
+            losses = -log_probs.gather(2, tgt_ids.unsqueeze(2)).squeeze(2)  # [B, ANS_LEN]
+
+            # Confidence with MASK excluded
+            cl = ans_logits.clone()
+            cl[:, :, mask_id] = -float('inf')
+            probs = F.softmax(cl, dim=-1)
+            confs = probs.max(dim=-1).values  # [B, ANS_LEN]
+            preds = probs.argmax(dim=-1)  # [B, ANS_LEN]
+            corrects = (preds == tgt_ids).float()
+
+            for j in range(ANS_LEN):
+                L[j] += losses[:, j].sum(); C[j] += corrects[:, j].sum()
+                CF[j] += confs[:, j].sum(); N[j] += B
+            # Carry-conditioned
+            ci_batch = ci_tensor[st:en]
+            for j in range(ANS_LEN):
+                ci_j = ci_batch[:, j]
+                nc_j = ~ci_j
+                Lc[j] += losses[ci_j, j].sum(); Cc[j] += corrects[ci_j, j].sum(); Nc[j] += ci_j.sum()
+                Ln[j] += losses[nc_j, j].sum(); Cn[j] += corrects[nc_j, j].sum(); Nn[j] += nc_j.sum()
+
+            # Dependency context tracking (vectorized accumulation)
+            dep_batch = dep_ids[st:en]    # [B, ANS_LEN]
+            ccl_batch = ccl_tensor[st:en]  # [B, ANS_LEN]
+            confs_flat = confs.reshape(-1)
+            corrects_flat = corrects.reshape(-1)
+            dep_flat = dep_batch.reshape(-1)
+            ccl_flat = ccl_batch.reshape(-1)
+            for di, dname in enumerate(dep_ctx_names):
+                mask = (dep_flat == di)
+                if mask.any():
+                    dep_conf_sum[dname] += confs_flat[mask].sum().item()
+                    dep_acc_sum[dname] += corrects_flat[mask].sum().item()
+                    dep_count[dname] += mask.sum().item()
+            # Chain length stats (p positions: chain > 0)
+            p_mask = (ccl_flat > 0)
+            if p_mask.any():
+                for cl_val in ccl_flat[p_mask].unique().tolist():
+                    cl_mask = (ccl_flat == cl_val)
+                    cl_conf_sum[cl_val] += confs_flat[cl_mask].sum().item()
+                    cl_acc_sum[cl_val] += corrects_flat[cl_mask].sum().item()
+                    cl_count[cl_val] += cl_mask.sum().item()
 
     s = N.clamp(1)
     pos_conf = (CF/s).cpu().tolist()
@@ -821,98 +892,112 @@ def probe_gkp_detailed(model, tokenizer, test_samples, fmt, max_len, device=None
 
     ids_all, ans_all = encode_samples(test_samples, tokenizer, max_len)
     ids_all, ans_all = ids_all.to(device), ans_all.to(device)
+    N_test = len(test_samples)
+    T = ids_all.shape[1]
 
-    by_dep = defaultdict(lambda: {'conf': [], 'acc': []})
-    by_cl = defaultdict(lambda: {'conf': [], 'acc': []})
-    by_gkp = defaultdict(lambda: {'conf': [], 'acc': []})
-    # For chain_len vs confidence correlation (p positions only)
-    p_chain_lens = []
-    p_confs = []
-    # No-propagate sample tracking
-    no_p_correct = 0
-    no_p_digit_correct = 0
-    no_p_digit_total = 0
-    no_p_count = 0
+    # Precompute all metadata as tensors
+    dep_ctx_names = ['g', 'k', 'p_above_g', 'p_above_k', 'p_above_p', 'p_bottom', 'carry_out']
+    dep_to_id = {name: i for i, name in enumerate(dep_ctx_names)}
+    gkp_names = ['g', 'k', 'p', 'carry_out']
+    gkp_to_id = {name: i for i, name in enumerate(gkp_names)}
 
-    for st in range(0, len(test_samples), 128):
-        en = min(st + 128, len(test_samples))
+    all_dep = []
+    all_gkp = []
+    all_ccl = []
+    all_has_p = []
+    for s in test_samples:
+        a, b = _parse_operands(s)
+        dep = _dependency_context_at_pos(a, b, fmt)
+        gkp = _gkp_at_answer_pos(a, b, fmt)
+        ccl = _carry_chain_length_at_pos(a, b, fmt)
+        all_dep.append([dep_to_id.get(d, 0) for d in dep])
+        all_gkp.append([gkp_to_id.get(g, 0) for g in gkp])
+        all_ccl.append(ccl)
+        all_has_p.append(any(g == 'p' for g in gkp))
+
+    dep_ids = torch.tensor(all_dep, dtype=torch.long, device=device)  # [N, ANS_LEN]
+    gkp_ids = torch.tensor(all_gkp, dtype=torch.long, device=device)
+    ccl_t = torch.tensor(all_ccl, dtype=torch.long, device=device)
+    has_p = torch.tensor(all_has_p, dtype=torch.bool, device=device)
+
+    # Accumulators
+    all_confs = torch.zeros(N_test, ANS_LEN, device=device)
+    all_corrects = torch.zeros(N_test, ANS_LEN, device=device)
+
+    for st in range(0, N_test, 128):
+        en = min(st + 128, N_test)
         ids, ans = ids_all[st:en], ans_all[st:en]
         B = ids.shape[0]
 
-        # Fully mask all answer positions
+        ans_pos = ans.unsqueeze(1) + torch.arange(ANS_LEN, device=device)
+        ans_pos = ans_pos.clamp(max=T-1)
+        batch_idx = torch.arange(B, device=device).unsqueeze(1).expand_as(ans_pos)
+
         xm = ids.clone()
-        for b in range(B):
-            a_s = ans[b].item()
-            xm[b, a_s:a_s + ANS_LEN] = mask_id
+        xm[batch_idx, ans_pos] = mask_id
         logits = model(xm)
 
-        for b in range(B):
-            a, bb = _parse_operands(test_samples[st + b])
-            a_s = ans[b].item()
-            dep_ctx = _dependency_context_at_pos(a, bb, fmt)
-            gkp = _gkp_at_answer_pos(a, bb, fmt)
-            ccl = _carry_chain_length_at_pos(a, bb, fmt)
+        ans_logits = logits[batch_idx, ans_pos]  # [B, ANS_LEN, V]
+        tgt_ids = ids[batch_idx, ans_pos]
+        cl = ans_logits.clone()
+        cl[:, :, mask_id] = -float('inf')
+        probs = F.softmax(cl, dim=-1)
+        confs = probs.max(dim=-1).values
+        preds = probs.argmax(dim=-1)
+        corrects = (preds == tgt_ids).float()
 
-            sample_all_correct = True
-            sample_has_p = any(g == 'p' for g in gkp[:ANS_LEN])
+        all_confs[st:en] = confs
+        all_corrects[st:en] = corrects
 
-            for j in range(ANS_LEN):
-                pos = a_s + j
-                tgt = ids[b, pos].item()
+    # Aggregate by dependency context
+    dep_flat = dep_ids.reshape(-1)
+    gkp_flat = gkp_ids.reshape(-1)
+    ccl_flat = ccl_t.reshape(-1)
+    conf_flat = all_confs.reshape(-1)
+    acc_flat = all_corrects.reshape(-1)
 
-                cl = logits[b, pos].clone()
-                cl[mask_id] = -float('inf')
-                probs = F.softmax(cl, dim=-1)
-                conf = probs.max().item()
-                pred = probs.argmax().item()
-                correct = float(pred == tgt)
+    by_dep = {}
+    for di, dname in enumerate(dep_ctx_names):
+        mask = (dep_flat == di)
+        if mask.any():
+            by_dep[dname] = {'conf': conf_flat[mask].tolist(), 'acc': acc_flat[mask].tolist()}
+    by_gkp = {}
+    for gi, gname in enumerate(gkp_names):
+        mask = (gkp_flat == gi)
+        if mask.any():
+            by_gkp[gname] = {'conf': conf_flat[mask].tolist(), 'acc': acc_flat[mask].tolist()}
+    by_cl = {}
+    for cl_val in ccl_flat.unique().tolist():
+        mask = (ccl_flat == cl_val)
+        by_cl[cl_val] = {'conf': conf_flat[mask].tolist(), 'acc': acc_flat[mask].tolist()}
 
-                ctx = dep_ctx[j]
-                cat = gkp[j]
-                chain = ccl[j]
+    # Chain_len vs confidence correlation (p positions only)
+    p_mask = (gkp_flat == gkp_to_id['p'])
+    chain_conf_corr = None
+    if p_mask.sum() >= 10:
+        x = ccl_flat[p_mask].float()
+        y = conf_flat[p_mask]
+        xm, ym = x.mean(), y.mean()
+        cov = ((x - xm) * (y - ym)).sum()
+        sx = ((x - xm)**2).sum().sqrt()
+        sy = ((y - ym)**2).sum().sqrt()
+        chain_conf_corr = float(cov / (sx * sy)) if sx > 0 and sy > 0 else 0.0
 
-                by_dep[ctx]['conf'].append(conf)
-                by_dep[ctx]['acc'].append(correct)
-                by_gkp[cat]['conf'].append(conf)
-                by_gkp[cat]['acc'].append(correct)
-                by_cl[chain]['conf'].append(conf)
-                by_cl[chain]['acc'].append(correct)
+    # No-propagate samples
+    no_p_mask = ~has_p
+    no_p_count = no_p_mask.sum().item()
+    if no_p_count > 0:
+        no_p_exact = (all_corrects[no_p_mask].sum(dim=1) == ANS_LEN).float().mean().item()
+        no_p_digit = all_corrects[no_p_mask].mean().item()
+    else:
+        no_p_exact = 0.0
+        no_p_digit = 0.0
 
-                if cat == 'p':
-                    p_chain_lens.append(chain)
-                    p_confs.append(conf)
-
-                if not correct:
-                    sample_all_correct = False
-
-            if not sample_has_p:
-                no_p_count += 1
-                no_p_correct += int(sample_all_correct)
-                for j in range(ANS_LEN):
-                    pos = a_s + j
-                    tgt = ids[b, pos].item()
-                    cl2 = logits[b, pos].clone()
-                    cl2[mask_id] = -float('inf')
-                    no_p_digit_correct += int(cl2.argmax().item() == tgt)
-                    no_p_digit_total += 1
-
-    # Summarise
     def _summarise(d):
         return {k: {'mean_conf': sum(v['conf'])/max(len(v['conf']),1),
                      'mean_acc': sum(v['acc'])/max(len(v['acc']),1),
                      'n': len(v['conf'])}
                 for k, v in sorted(d.items(), key=lambda x: str(x[0]))}
-
-    # Pearson correlation for p positions: chain_len vs confidence
-    chain_conf_corr = None
-    if len(p_chain_lens) >= 10:
-        x = np.array(p_chain_lens, dtype=float)
-        y = np.array(p_confs, dtype=float)
-        xm, ym = x.mean(), y.mean()
-        cov = ((x - xm) * (y - ym)).sum()
-        sx = np.sqrt(((x - xm)**2).sum())
-        sy = np.sqrt(((y - ym)**2).sum())
-        chain_conf_corr = float(cov / (sx * sy)) if sx > 0 and sy > 0 else 0.0
 
     return {
         'by_dep_context': _summarise(by_dep),
@@ -921,8 +1006,8 @@ def probe_gkp_detailed(model, tokenizer, test_samples, fmt, max_len, device=None
         'chain_conf_corr': chain_conf_corr,
         'no_p_samples': {
             'n': no_p_count,
-            'one_step_exact_acc': no_p_correct / max(no_p_count, 1),
-            'one_step_digit_acc': no_p_digit_correct / max(no_p_digit_total, 1),
+            'one_step_exact_acc': no_p_exact,
+            'one_step_digit_acc': no_p_digit,
         },
     }
 
@@ -987,7 +1072,7 @@ def train_with_dynamics(
         return MIN_LR + 0.5 * (LR - MIN_LR) * (1 + math.cos(math.pi * min(ratio, 1.0)))
 
     dynamics = {'checkpoints': [], 'gen_checkpoints': [], 'train_loss': []}
-    best_loss = float('inf')
+    best_loss = float('inf')  # held-out probe loss (not training loss)
     best_state = None
     it = 0
     tg = 0  # token-gradient count
@@ -999,10 +1084,18 @@ def train_with_dynamics(
         return ['LSB'] + [f'p{j}' for j in range(1, ANS_LEN-1)] + ['MSB']
 
     def _do_eval(epoch):
+        nonlocal best_loss, best_state
         probe = probe_per_position(
             model, tokenizer, test_samples, objective, fmt, max_len, device)
         dynamics['checkpoints'].append({
             'epoch': epoch, 'iter': it, 'token_gradients': tg, **probe})
+
+        # Best model by held-out probe loss (fair across mask types)
+        pl = probe['overall_loss']
+        if pl < best_loss and epoch > 0:
+            best_loss = pl
+            best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+
         labs = _pos_labels()
         acc_str = ' '.join(f"{labs[j]}={probe['pos_acc'][j]:.2f}"
                            for j in range(ANS_LEN))
@@ -1023,7 +1116,13 @@ def train_with_dynamics(
                 print(f"      dep(conf/acc): {' '.join(parts)}")
 
         # Generation accuracy tracking (less frequent, more expensive)
-        if epoch % GEN_EVAL_EVERY == 0:
+        # Front-loaded: denser in first 10% to catch early dynamics
+        gen_eval_now = (epoch % GEN_EVAL_EVERY == 0)
+        if not gen_eval_now and epoch < MAX_EPOCHS * 0.1:
+            gen_eval_now = (epoch % max(GEN_EVAL_EVERY // 4, 1) == 0)
+        elif not gen_eval_now and epoch < MAX_EPOCHS * 0.3:
+            gen_eval_now = (epoch % max(GEN_EVAL_EVERY // 2, 1) == 0)
+        if gen_eval_now:
             gen_entry = {'epoch': epoch}
             if objective == 'ar':
                 r = _quick_gen_eval(
@@ -1036,7 +1135,8 @@ def train_with_dynamics(
                 print(f"      [gen] ar={r['accuracy']:.3f}")
             else:
                 ga_strs = []
-                for dp in DECODE_POLICIES:
+                # Only confidence decode during training (lsb evaluated at final)
+                for dp in ['confidence']:
                     r = _quick_gen_eval(
                         model, tokenizer, test_samples, 'diffusion', fmt,
                         decode_policy=dp, device=device)
@@ -1075,7 +1175,7 @@ def train_with_dynamics(
         puma_perm = torch.randperm(len(train_samples))
 
     def _puma_refresh(indices):
-        """Initialize or refresh streaming buffer entries."""
+        """Initialize or refresh streaming buffer entries (vectorized)."""
         nonlocal puma_x0, puma_z, puma_ans, puma_stage, puma_pool_idx, puma_perm
         if puma_x0 is None:
             B = len(indices)
@@ -1084,63 +1184,92 @@ def train_with_dynamics(
             puma_z = torch.zeros(B, T, dtype=torch.long, device=device)
             puma_ans = torch.zeros(B, dtype=torch.long, device=device)
             puma_stage = torch.zeros(B, dtype=torch.long, device=device)
-        for bi in indices:
-            si = puma_perm[puma_pool_idx % len(puma_perm)].item()
-            puma_pool_idx += 1
-            if puma_pool_idx >= len(puma_perm):
-                puma_perm = torch.randperm(len(train_samples))
-                puma_pool_idx = 0
-            puma_x0[bi] = puma_all_ids[si]
-            puma_z[bi] = puma_all_ids[si].clone()
-            puma_ans[bi] = puma_all_ans[si]
-            a_s = puma_all_ans[si].item()
-            puma_z[bi, a_s:min(a_s + ANS_LEN, puma_z.shape[1])] = mask_id
-            puma_stage[bi] = 0
+        idx_t = torch.tensor(indices, device=device)
+        n = len(indices)
+        # Gather pool indices, handle wrap-around
+        pool_end = puma_pool_idx + n
+        if pool_end <= len(puma_perm):
+            si = puma_perm[puma_pool_idx:pool_end]
+            puma_pool_idx = pool_end
+        else:
+            part1 = puma_perm[puma_pool_idx:]
+            puma_perm = torch.randperm(len(train_samples))
+            remaining = n - len(part1)
+            part2 = puma_perm[:remaining]
+            si = torch.cat([part1, part2])
+            puma_pool_idx = remaining
+        si = si.to(device)
+        puma_x0[idx_t] = puma_all_ids[si]
+        puma_z[idx_t] = puma_all_ids[si].clone()
+        puma_ans[idx_t] = puma_all_ans[si]
+        puma_stage[idx_t] = 0
+        # Mask answer regions (vectorized)
+        ans_pos = puma_ans[idx_t].unsqueeze(1) + torch.arange(ANS_LEN, device=device)
+        ans_pos = ans_pos.clamp(max=puma_z.shape[1]-1)
+        bi_exp = idx_t.unsqueeze(1).expand_as(ans_pos)
+        puma_z[bi_exp, ans_pos] = mask_id
 
     def _chain_advance(logits_det, K_cur):
-        """Advance chains. Policy depends on mask_type:
-        - puma: reveal highest-confidence positions (adaptive, zero overhead)
+        """Advance chains (vectorized). Policy depends on mask_type:
+        - puma: reveal highest-confidence positions (adaptive)
         - oracle_lsb: reveal LSB-first positions (fixed order)
         """
         nonlocal puma_z, puma_stage
         B = puma_z.shape[0]
-        refresh_list = []
-        for bi in range(B):
-            mpos = (puma_z[bi] == mask_id).nonzero(as_tuple=True)[0]
-            if len(mpos) == 0:
-                refresh_list.append(bi); continue
-            # How many to reveal this step
-            K_rem = max(K_cur - puma_stage[bi].item(), 1)
-            n_reveal = max(1, math.ceil(len(mpos) / K_rem))
+        T = puma_z.shape[1]
 
-            if mask_type == 'puma':
-                # Adaptive: rank by model confidence
-                lp = logits_det[bi, mpos].clone()
-                lp[:, mask_id] = -float('inf')
-                confs = F.softmax(lp, dim=-1).max(dim=-1).values
-                above_tau = confs > PUMA_TAU
-                _, topk_idx = confs.topk(min(n_reveal, len(mpos)))
-                reveal = torch.zeros(len(mpos), dtype=torch.bool, device=device)
-                reveal[topk_idx] = True
-                reveal = reveal | above_tau
+        # Build answer position indices [B, ANS_LEN]
+        ans_pos = puma_ans.unsqueeze(1) + torch.arange(ANS_LEN, device=device)
+        ans_pos = ans_pos.clamp(max=T-1)
+        batch_idx = torch.arange(B, device=device).unsqueeze(1).expand_as(ans_pos)
+
+        # Which answer positions are still masked? [B, ANS_LEN]
+        is_masked = (puma_z[batch_idx, ans_pos] == mask_id)
+        n_masked = is_masked.sum(dim=1)  # [B]
+
+        # How many to reveal per sample
+        K_rem = (K_cur - puma_stage).clamp(min=1)  # [B]
+        n_reveal = (n_masked.float() / K_rem.float()).ceil().long().clamp(min=1)  # [B]
+
+        if mask_type == 'puma':
+            # Get confidence at answer positions
+            lp = logits_det[batch_idx, ans_pos].clone()  # [B, ANS_LEN, V]
+            lp[:, :, mask_id] = -float('inf')
+            confs = F.softmax(lp, dim=-1).max(dim=-1).values  # [B, ANS_LEN]
+            # Non-masked positions get -inf so they're never selected
+            confs[~is_masked] = -float('inf')
+            # Rank descending by confidence
+            ranked = confs.argsort(dim=1, descending=True)  # [B, ANS_LEN]
+            rank_of_pos = torch.zeros_like(ranked)
+            rank_of_pos.scatter_(1, ranked, torch.arange(ANS_LEN, device=device).expand(B, -1))
+            # Reveal if rank < n_reveal OR confidence > tau
+            reveal = (rank_of_pos < n_reveal.unsqueeze(1)) | (confs > PUMA_TAU)
+            reveal = reveal & is_masked
+        else:
+            # Oracle LSB-first: assign priority by position
+            if fmt == 'plain':
+                # plain: higher index = more LSB → reveal first → priority = index
+                priority = torch.arange(ANS_LEN, device=device).expand(B, -1).float()
             else:
-                # Oracle LSB-first: reveal by position order
-                # plain: higher abs pos = LSB → reveal first (descending)
-                # reverse: lower abs pos = LSB → reveal first (ascending)
-                if fmt == 'plain':
-                    order = mpos.argsort(descending=True)
-                else:
-                    order = mpos.argsort(descending=False)
-                reveal = torch.zeros(len(mpos), dtype=torch.bool, device=device)
-                reveal[order[:n_reveal]] = True
+                # reverse: lower index = more LSB → reveal first → priority = -index
+                priority = -torch.arange(ANS_LEN, device=device).expand(B, -1).float()
+            priority[~is_masked] = -float('inf')
+            ranked = priority.argsort(dim=1, descending=True)
+            rank_of_pos = torch.zeros_like(ranked)
+            rank_of_pos.scatter_(1, ranked, torch.arange(ANS_LEN, device=device).expand(B, -1))
+            reveal = (rank_of_pos < n_reveal.unsqueeze(1)) & is_masked
 
-            reveal_pos = mpos[reveal]
-            puma_z[bi, reveal_pos] = puma_x0[bi, reveal_pos]
-            puma_stage[bi] += 1
-            if puma_stage[bi] >= K_cur or not (puma_z[bi] == mask_id).any():
-                refresh_list.append(bi)
-        if refresh_list:
-            _puma_refresh(refresh_list)
+        # Apply reveals
+        reveal_abs = ans_pos[reveal]
+        batch_reveal = batch_idx[reveal]
+        puma_z[batch_reveal, reveal_abs] = puma_x0[batch_reveal, reveal_abs]
+        puma_stage += 1
+
+        # Check which samples are done (no masks left or stage >= K)
+        still_masked = (puma_z[batch_idx, ans_pos] == mask_id).any(dim=1)
+        done = (~still_masked) | (puma_stage >= K_cur)
+        if done.any():
+            _puma_refresh(done.nonzero(as_tuple=True)[0].tolist())
 
     if uses_streaming:
         _puma_refresh(list(range(BATCH_SIZE)))
@@ -1199,40 +1328,48 @@ def train_with_dynamics(
                 else:  # diffusion (non-streaming)
                     pos = torch.arange(T, device=device).unsqueeze(0)
                     ans_mask = pos >= ans_starts.unsqueeze(1)
+                    # Precompute answer position indices [B, ANS_LEN]
+                    ans_pos = ans_starts.unsqueeze(1) + torch.arange(ANS_LEN, device=device)
+                    ans_pos = ans_pos.clamp(max=T-1)
 
                     if mask_type == 'random':
                         t_ratio = torch.rand(B, device=device)
                         m_probs = t_ratio.unsqueeze(1) * ans_mask.float()
                         m = torch.bernoulli(m_probs).bool()
+                        # Guarantee at least one mask per sample (vectorized)
                         no_m = ~(m.any(dim=1))
-                        for bi in no_m.nonzero(as_tuple=True)[0]:
-                            v = ans_mask[bi].nonzero(as_tuple=True)[0]
-                            if len(v) > 0: m[bi, v[torch.randint(len(v),(1,))]] = True
+                        if no_m.any():
+                            # Pick random answer position for each no-mask sample
+                            rand_j = torch.randint(ANS_LEN, (no_m.sum(),), device=device)
+                            fix_pos = ans_pos[no_m].gather(1, rand_j.unsqueeze(1)).squeeze(1)
+                            m[no_m, fix_pos] = True
 
                     elif mask_type == 'confidence':
-                        # Single-probe adaptive: fully-masked → rank → mask bottom
+                        # Single-probe adaptive: fully-masked → rank → mask bottom (vectorized)
                         xm_probe = ids.clone()
-                        for bi in range(B):
-                            a_s = ans_starts[bi].item()
-                            xm_probe[bi, a_s:min(a_s + ANS_LEN, T)] = mask_id
+                        # Batch mask all answer regions at once
+                        batch_idx = torch.arange(B, device=device).unsqueeze(1).expand_as(ans_pos)
+                        xm_probe[batch_idx, ans_pos] = mask_id
                         model.eval()
                         with torch.no_grad():
                             logits_probe = model(xm_probe)
                         model.train()
 
+                        # Extract logits at answer positions [B, ANS_LEN, V]
+                        lp = logits_probe[batch_idx, ans_pos]
+                        lp[:, :, mask_id] = -float('inf')
+                        confs = F.softmax(lp, dim=-1).max(dim=-1).values  # [B, ANS_LEN]
+                        # Rank by ascending confidence
+                        ranked = confs.argsort(dim=1)  # [B, ANS_LEN]
+                        # Number to mask per sample
                         t_ratio = torch.rand(B, device=device)
+                        nm = (t_ratio * ANS_LEN).ceil().long().clamp(min=1)  # [B]
+                        # Build mask: positions with rank < nm[b] get masked
+                        rank_of_pos = torch.zeros_like(ranked)
+                        rank_of_pos.scatter_(1, ranked, torch.arange(ANS_LEN, device=device).expand(B, -1))
+                        to_mask = rank_of_pos < nm.unsqueeze(1)  # [B, ANS_LEN]
                         m = torch.zeros(B, T, dtype=torch.bool, device=device)
-                        for bi in range(B):
-                            a_s = ans_starts[bi].item()
-                            a_pos = list(range(a_s, min(a_s + ANS_LEN, T)))
-                            na = len(a_pos)
-                            nm = max(1, int(math.ceil(t_ratio[bi].item() * na)))
-                            lp = logits_probe[bi, torch.tensor(a_pos, device=device)].clone()
-                            lp[:, mask_id] = -float('inf')
-                            confs = F.softmax(lp, dim=-1).max(dim=-1).values
-                            ranked = confs.argsort()  # ascending
-                            for k in range(nm):
-                                m[bi, a_pos[ranked[k].item()]] = True
+                        m[batch_idx, ans_pos] = to_mask
 
                     xm = ids.clone(); xm[m] = mask_id
                     logits = model(xm)
@@ -1252,11 +1389,6 @@ def train_with_dynamics(
         # ── End of epoch ──
         avg_loss = epoch_loss / max(epoch_n, 1)
 
-        # Best model snapshot (by own training loss)
-        if avg_loss < best_loss:
-            best_loss = avg_loss
-            best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
-
         if epoch % LOG_EVERY == 0:
             dynamics['train_loss'].append((epoch, avg_loss))
             print(f"    ep {epoch:4d}/{MAX_EPOCHS} | loss {avg_loss:.4f} | "
@@ -1264,9 +1396,15 @@ def train_with_dynamics(
 
         if epoch % EVAL_EVERY == 0 and epoch < MAX_EPOCHS:
             model.eval(); _do_eval(epoch); model.train()
+        elif epoch < MAX_EPOCHS * 0.1 and epoch % max(EVAL_EVERY // 5, 1) == 0:
+            # Dense eval in first 10% of training — catch early dynamics
+            model.eval(); _do_eval(epoch); model.train()
+        elif epoch < MAX_EPOCHS * 0.3 and epoch % max(EVAL_EVERY // 2, 1) == 0:
+            # Medium-dense eval in next 20%
+            model.eval(); _do_eval(epoch); model.train()
 
     # ── Load best model ──
-    print(f"    ✓ Done {MAX_EPOCHS} epochs (best train loss: {best_loss:.4f})")
+    print(f"    ✓ Done {MAX_EPOCHS} epochs (best probe loss: {best_loss:.4f})")
     if best_state:
         model.load_state_dict({k: v.to(device) for k, v in best_state.items()})
     model.eval()
@@ -1366,7 +1504,7 @@ def final_evaluate(model, tokenizer, test_samples, objective, fmt,
 
 def _analyse_orders(decode_orders, prefix_len, fmt,
                     gkp_per_sample=None, chain_len_per_sample=None):
-    """Per-position decode rank analysis.
+    """Per-position decode rank analysis (vectorized).
     Computes:
       mean_rank:          mean decode step per position
       pairwise_conc:      fraction of position pairs decoded in LSB→MSB order
@@ -1376,117 +1514,133 @@ def _analyse_orders(decode_orders, prefix_len, fmt,
       chain_len_vs_rank:  {chain_len: mean_decode_rank} — key analysis
     """
     N, S = decode_orders.shape
+
+    # Build rop [N, ANS_LEN]: for each sample & position, what decode step was it?
+    # decode_orders[i, s] = absolute position decoded at step s
+    # We want: rop[i, j] = step at which relative position j was decoded
+    rel_orders = decode_orders - prefix_len  # [N, S]
     rop = torch.full((N, ANS_LEN), float('nan'))
-    for i in range(N):
-        for s in range(S):
-            r = decode_orders[i, s].item() - prefix_len
-            if 0 <= r < ANS_LEN: rop[i, r] = s
+    # Vectorized: for each step, assign step number to the corresponding position
+    valid = (rel_orders >= 0) & (rel_orders < ANS_LEN)
+    for s in range(S):
+        v = valid[:, s]
+        if v.any():
+            positions = rel_orders[v, s].long()
+            rop[v.nonzero(as_tuple=True)[0], positions] = s
+
+    # Mean rank per position
     mr = []
     for j in range(ANS_LEN):
         v = rop[:, j][~rop[:, j].isnan()]
         mr.append(v.mean().item() if len(v) > 0 else -1)
 
-    # Pairwise concordance
-    total_conc = 0.0
-    total_valid = 0
-    for n in range(N):
-        row = rop[n]
-        if row.isnan().any(): continue
-        conc = 0
-        for i in range(ANS_LEN):
-            for j in range(i + 1, ANS_LEN):
-                if fmt == 'plain':
-                    conc += int(row[j].item() < row[i].item())
-                else:
-                    conc += int(row[i].item() < row[j].item())
-        total_conc += conc
-        total_valid += 1
+    # Pairwise concordance (vectorized)
+    # Valid rows = no NaN in any position
+    valid_mask = ~rop.isnan().any(dim=1)  # [N]
+    rop_valid = rop[valid_mask]  # [N_valid, ANS_LEN]
+    n_valid = rop_valid.shape[0]
     n_pairs = ANS_LEN * (ANS_LEN - 1) // 2
-    pw_conc = total_conc / (total_valid * n_pairs) if total_valid > 0 else -1
 
+    if n_valid > 0:
+        # For all pairs (i, j) with i < j, count how many times
+        # the LSB-side position is decoded first
+        # Generate all pair indices
+        ii, jj = torch.triu_indices(ANS_LEN, ANS_LEN, offset=1)
+        ri = rop_valid[:, ii]  # [N_valid, n_pairs]
+        rj = rop_valid[:, jj]  # [N_valid, n_pairs]
+        if fmt == 'plain':
+            # j is more LSB → concordant if rj < ri (j decoded first)
+            conc_per_pair = (rj < ri).float()
+        else:
+            # i is more LSB → concordant if ri < rj (i decoded first)
+            conc_per_pair = (ri < rj).float()
+        pw_conc = conc_per_pair.mean().item()
+    else:
+        pw_conc = -1
+
+    # Rank histogram
     rh = torch.zeros(ANS_LEN, S)
     for j in range(ANS_LEN):
-        for r in range(S): rh[j, r] = (rop[:, j] == r).sum()
+        vals = rop[:, j][~rop[:, j].isnan()].long()
+        if len(vals) > 0:
+            rh[j].scatter_add_(0, vals.clamp(max=S-1), torch.ones_like(vals, dtype=torch.float))
 
     result = {'mean_rank': mr, 'pairwise_concordance': pw_conc,
               'rank_histogram': rh}
 
-    # G/K/P analysis
+    # G/K/P analysis (vectorized)
     if gkp_per_sample is not None and len(gkp_per_sample) >= N:
-        gkp_ranks = {'g': [], 'k': [], 'p': [], 'carry_out': []}
-        for i in range(min(N, len(gkp_per_sample))):
-            row = rop[i]
-            if row.isnan().any(): continue
-            gkp = gkp_per_sample[i]
-            for j in range(ANS_LEN):
-                cat = gkp[j]
-                if cat in gkp_ranks:
-                    gkp_ranks[cat].append(row[j].item())
-        result['gkp_mean_rank'] = {
-            cat: sum(ranks)/len(ranks) if ranks else None
-            for cat, ranks in gkp_ranks.items()
-        }
-        easy_before_hard = 0
-        easy_hard_total = 0
-        for i in range(min(N, len(gkp_per_sample))):
-            row = rop[i]
-            if row.isnan().any(): continue
-            gkp = gkp_per_sample[i]
-            for j1 in range(ANS_LEN):
-                for j2 in range(ANS_LEN):
-                    if j1 == j2: continue
-                    if gkp[j1] in ('g', 'k') and gkp[j2] == 'p':
-                        easy_hard_total += 1
-                        if row[j1].item() < row[j2].item():
-                            easy_before_hard += 1
-        result['easy_before_hard'] = (easy_before_hard / easy_hard_total
-                                       if easy_hard_total > 0 else None)
+        gkp_names = ['g', 'k', 'p', 'carry_out']
+        gkp_to_id = {name: i for i, name in enumerate(gkp_names)}
+        gkp_ids = torch.tensor([[gkp_to_id.get(g, 0) for g in gkp[:ANS_LEN]]
+                                 for gkp in gkp_per_sample[:N]])  # [N, ANS_LEN]
 
-    # Carry chain length vs decode rank
-    # Key question: do positions with longer chains get decoded later?
+        rop_v = rop_valid
+        gkp_v = gkp_ids[valid_mask]  # [N_valid, ANS_LEN]
+        rop_flat = rop_v.reshape(-1)
+        gkp_flat = gkp_v.reshape(-1)
+
+        gkp_mean_rank = {}
+        for gi, gname in enumerate(gkp_names):
+            mask = (gkp_flat == gi)
+            if mask.any():
+                gkp_mean_rank[gname] = rop_flat[mask].mean().item()
+            else:
+                gkp_mean_rank[gname] = None
+        result['gkp_mean_rank'] = gkp_mean_rank
+
+        # Easy before hard (vectorized over pairs within each sample)
+        if n_valid > 0:
+            is_easy = (gkp_v <= 1)  # g=0, k=1 → easy
+            is_p = (gkp_v == 2)     # p=2 → hard
+            # For each sample, count pairs where easy position decoded before p position
+            # Use broadcasting: [N_valid, ANS_LEN, 1] vs [N_valid, 1, ANS_LEN]
+            easy_rank = rop_v.unsqueeze(2) * is_easy.float().unsqueeze(2)  # rank of easy pos
+            p_rank = rop_v.unsqueeze(1) * is_p.float().unsqueeze(1)        # rank of p pos
+            pair_valid = is_easy.unsqueeze(2) & is_p.unsqueeze(1)  # [N_valid, ANS_LEN, ANS_LEN]
+            if pair_valid.any():
+                easy_first = (rop_v.unsqueeze(2) < rop_v.unsqueeze(1)) & pair_valid
+                result['easy_before_hard'] = easy_first.sum().item() / pair_valid.sum().item()
+            else:
+                result['easy_before_hard'] = None
+        else:
+            result['easy_before_hard'] = None
+
+    # Carry chain length vs decode rank (vectorized)
     if chain_len_per_sample is not None and len(chain_len_per_sample) >= N:
-        cl_ranks = defaultdict(list)  # chain_len → list of decode ranks
-        for i in range(min(N, len(chain_len_per_sample))):
-            row = rop[i]
-            if row.isnan().any(): continue
-            ccl = chain_len_per_sample[i]
-            for j in range(ANS_LEN):
-                cl_ranks[ccl[j]].append(row[j].item())
-        result['chain_len_vs_rank'] = {
-            cl: sum(ranks)/len(ranks)
-            for cl, ranks in sorted(cl_ranks.items()) if ranks
-        }
+        ccl = torch.tensor([c[:ANS_LEN] for c in chain_len_per_sample[:N]])  # [N, ANS_LEN]
+        ccl_v = ccl[valid_mask].reshape(-1)
+        rank_v = rop_valid.reshape(-1)
+        cl_vs_rank = {}
+        for cl_val in ccl_v.unique().tolist():
+            mask = (ccl_v == cl_val)
+            cl_vs_rank[cl_val] = rank_v[mask].mean().item()
+        result['chain_len_vs_rank'] = cl_vs_rank
 
     # Regression: reveal_step ~ β₁·position + β₂·chain_len + β₃·is_propagate
-    # Disentangles whether decode order is driven by position or dependency.
-    # β₂ > β₁ → dependency-driven;  β₁ > β₂ → position-driven.
     if (gkp_per_sample is not None and chain_len_per_sample is not None
-            and len(gkp_per_sample) >= N and len(chain_len_per_sample) >= N):
-        X_rows, y_rows = [], []
-        for i in range(min(N, len(gkp_per_sample))):
-            row = rop[i]
-            if row.isnan().any(): continue
-            gkp = gkp_per_sample[i]
-            ccl = chain_len_per_sample[i]
-            for j in range(ANS_LEN):
-                # Normalise position to [0,1]: 0=MSB, 1=LSB (plain) or 0=LSB, 1=MSB (reverse)
-                # Use "LSB distance" so higher = more LSB regardless of format
-                if fmt == 'plain':
-                    lsb_dist = j / max(ANS_LEN - 1, 1)
-                else:
-                    lsb_dist = 1.0 - j / max(ANS_LEN - 1, 1)
-                is_prop = 1.0 if gkp[j] == 'p' else 0.0
-                X_rows.append([lsb_dist, ccl[j], is_prop])
-                y_rows.append(row[j].item())
-        if len(X_rows) >= 10:
-            X = np.array(X_rows)
-            y = np.array(y_rows)
-            # Standardise for comparable β magnitudes
+            and len(gkp_per_sample) >= N and len(chain_len_per_sample) >= N
+            and n_valid > 0):
+        gkp_ids_v = gkp_ids[valid_mask]  # [N_valid, ANS_LEN]
+        ccl_v = torch.tensor([c[:ANS_LEN] for c in chain_len_per_sample[:N]])[valid_mask]
+        rank_flat = rop_valid.reshape(-1).numpy()
+        nv = rop_valid.shape[0]
+        # Position feature
+        pos_idx = torch.arange(ANS_LEN).unsqueeze(0).expand(nv, -1).reshape(-1).float().numpy()
+        if fmt == 'plain':
+            lsb_dist = pos_idx / max(ANS_LEN - 1, 1)
+        else:
+            lsb_dist = 1.0 - pos_idx / max(ANS_LEN - 1, 1)
+        chain_flat = ccl_v.reshape(-1).float().numpy()
+        is_prop = (gkp_ids_v == 2).reshape(-1).float().numpy()  # p=2
+
+        X = np.column_stack([lsb_dist, chain_flat, is_prop])
+        y = rank_flat
+        if len(X) >= 10:
             X_mean = X.mean(axis=0)
             X_std = X.std(axis=0)
             X_std[X_std == 0] = 1.0
             X_z = (X - X_mean) / X_std
-            # Add intercept
             X_z = np.column_stack([np.ones(len(X_z)), X_z])
             beta, residuals, _, _ = np.linalg.lstsq(X_z, y, rcond=None)
             y_pred = X_z @ beta
@@ -1494,12 +1648,12 @@ def _analyse_orders(decode_orders, prefix_len, fmt,
             ss_tot = ((y - y.mean()) ** 2).sum()
             r_squared = 1 - ss_res / ss_tot if ss_tot > 0 else 0
             result['regression'] = {
-                'beta_position': float(beta[1]),  # standardised
+                'beta_position': float(beta[1]),
                 'beta_chain_len': float(beta[2]),
                 'beta_is_propagate': float(beta[3]),
                 'intercept': float(beta[0]),
                 'r_squared': float(r_squared),
-                'n_obs': len(X_rows),
+                'n_obs': len(X),
             }
 
     return result
@@ -2343,7 +2497,9 @@ def run(tag=''):
     print(f"  Data:  N_TRAIN={N_TRAIN}, N_TEST={N_TEST}")
     print(f"  Budget: {MAX_EPOCHS} epochs × {N_TRAIN//BATCH_SIZE} batches "
           f"= {MAX_EPOCHS * (N_TRAIN//BATCH_SIZE):,} iters")
-    print(f"  Eval every {EVAL_EVERY} epochs, gen eval every {GEN_EVAL_EVERY} epochs")
+    print(f"  Eval every {EVAL_EVERY} epochs (dense early: /{EVAL_EVERY//5} first 10%, "
+          f"/{EVAL_EVERY//2} next 20%)")
+    print(f"  Gen eval every {GEN_EVAL_EVERY} epochs (dense early: /{GEN_EVAL_EVERY//4} first 10%)")
     print(f"  Formats: {FORMATS}  Masks: {MASK_TYPES}  Decode: {DECODE_POLICIES}")
     print(f"  AR: {'yes' if RUN_AR else 'skip'}")
 
@@ -2353,11 +2509,23 @@ def run(tag=''):
         train_data = gen_data(N_TRAIN, fmt, seed=SEED)
         test_data = gen_test_data(N_TEST, fmt, seed=9000)
         cd = defaultdict(int)
-        for s in train_data: a, b = _parse_operands(s); cd[_count_carries(a, b)] += 1
-        print(f"\n  [{fmt}] train N={len(train_data)}, carries={dict(sorted(cd.items()))}")
+        mcl = defaultdict(int)
+        for s in train_data:
+            a, b = _parse_operands(s)
+            cd[_count_carries(a, b)] += 1
+            mcl[_max_chain_len(a, b)] += 1
+        print(f"\n  [{fmt}] train N={len(train_data)}")
+        print(f"    carries={dict(sorted(cd.items()))}")
+        print(f"    max_chain={dict(sorted(mcl.items()))}")
         cd_test = defaultdict(int)
-        for s in test_data: a, b = _parse_operands(s); cd_test[_count_carries(a, b)] += 1
-        print(f"  [{fmt}] test  N={len(test_data)} (full {ND}-digit), carries={dict(sorted(cd_test.items()))}")
+        mcl_test = defaultdict(int)
+        for s in test_data:
+            a, b = _parse_operands(s)
+            cd_test[_count_carries(a, b)] += 1
+            mcl_test[_max_chain_len(a, b)] += 1
+        print(f"  [{fmt}] test  N={len(test_data)} (full {ND}-digit)")
+        print(f"    carries={dict(sorted(cd_test.items()))}")
+        print(f"    max_chain={dict(sorted(mcl_test.items()))}")
 
         # ── AR ──
         if RUN_AR:
@@ -2511,4 +2679,14 @@ def run(tag=''):
 
 if __name__ == '__main__':
     args = parse_args()
-    run(tag=args.tag)
+    seeds = args.seeds if args.seeds else [SEED]
+    if len(seeds) == 1:
+        globals()['SEED'] = seeds[0]
+        run(tag=args.tag)
+    else:
+        print(f"Multi-seed run: {seeds}")
+        for si, seed in enumerate(seeds):
+            globals()['SEED'] = seed
+            seed_tag = f"{args.tag}_s{seed}" if args.tag else f"s{seed}"
+            print(f"\n{'#'*70}\n# Seed {seed} ({si+1}/{len(seeds)})\n{'#'*70}")
+            run(tag=seed_tag)
