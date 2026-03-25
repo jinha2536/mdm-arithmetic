@@ -61,8 +61,8 @@ BATCH_SIZE = 64
 MAX_EPOCHS = 3000
 EVAL_EVERY = 50
 LOG_EVERY = 20
-GEN_EVAL_EVERY = 200
-GEN_EVAL_N = 100
+GEN_EVAL_EVERY = 500
+GEN_EVAL_N = 50
 THRESHOLD = 0.95
 
 MASK_TYPES = ['random', 'puma']
@@ -422,28 +422,38 @@ DEPTH_CAT_TO_ID = {name: i for i, name in enumerate(DEPTH_CATS)}
 
 @torch.no_grad()
 def probe_per_position(model, tokenizer, test_data, objective,
-                       max_len, device=None):
+                       max_len, device=None,
+                       test_blank_masks=None, test_cat_ids=None,
+                       ids_all=None, ans_all=None):
     """Fully-masked probe with difficulty-category tracking.
-
-    Returns dict with per-position and per-category metrics.
+    Accepts precomputed tensors to avoid Python loops in hot path.
     """
     if device is None: device = DEVICE
     model.eval()
     mask_id = tokenizer.special_ids['mask']
-
-    strings = [d['string'] for d in test_data]
-    metas = [d['meta'] for d in test_data]
-
-    ids_all, ans_all = encode_samples(strings, tokenizer, max_len)
-    ids_all, ans_all = ids_all.to(device), ans_all.to(device)
     N_test = len(test_data)
 
-    # Precompute category IDs per sample per position [N, 81]
-    cat_ids = torch.zeros(N_test, ANS_LEN, dtype=torch.long, device=device)
-    for si in range(N_test):
-        for j in range(ANS_LEN):
-            m = metas[si][j]
-            cat_ids[si, j] = DEPTH_CAT_TO_ID[_depth_to_cat(m)]
+    # Use precomputed encoded data or encode on the fly
+    if ids_all is None or ans_all is None:
+        strings = [d['string'] for d in test_data]
+        ids_all, ans_all = encode_samples(strings, tokenizer, max_len)
+        ids_all, ans_all = ids_all.to(device), ans_all.to(device)
+
+    # Use precomputed or build on the fly
+    if test_blank_masks is None or test_cat_ids is None:
+        test_blank_masks_l = torch.zeros(N_test, ANS_LEN, dtype=torch.bool, device=device)
+        test_cat_ids_l = torch.zeros(N_test, ANS_LEN, dtype=torch.long, device=device)
+        for si, d in enumerate(test_data):
+            puzzle_str = d['string'].split('=')[0]
+            for j in range(ANS_LEN):
+                if puzzle_str[j] == '0':
+                    test_blank_masks_l[si, j] = True
+                test_cat_ids_l[si, j] = DEPTH_CAT_TO_ID[_depth_to_cat(d['meta'][j])]
+        blank_masks_t = test_blank_masks_l
+        cat_ids = test_cat_ids_l
+    else:
+        blank_masks_t = test_blank_masks[:N_test]
+        cat_ids = test_cat_ids[:N_test]
 
     # Accumulators
     total_loss = torch.zeros(ANS_LEN, device=device)
@@ -451,13 +461,15 @@ def probe_per_position(model, tokenizer, test_data, objective,
     total_conf = torch.zeros(ANS_LEN, device=device)
     total_n = torch.zeros(ANS_LEN, device=device)
 
-    # Per-category accumulators
-    cat_conf_sum = defaultdict(float)
-    cat_acc_sum = defaultdict(float)
-    cat_count = defaultdict(int)
+    # Per-category accumulators (on GPU for speed)
+    n_cats = len(DEPTH_CATS)
+    cat_conf_acc = torch.zeros(n_cats, device=device)
+    cat_correct_acc = torch.zeros(n_cats, device=device)
+    cat_count_acc = torch.zeros(n_cats, dtype=torch.long, device=device)
 
-    for st in range(0, N_test, 64):
-        en = min(st + 64, N_test)
+    BS = 128  # probe batch size
+    for st in range(0, N_test, BS):
+        en = min(st + BS, N_test)
         ids = ids_all[st:en]
         ans = ans_all[st:en]
         B = ids.shape[0]
@@ -466,6 +478,7 @@ def probe_per_position(model, tokenizer, test_data, objective,
         ans_pos = ans.unsqueeze(1) + torch.arange(ANS_LEN, device=device)
         ans_pos = ans_pos.clamp(max=T-1)
         batch_idx = torch.arange(B, device=device).unsqueeze(1).expand_as(ans_pos)
+        bl = blank_masks_t[st:en]  # [B, ANS_LEN]
 
         if objective == 'ar':
             logits = model(ids[:, :-1])
@@ -478,18 +491,11 @@ def probe_per_position(model, tokenizer, test_data, objective,
             preds = logits[batch_idx, pred_pos].argmax(dim=-1)
             corrects = (preds == tgt_ids).float() * valid.float()
             confs = F.softmax(logits[batch_idx, pred_pos], dim=-1).max(dim=-1).values * valid.float()
-            v_count = valid.float()
+            w = valid.float()
         else:
-            # Only mask blank positions (given cells visible as context)
+            # Mask only blank positions
             xm = ids.clone()
-            blank_batch = torch.zeros(B, ANS_LEN, dtype=torch.bool, device=device)
-            for bi in range(B):
-                si = st + bi
-                puzzle_str = test_data[si]['string'].split('=')[0]
-                for j in range(ANS_LEN):
-                    if puzzle_str[j] == '0':
-                        blank_batch[bi, j] = True
-            xm[batch_idx[blank_batch], ans_pos[blank_batch]] = mask_id
+            xm[batch_idx[bl], ans_pos[bl]] = mask_id
             logits = model(xm)
             ans_logits = logits[batch_idx, ans_pos]
             tgt_ids = ids[batch_idx, ans_pos]
@@ -501,28 +507,26 @@ def probe_per_position(model, tokenizer, test_data, objective,
             confs = probs.max(dim=-1).values
             preds = probs.argmax(dim=-1)
             corrects = (preds == tgt_ids).float()
-            # Only count blank positions (given cells are trivial)
-            v_count = blank_batch.float()
+            w = bl.float()
 
-        for j in range(ANS_LEN):
-            w = v_count[:, j]  # 1.0 for blank/valid, 0.0 for given/invalid
-            total_loss[j] += (losses[:, j] * w).sum()
-            total_correct[j] += (corrects[:, j] * w).sum()
-            total_conf[j] += (confs[:, j] * w).sum()
-            total_n[j] += w.sum()
+        # Vectorized accumulation (no per-position loop)
+        total_loss += (losses * w).sum(dim=0)
+        total_correct += (corrects * w).sum(dim=0)
+        total_conf += (confs * w).sum(dim=0)
+        total_n += w.sum(dim=0)
 
-        # Per-category (vectorized, blank-only for diffusion)
-        cat_batch = cat_ids[st:en]
-        v_flat = v_count.reshape(-1)
+        # Per-category accumulation (vectorized scatter)
+        cat_batch = cat_ids[st:en]  # [B, ANS_LEN]
+        w_flat = w.reshape(-1)
+        valid_flat = w_flat > 0
+        cat_flat = cat_batch.reshape(-1)
         confs_flat = confs.reshape(-1)
         corrects_flat = corrects.reshape(-1)
-        cat_flat = cat_batch.reshape(-1)
-        for ci, cname in enumerate(DEPTH_CATS):
-            mask = (cat_flat == ci) & (v_flat > 0)
-            if mask.any():
-                cat_conf_sum[cname] += confs_flat[mask].sum().item()
-                cat_acc_sum[cname] += corrects_flat[mask].sum().item()
-                cat_count[cname] += mask.sum().item()
+        if valid_flat.any():
+            vc = cat_flat[valid_flat]
+            cat_conf_acc.scatter_add_(0, vc, confs_flat[valid_flat])
+            cat_correct_acc.scatter_add_(0, vc, corrects_flat[valid_flat])
+            cat_count_acc.scatter_add_(0, vc, torch.ones_like(vc, dtype=torch.long))
 
     N_safe = total_n.clamp(min=1)
     pos_loss = (total_loss / N_safe).tolist()
@@ -534,12 +538,12 @@ def probe_per_position(model, tokenizer, test_data, objective,
 
     # Per-category summary
     depth_context = {}
-    for cname in DEPTH_CATS:
-        n = cat_count.get(cname, 0)
+    for ci, cname in enumerate(DEPTH_CATS):
+        n = cat_count_acc[ci].item()
         if n > 0:
             depth_context[cname] = {
-                'mean_conf': cat_conf_sum[cname] / n,
-                'mean_acc': cat_acc_sum[cname] / n,
+                'mean_conf': cat_conf_acc[ci].item() / n,
+                'mean_acc': cat_correct_acc[ci].item() / n,
                 'n': n,
             }
 
@@ -750,6 +754,10 @@ def train_with_dynamics(
           f"{n_given_total} given (skipped), "
           f"avg {n_blank_total/N:.1f} blanks/puzzle")
 
+    # Precompute reusable tensors
+    T = train_ids.shape[1]
+    _arange_ans = torch.arange(ANS_LEN, device=device)
+
     model = Transformer(
         vocab_size=len(tokenizer), block_size=max_len + 8,
         n_layer=N_LAYER, n_head=N_HEAD, n_embd=N_EMBD,
@@ -809,7 +817,7 @@ def train_with_dynamics(
         def _chain_advance(logits, K_cur):
             nonlocal puma_stage
             B_buf = puma_z.shape[0]
-            ans_pos = puma_ans.unsqueeze(1) + torch.arange(ANS_LEN, device=device)
+            ans_pos = puma_ans.unsqueeze(1) + _arange_ans
             ans_pos = ans_pos.clamp(max=T-1)
             batch_idx = torch.arange(B_buf, device=device).unsqueeze(1).expand_as(ans_pos)
 
@@ -830,7 +838,7 @@ def train_with_dynamics(
             if mask_type == 'puma':
                 ranked = confs.argsort(dim=1, descending=True)
                 rank_of_pos = torch.zeros_like(ranked)
-                rank_of_pos.scatter_(1, ranked, torch.arange(ANS_LEN, device=device).expand(B_buf, -1))
+                rank_of_pos.scatter_(1, ranked, _arange_ans.expand(B_buf, -1))
                 reveal = (rank_of_pos < n_reveal.unsqueeze(1)) | (confs > PUMA_TAU)
                 reveal = reveal & is_masked
             else:
@@ -849,11 +857,28 @@ def train_with_dynamics(
 
         _puma_refresh(list(range(BATCH_SIZE)))
 
+    # Precompute test data tensors (once, reused by every eval)
+    test_strings = [d['string'] for d in test_data]
+    test_ids_all, test_ans_all = encode_samples(test_strings, tokenizer, max_len)
+    test_ids_all = test_ids_all.to(device)
+    test_ans_all = test_ans_all.to(device)
+    N_test = len(test_data)
+    test_blank_masks = torch.zeros(N_test, ANS_LEN, dtype=torch.bool, device=device)
+    test_cat_ids = torch.zeros(N_test, ANS_LEN, dtype=torch.long, device=device)
+    for si, d in enumerate(test_data):
+        puzzle_str = d['string'].split('=')[0]
+        for j in range(ANS_LEN):
+            if puzzle_str[j] == '0':
+                test_blank_masks[si, j] = True
+            test_cat_ids[si, j] = DEPTH_CAT_TO_ID[_depth_to_cat(d['meta'][j])]
+
     def _do_eval(epoch):
         nonlocal best_loss, best_state
         t_eval = time.time()
         probe = probe_per_position(
-            model, tokenizer, test_data, objective, max_len, device)
+            model, tokenizer, test_data, objective, max_len, device,
+            test_blank_masks=test_blank_masks, test_cat_ids=test_cat_ids,
+            ids_all=test_ids_all, ans_all=test_ans_all)
         dynamics['checkpoints'].append({
             'epoch': epoch, 'iter': it, 'token_gradients': tg, **probe})
         pl = probe['overall_loss']
@@ -945,28 +970,27 @@ def train_with_dynamics(
                     loss = F.cross_entropy(logits[lm], targets[lm])
                     epoch_tg += lm.sum()
                 else:
-                    ans_pos = ans_starts.unsqueeze(1) + torch.arange(ANS_LEN, device=device)
+                    ans_pos = ans_starts.unsqueeze(1) + _arange_ans
                     ans_pos = ans_pos.clamp(max=T_batch-1)
                     batch_idx = torch.arange(B, device=device).unsqueeze(1).expand_as(ans_pos)
 
                     if mask_type == 'random':
-                        # Only mask blank positions (given cells are never masked)
                         bl = blank_masks[idx]  # [B, ANS_LEN]
                         t_ratio = torch.rand(B, device=device)
-                        # Per-position mask probability: t_ratio * is_blank
                         m_probs = torch.zeros(B, T_batch, dtype=torch.float, device=device)
                         m_probs[batch_idx, ans_pos] = t_ratio.unsqueeze(1) * bl.float()
                         m = torch.bernoulli(m_probs).bool()
-                        # Guarantee at least one mask per sample
+                        # Vectorized no-mask fallback: pick random blank per sample
                         no_m = ~(m.any(dim=1))
                         if no_m.any():
-                            # Pick random blank position for each no-mask sample
-                            for bi_local in no_m.nonzero(as_tuple=True)[0]:
-                                bi_global = idx[bi_local]
-                                blank_js = blank_masks[bi_global].nonzero(as_tuple=True)[0]
-                                if len(blank_js) > 0:
-                                    rj = blank_js[torch.randint(len(blank_js), (1,))].item()
-                                    m[bi_local, ans_pos[bi_local, rj]] = True
+                            n_no = no_m.sum()
+                            bl_no = bl[no_m]  # [n_no, ANS_LEN]
+                            # Sample one blank per row using Gumbel trick
+                            rand_scores = torch.rand_like(bl_no.float())
+                            rand_scores[~bl_no] = -1.0  # exclude non-blank
+                            chosen_j = rand_scores.argmax(dim=1)  # [n_no]
+                            chosen_abs = ans_pos[no_m].gather(1, chosen_j.unsqueeze(1)).squeeze(1)
+                            m[no_m.nonzero(as_tuple=True)[0], chosen_abs] = True
                     elif mask_type == 'confidence':
                         bl = blank_masks[idx]  # [B, ANS_LEN]
                         xm_probe = ids.clone()
@@ -987,7 +1011,7 @@ def train_with_dynamics(
                         t_ratio = torch.rand(B, device=device)
                         nm = (t_ratio * n_blanks_per).ceil().long().clamp(min=1)
                         rank_of_pos = torch.zeros_like(ranked)
-                        rank_of_pos.scatter_(1, ranked, torch.arange(ANS_LEN, device=device).expand(B, -1))
+                        rank_of_pos.scatter_(1, ranked, _arange_ans.expand(B, -1))
                         to_mask = (rank_of_pos < nm.unsqueeze(1)) & bl
                         m = torch.zeros(B, T_batch, dtype=torch.bool, device=device)
                         m[batch_idx, ans_pos] = to_mask
