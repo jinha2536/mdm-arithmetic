@@ -139,11 +139,19 @@ def parse_args():
     return args
 
 
+
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# Sudoku Core: Solver, Generator, Depth
+# Sudoku Core: Bitmask Solver, Generator, Depth
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-def _peers(r, c):
+# ── Precomputed topology ──
+_rows = [[(r, c) for c in range(9)] for r in range(9)]
+_cols = [[(r, c) for r in range(9)] for c in range(9)]
+_boxes = [[(br+dr, bc+dc) for dr in range(3) for dc in range(3)]
+          for br in range(0, 9, 3) for bc in range(0, 9, 3)]
+ALL_GROUPS = _rows + _cols + _boxes
+
+def _peers_rc(r, c):
     br, bc = (r // 3) * 3, (c // 3) * 3
     ps = set()
     for i in range(9):
@@ -154,170 +162,234 @@ def _peers(r, c):
     ps.discard((r, c))
     return ps
 
-PEERS = {(r, c): _peers(r, c) for r in range(9) for c in range(9)}
-ROWS = [[(r, c) for c in range(9)] for r in range(9)]
-COLS = [[(r, c) for r in range(9)] for c in range(9)]
-BOXES = [[(br+dr, bc+dc) for dr in range(3) for dc in range(3)]
-         for br in range(0, 9, 3) for bc in range(0, 9, 3)]
-ALL_GROUPS = ROWS + COLS + BOXES
+PEERS = {(r, c): _peers_rc(r, c) for r in range(9) for c in range(9)}
 
-# Cell → indices of groups it belongs to
-CELL_GROUP_IDS = {}
-for r in range(9):
-    for c in range(9):
-        CELL_GROUP_IDS[(r, c)] = [gi for gi, g in enumerate(ALL_GROUPS) if (r, c) in g]
+PEERS_FLAT = [None] * 81
+UNITS_FLAT = [None] * 81
+for _r in range(9):
+    for _c in range(9):
+        _i = _r * 9 + _c
+        _units = [u for u in ALL_GROUPS if (_r, _c) in u]
+        UNITS_FLAT[_i] = [[rr * 9 + cc for rr, cc in u] for u in _units]
+        _ps = set()
+        for u in _units:
+            for rr, cc in u:
+                _ps.add(rr * 9 + cc)
+        _ps.discard(_i)
+        PEERS_FLAT[_i] = list(_ps)
 
-# Cell → set of all peer cells (sharing at least one group)
-CELL_PEERS_SET = {(r, c): _peers(r, c) for r in range(9) for c in range(9)}
+ALL_9 = 0x1FF
+VAL_BIT = [0] + [1 << (v - 1) for v in range(1, 10)]
+BIT_VAL = {1 << i: i + 1 for i in range(9)}
+POPCOUNT = [bin(i).count('1') for i in range(512)]
+LOWEST_BIT = [0] * 512
+for _i in range(1, 512):
+    LOWEST_BIT[_i] = _i & (-_i)
 
 
-def _get_candidates(grid, r, c):
-    if grid[r][c] != 0:
-        return set()
-    used = {grid[pr][pc] for pr, pc in PEERS[(r, c)]} - {0}
-    return set(range(1, 10)) - used
+# ── Bitmask constraint propagation solver ──
 
+def _bm_init(grid_flat):
+    cands = [ALL_9] * 81
+    for i in range(81):
+        if grid_flat[i] != 0:
+            if not _bm_assign(cands, i, grid_flat[i]):
+                return None
+    return cands
 
-def _solve(grid, max_solutions=2):
-    grid = [row[:] for row in grid]
+def _bm_assign(cands, i, val):
+    others = cands[i] & ~VAL_BIT[val]
+    while others:
+        ob = LOWEST_BIT[others]
+        if not _bm_elim(cands, i, BIT_VAL[ob]):
+            return False
+        others &= ~ob
+    return True
+
+def _bm_elim(cands, i, val):
+    bit = VAL_BIT[val]
+    if not (cands[i] & bit):
+        return True
+    cands[i] &= ~bit
+    c = cands[i]
+    if c == 0:
+        return False
+    if POPCOUNT[c] == 1:
+        for p in PEERS_FLAT[i]:
+            if not _bm_elim(cands, p, BIT_VAL[c]):
+                return False
+    for unit in UNITS_FLAT[i]:
+        places = [j for j in unit if cands[j] & bit]
+        n = len(places)
+        if n == 0:
+            return False
+        if n == 1:
+            if not _bm_assign(cands, places[0], val):
+                return False
+    return True
+
+def _bm_solved(cands):
+    for i in range(81):
+        if POPCOUNT[cands[i]] != 1:
+            return False
+    return True
+
+def _bm_search(cands, solutions, max_solutions):
+    if len(solutions) >= max_solutions:
+        return
+    best_i, best_n = -1, 10
+    for i in range(81):
+        n = POPCOUNT[cands[i]]
+        if 1 < n < best_n:
+            best_i = i
+            best_n = n
+    if best_i == -1:
+        solutions.append([BIT_VAL[cands[i]] for i in range(81)])
+        return
+    c = cands[best_i]
+    while c:
+        bit = LOWEST_BIT[c]
+        cp = list(cands)
+        if _bm_assign(cp, best_i, BIT_VAL[bit]):
+            _bm_search(cp, solutions, max_solutions)
+        c &= ~bit
+
+def _is_unique(grid_flat):
+    cands = _bm_init(grid_flat)
+    if cands is None:
+        return False
+    if _bm_solved(cands):
+        return True
     solutions = []
-    def _bt():
-        if len(solutions) >= max_solutions:
-            return
-        best, best_cands = None, None
-        for r in range(9):
-            for c in range(9):
-                if grid[r][c] == 0:
-                    cands = _get_candidates(grid, r, c)
-                    if len(cands) == 0:
-                        return
-                    if best is None or len(cands) < len(best_cands):
-                        best = (r, c)
-                        best_cands = cands
-        if best is None:
-            solutions.append([row[:] for row in grid])
-            return
-        r, c = best
-        for v in best_cands:
-            grid[r][c] = v
-            _bt()
-            grid[r][c] = 0
-    _bt()
-    return solutions
+    _bm_search(cands, solutions, max_solutions=2)
+    return len(solutions) == 1
 
 
-def _generate_complete_grid(rng):
-    grid = [[0]*9 for _ in range(9)]
+# ── Grid generation (flat arrays) ──
+
+def _generate_grid(rng):
+    grid = [0] * 81
     base = list(range(1, 10))
     rng.shuffle(base)
     shifts = [0, 3, 6, 1, 4, 7, 2, 5, 8]
     for r in range(9):
         for c in range(9):
-            grid[r][c] = base[(c + shifts[r]) % 9]
+            grid[r * 9 + c] = base[(c + shifts[r]) % 9]
     for _ in range(30):
         t = rng.randint(0, 4)
         if t == 0:
             band = rng.randint(0, 2)
             r1, r2 = rng.sample(range(band*3, band*3+3), 2)
-            grid[r1], grid[r2] = grid[r2], grid[r1]
+            for c in range(9):
+                grid[r1*9+c], grid[r2*9+c] = grid[r2*9+c], grid[r1*9+c]
         elif t == 1:
             stack = rng.randint(0, 2)
             c1, c2 = rng.sample(range(stack*3, stack*3+3), 2)
             for r in range(9):
-                grid[r][c1], grid[r][c2] = grid[r][c2], grid[r][c1]
+                grid[r*9+c1], grid[r*9+c2] = grid[r*9+c2], grid[r*9+c1]
         elif t == 2:
             b1, b2 = rng.sample(range(3), 2)
             for i in range(3):
-                grid[b1*3+i], grid[b2*3+i] = grid[b2*3+i], grid[b1*3+i]
+                for c in range(9):
+                    grid[(b1*3+i)*9+c], grid[(b2*3+i)*9+c] = grid[(b2*3+i)*9+c], grid[(b1*3+i)*9+c]
         elif t == 3:
             s1, s2 = rng.sample(range(3), 2)
             for r in range(9):
                 for i in range(3):
-                    grid[r][s1*3+i], grid[r][s2*3+i] = grid[r][s2*3+i], grid[r][s1*3+i]
+                    grid[r*9+s1*3+i], grid[r*9+s2*3+i] = grid[r*9+s2*3+i], grid[r*9+s1*3+i]
         else:
             perm = list(range(1, 10))
             rng.shuffle(perm)
-            mp = {i+1: perm[i] for i in range(9)}
-            grid = [[mp[grid[r][c]] for c in range(9)] for r in range(9)]
+            grid = [perm[v - 1] for v in grid]
     return grid
 
 
-def _make_puzzle(solution, n_blanks, rng):
-    puzzle = [row[:] for row in solution]
-    cells = [(r, c) for r in range(9) for c in range(9)]
+def _make_puzzle(sol, n_blanks, rng):
+    puzzle = list(sol)
+    cells = list(range(81))
     rng.shuffle(cells)
     removed = 0
-    for r, c in cells:
+    for i in cells:
         if removed >= n_blanks:
             break
-        val = puzzle[r][c]
-        puzzle[r][c] = 0
-        sols = _solve(puzzle, max_solutions=2)
-        if len(sols) == 1:
+        val = puzzle[i]
+        puzzle[i] = 0
+        if _is_unique(puzzle):
             removed += 1
         else:
-            puzzle[r][c] = val
+            puzzle[i] = val
     return puzzle if removed >= n_blanks else None
 
 
-def compute_prop_depth(puzzle):
-    """Propagation depth using naked + hidden singles.
-    Returns dict: (row, col) → depth (0, 1, 2, ..., or -1)."""
-    grid = [row[:] for row in puzzle]
-    blanks = {(r, c) for r in range(9) for c in range(9) if grid[r][c] == 0}
+# ── Depth computation ──
+
+def compute_prop_depth(puzzle_flat):
+    grid = list(puzzle_flat)
+    blanks = {i for i in range(81) if grid[i] == 0}
     depths = {}
     current_depth = 0
+    def _cands(i):
+        if grid[i] != 0: return set()
+        used = {grid[p] for p in PEERS_FLAT[i]} - {0}
+        return set(range(1, 10)) - used
     while True:
-        newly_solved = []
-        for r, c in blanks - set(depths.keys()):
-            cands = _get_candidates(grid, r, c)
-            if len(cands) == 1:
-                grid[r][c] = cands.pop()
-                depths[(r, c)] = current_depth
-                newly_solved.append((r, c))
-        for group in ALL_GROUPS:
-            unfilled = [(r, c) for r, c in group
-                        if grid[r][c] == 0 and (r, c) not in depths]
-            if not unfilled:
-                continue
+        newly = []
+        for i in blanks - set(depths.keys()):
+            c = _cands(i)
+            if len(c) == 1:
+                grid[i] = c.pop()
+                depths[i] = current_depth
+                newly.append(i)
+        for group_cells in ALL_GROUPS:
+            gi = [r*9+c for r, c in group_cells]
+            unfilled = [i for i in gi if grid[i] == 0 and i not in depths]
+            if not unfilled: continue
             for val in range(1, 10):
-                if any(grid[r][c] == val for r, c in group):
-                    continue
-                possible = [(r, c) for r, c in unfilled
-                            if val in _get_candidates(grid, r, c)]
+                if any(grid[i] == val for i in gi): continue
+                possible = [i for i in unfilled if val in _cands(i)]
                 if len(possible) == 1:
-                    r, c = possible[0]
-                    if (r, c) not in depths:
-                        grid[r][c] = val
-                        depths[(r, c)] = current_depth
-                        newly_solved.append((r, c))
-        if not newly_solved:
-            break
+                    i = possible[0]
+                    if i not in depths:
+                        grid[i] = val
+                        depths[i] = current_depth
+                        newly.append(i)
+        if not newly: break
         current_depth += 1
-    for r, c in blanks:
-        if (r, c) not in depths:
-            depths[(r, c)] = -1
+    for i in blanks:
+        if i not in depths:
+            depths[i] = -1
     return depths
 
 
-def compute_n_candidates(puzzle):
+def compute_n_candidates(puzzle_flat):
     result = {}
-    for r in range(9):
-        for c in range(9):
-            if puzzle[r][c] == 0:
-                result[(r, c)] = len(_get_candidates(puzzle, r, c))
+    for i in range(81):
+        if puzzle_flat[i] == 0:
+            used = {puzzle_flat[p] for p in PEERS_FLAT[i]} - {0}
+            result[i] = 9 - len(used)
+    return result
+
+
+def compute_n_cands_after_cp(puzzle_flat):
+    """For depth_hard cells: how many candidates remain after full CP?
+    This gives a gradient within depth_hard:
+      n_cands_cp=2 → almost determined, one guess away
+      n_cands_cp=5 → very uncertain, deep reasoning needed
+    Returns dict: flat_idx → n_candidates_after_cp (only for hard cells).
+    """
+    cands = _bm_init(puzzle_flat)
+    if cands is None:
+        return {}
+    result = {}
+    for i in range(81):
+        if puzzle_flat[i] == 0 and POPCOUNT[cands[i]] > 1:
+            result[i] = POPCOUNT[cands[i]]
     return result
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# Data Format & Generation
+# Data Format & Generation (multiprocessing + disk cache)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-def _grid_to_str(grid):
-    return ''.join(str(grid[r][c]) for r in range(9) for c in range(9))
-
-def _str_to_grid(s):
-    return [[int(s[r*9+c]) for c in range(9)] for r in range(9)]
 
 def _flat_idx_to_rc(idx):
     return idx // 9, idx % 9
@@ -325,75 +397,103 @@ def _flat_idx_to_rc(idx):
 def _rc_to_flat_idx(r, c):
     return r * 9 + c
 
-
-def _fmt_sudoku(puzzle_grid, solution_grid):
-    return f"{_grid_to_str(puzzle_grid)}={_grid_to_str(solution_grid)}"
-
-
 def _parse_sudoku(s):
-    """Parse formatted string → (puzzle_str, solution_str)."""
     parts = s.split('=')
     return parts[0], parts[1]
 
 
-def _get_cell_metadata(puzzle_grid, solution_grid):
-    """Compute per-cell metadata for analysis.
-    Returns dict with flat_idx → {is_given, prop_depth, n_candidates, ...}
-    """
-    depths = compute_prop_depth(puzzle_grid)
-    n_cands = compute_n_candidates(puzzle_grid)
-
+def _gen_one_puzzle(args):
+    """Worker function for multiprocessing."""
+    seed, min_blanks, max_blanks = args
+    rng = random.Random(seed)
+    sol = _generate_grid(rng)
+    nb = rng.randint(min_blanks, max_blanks)
+    puzzle = _make_puzzle(sol, nb, rng)
+    if puzzle is None:
+        return None
+    n_blanks = sum(1 for v in puzzle if v == 0)
+    depths = compute_prop_depth(puzzle)
+    n_cands = compute_n_candidates(puzzle)
+    n_cands_cp = compute_n_cands_after_cp(puzzle)
+    puzzle_str = ''.join(str(v) for v in puzzle)
+    sol_str = ''.join(str(v) for v in sol)
     meta = {}
-    for r in range(9):
-        for c in range(9):
-            idx = _rc_to_flat_idx(r, c)
-            is_given = puzzle_grid[r][c] != 0
-            meta[idx] = {
-                'is_given': is_given,
-                'prop_depth': -99 if is_given else depths.get((r, c), -1),
-                'n_candidates': 0 if is_given else n_cands.get((r, c), 0),
-                'row': r, 'col': c,
-                'box': (r // 3) * 3 + c // 3,
-            }
-    return meta
+    for i in range(81):
+        is_given = puzzle[i] != 0
+        meta[i] = {
+            'is_given': is_given,
+            'prop_depth': -99 if is_given else depths.get(i, -1),
+            'n_candidates': 0 if is_given else n_cands.get(i, 0),
+            'n_cands_after_cp': 0 if is_given else n_cands_cp.get(i, 0),
+            'row': i // 9, 'col': i % 9,
+            'box': (i // 9 // 3) * 3 + (i % 9) // 3,
+        }
+    return {'string': f"{puzzle_str}={sol_str}", 'meta': meta, 'n_blanks': n_blanks}
 
 
 def gen_sudoku_data(n, seed, min_blanks=None, max_blanks=None):
-    """Generate n Sudoku puzzles with metadata.
-    Returns list of dicts: {string, meta, n_blanks}.
-    """
+    """Generate n puzzles with multiprocessing + disk caching."""
     if min_blanks is None: min_blanks = MIN_BLANKS
     if max_blanks is None: max_blanks = MAX_BLANKS
 
-    rng = random.Random(seed)
+    # Disk cache
+    cache_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.sudoku_cache')
+    cache_key = f"n{n}_s{seed}_bl{min_blanks}-{max_blanks}"
+    cache_path = os.path.join(cache_dir, f"{cache_key}.json")
+    if os.path.exists(cache_path):
+        try:
+            with open(cache_path) as f:
+                data = json.load(f)
+            for d in data:
+                d['meta'] = {int(k): v for k, v in d['meta'].items()}
+            print(f"    Loaded {len(data)} puzzles from cache")
+            return data
+        except Exception:
+            pass
+
+    from concurrent.futures import ProcessPoolExecutor
+    n_workers = min(os.cpu_count() or 1, 16)
+    n_attempt = int(n * 1.5) + 200
+    args_list = [(seed * 100000 + i, min_blanks, max_blanks) for i in range(n_attempt)]
+
     results = []
-    attempts = 0
-    max_attempts = n * 10
+    t0 = time.time()
+    if n_workers > 1 and n > 50:
+        with ProcessPoolExecutor(max_workers=n_workers) as pool:
+            cs = max(n_attempt // (n_workers * 4), 1)
+            for r in pool.map(_gen_one_puzzle, args_list, chunksize=cs):
+                if r is not None:
+                    results.append(r)
+                if len(results) >= n:
+                    break
+    else:
+        for a in args_list:
+            r = _gen_one_puzzle(a)
+            if r is not None:
+                results.append(r)
+            if len(results) >= n:
+                break
 
-    while len(results) < n and attempts < max_attempts:
-        attempts += 1
-        sol = _generate_complete_grid(rng)
-        nb = rng.randint(min_blanks, max_blanks)
-        puzzle = _make_puzzle(sol, nb, rng)
-        if puzzle is None:
-            continue
-        actual_blanks = sum(1 for r in range(9) for c in range(9) if puzzle[r][c] == 0)
-        s = _fmt_sudoku(puzzle, sol)
-        meta = _get_cell_metadata(puzzle, sol)
-        results.append({
-            'string': s,
-            'meta': meta,
-            'n_blanks': actual_blanks,
-        })
-
+    elapsed = time.time() - t0
     if len(results) < n:
-        print(f"  WARNING: generated only {len(results)}/{n} puzzles")
+        print(f"    WARNING: generated {len(results)}/{n}")
+    results = results[:n]
+    print(f"    Generated {len(results)} puzzles in {elapsed:.1f}s "
+          f"({elapsed/max(len(results),1)*1000:.0f}ms each, {n_workers} workers)")
+
+    try:
+        os.makedirs(cache_dir, exist_ok=True)
+        with open(cache_path, 'w') as f:
+            json.dump(results, f)
+        print(f"    Cached to {cache_path}")
+    except Exception as e:
+        print(f"    Cache write failed: {e}")
+
     return results
 
 
 def build_tok():
     return CharTokenizer(list('0123456789='), {'mask': 'M', 'pad': 'P'})
-
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Analysis: Cell Difficulty Categories
@@ -588,6 +688,17 @@ def analyse_constraint_cascade(model, tokenizer, test_data, max_len,
     # By category of observed cell (whose conf changes)
     delta_obs_by_cat = {cat: [] for cat in DEPTH_CATS}
 
+    # ── Digit-level constraint tracking ──
+    # When cell X is revealed as value V:
+    #   same-group cells: P(V) should DECREASE (V is now forbidden)
+    #   diff-group cells: P(V) should NOT change
+    # This is a direct test of constraint-consistent inference.
+    digit_elim_same = []    # ΔP(revealed_digit) for same-group cells
+    digit_elim_diff = []    # ΔP(revealed_digit) for diff-group cells
+    # Also: does P(correct answer) increase for same-group cells?
+    gold_boost_same = []    # ΔP(gold_digit) for same-group cells
+    gold_boost_diff = []    # ΔP(gold_digit) for diff-group cells
+
     for si, sample in enumerate(samples):
         s = sample['string']
         meta = sample['meta']
@@ -614,13 +725,17 @@ def analyse_constraint_cascade(model, tokenizer, test_data, max_len,
             r, c = _flat_idx_to_rc(j)
             peer_flat[j] = {_rc_to_flat_idx(pr, pc) for pr, pc in PEERS[(r, c)]}
 
-        # Initial confidence (only for blank positions)
+        # Initial confidence and probs (only for blank positions)
         logits = model(x)
         prev_conf = torch.zeros(ANS_LEN, device=device)
+        prev_probs = {}  # j → prob vector (for digit-level tracking)
+        sol_enc = tokenizer.encode(sol_str)
         for j in blank_js:
             cl = logits[0, T_pre + j].clone()
             cl[mask_id] = -float('inf')
-            prev_conf[j] = F.softmax(cl, dim=-1).max()
+            p = F.softmax(cl, dim=-1)
+            prev_conf[j] = p.max()
+            prev_probs[j] = p.clone()
 
         # Step-by-step decode (confidence policy, blank positions only)
         for step in range(len(blank_js)):
@@ -644,41 +759,64 @@ def analyse_constraint_cascade(model, tokenizer, test_data, max_len,
             pos = T_pre + best_j
             cl = logits[0, pos].clone()
             cl[mask_id] = -float('inf')
-            x[0, pos] = cl.argmax()
+            revealed_tok = cl.argmax()
+            x[0, pos] = revealed_tok
             unmasked[pos] = True
+            # The digit value that was revealed (token ID)
+            revealed_digit_id = revealed_tok.item()
 
-            # New confidences
+            # New confidences and probs
             logits_new = model(x)
             new_conf = torch.zeros(ANS_LEN, device=device)
+            new_probs = {}
             for j in blank_js:
                 if unmasked[T_pre + j]:
                     new_conf[j] = 1.0
                     continue
                 cl2 = logits_new[0, T_pre + j].clone()
                 cl2[mask_id] = -float('inf')
-                new_conf[j] = F.softmax(cl2, dim=-1).max()
+                p = F.softmax(cl2, dim=-1)
+                new_conf[j] = p.max()
+                new_probs[j] = p
 
             # Classify revealed cell
             rev_cat = _depth_to_cat(meta[best_j])
             rev_peers = peer_flat[best_j]
 
-            # Record Δconf for remaining masked (blank) cells
+            # Record Δconf AND digit-level changes for remaining cells
             for j in blank_js:
                 if unmasked[T_pre + j] or j == best_j:
                     continue
                 delta = (new_conf[j] - prev_conf[j]).item()
                 obs_cat = _depth_to_cat(meta[j])
 
+                # Digit-level: ΔP(revealed_digit) — should be negative for same-group
+                if j in prev_probs and j in new_probs:
+                    dp_revealed = (new_probs[j][revealed_digit_id]
+                                   - prev_probs[j][revealed_digit_id]).item()
+                    # ΔP(gold) — P(correct answer) change
+                    gold_id = sol_enc[j]
+                    dp_gold = (new_probs[j][gold_id]
+                               - prev_probs[j][gold_id]).item()
+                else:
+                    dp_revealed = 0.0
+                    dp_gold = 0.0
+
                 if j in rev_peers:
                     delta_same_group.append(delta)
                     delta_by_cat[rev_cat]['same'].append(delta)
+                    digit_elim_same.append(dp_revealed)
+                    gold_boost_same.append(dp_gold)
                 else:
                     delta_diff_group.append(delta)
                     delta_by_cat[rev_cat]['diff'].append(delta)
+                    digit_elim_diff.append(dp_revealed)
+                    gold_boost_diff.append(dp_gold)
 
                 delta_obs_by_cat[obs_cat].append(delta)
 
             prev_conf = new_conf
+            prev_probs = new_probs
 
     def _mean(lst):
         return sum(lst) / len(lst) if lst else 0.0
@@ -704,6 +842,13 @@ def analyse_constraint_cascade(model, tokenizer, test_data, max_len,
         'n_diff': len(delta_diff_group),
         'by_revealed_cat': by_rev_cat,
         'by_observed_cat': by_obs_cat,
+        # Digit-level constraint consistency
+        'digit_elim_same': _mean(digit_elim_same),   # should be negative
+        'digit_elim_diff': _mean(digit_elim_diff),   # should be ~0
+        'gold_boost_same': _mean(gold_boost_same),    # should be positive
+        'gold_boost_diff': _mean(gold_boost_diff),    # should be ~0
+        'n_digit_same': len(digit_elim_same),
+        'n_digit_diff': len(digit_elim_diff),
     }
     sg = result['same_group_delta']
     dg = result['diff_group_delta']
@@ -711,11 +856,94 @@ def analyse_constraint_cascade(model, tokenizer, test_data, max_len,
         ratio_str = f"ratio={sg/dg:.2f}x"
     else:
         ratio_str = "ratio=inf"
+    de_s = result['digit_elim_same']
+    de_d = result['digit_elim_diff']
+    gb_s = result['gold_boost_same']
+    gb_d = result['gold_boost_diff']
     result['summary'] = (
-        f"Constraint cascade: same_group={sg:+.4f} (n={result['n_same']}), "
-        f"diff_group={dg:+.4f} (n={result['n_diff']}), {ratio_str}"
+        f"Constraint cascade: same_group={sg:+.4f} diff_group={dg:+.4f} {ratio_str}\n"
+        f"    Digit elimination: same_group ΔP(revealed)={de_s:+.4f}, "
+        f"diff_group ΔP(revealed)={de_d:+.4f}\n"
+        f"    Gold probability:  same_group ΔP(gold)={gb_s:+.4f}, "
+        f"diff_group ΔP(gold)={gb_d:+.4f}"
     )
     return result
+
+
+@torch.no_grad()
+def probe_selective_masking(model, tokenizer, test_data, max_len, device=None):
+    """Test parallel reasoning ability by comparing accuracy under different masking.
+
+    Conditions:
+      all_blank:   all blank cells masked (standard probe)
+      hard_only:   only depth_hard cells masked, depth_0/1/2 revealed as ground truth
+      easy_only:   only depth_0 cells masked, harder cells revealed
+
+    If hard_only acc ≈ all_blank acc for hard cells → model doesn't rely on
+    sequential propagation through easy cells (parallel reasoning).
+    If hard_only acc >> all_blank acc for hard cells → model needs easy cells
+    as stepping stones (sequential reasoning).
+    """
+    if device is None: device = DEVICE
+    model.eval()
+    mask_id = tokenizer.special_ids['mask']
+
+    strings = [d['string'] for d in test_data]
+    metas = [d['meta'] for d in test_data]
+    ids_all, ans_all = encode_samples(strings, tokenizer, max_len)
+    ids_all, ans_all = ids_all.to(device), ans_all.to(device)
+    N_test = len(test_data)
+
+    conditions = {
+        'all_blank': lambda m: not m['is_given'],
+        'hard_only': lambda m: m['prop_depth'] == -1,
+        'easy_only': lambda m: m['prop_depth'] == 0 and not m['is_given'],
+    }
+
+    results = {}
+    for cond_name, mask_fn in conditions.items():
+        cat_correct = defaultdict(list)
+
+        for st in range(0, N_test, 64):
+            en = min(st + 64, N_test)
+            ids = ids_all[st:en]
+            ans = ans_all[st:en]
+            B = ids.shape[0]
+            T = ids.shape[1]
+
+            ans_pos = ans.unsqueeze(1) + torch.arange(ANS_LEN, device=device)
+            ans_pos = ans_pos.clamp(max=T-1)
+            batch_idx = torch.arange(B, device=device).unsqueeze(1).expand_as(ans_pos)
+
+            mask_cells = torch.zeros(B, ANS_LEN, dtype=torch.bool, device=device)
+            for bi in range(B):
+                si = st + bi
+                for j in range(ANS_LEN):
+                    if mask_fn(metas[si][j]):
+                        mask_cells[bi, j] = True
+
+            xm = ids.clone()
+            xm[batch_idx[mask_cells], ans_pos[mask_cells]] = mask_id
+            logits = model(xm)
+            ans_logits = logits[batch_idx, ans_pos]
+            tgt_ids = ids[batch_idx, ans_pos]
+            cl = ans_logits.clone()
+            cl[:, :, mask_id] = -float('inf')
+            preds = cl.argmax(dim=-1)
+            corrects = (preds == tgt_ids)
+
+            for bi in range(B):
+                si = st + bi
+                for j in range(ANS_LEN):
+                    if mask_cells[bi, j]:
+                        cat = _depth_to_cat(metas[si][j])
+                        cat_correct[cat].append(corrects[bi, j].item())
+
+        results[cond_name] = {
+            cat: sum(v)/len(v) for cat, v in cat_correct.items() if v
+        }
+
+    return results
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -907,11 +1135,20 @@ def train_with_dynamics(
             if oa:
                 entry['depth_vs_rank'] = oa.get('depth_vs_rank')
                 entry['difficulty_concordance'] = oa.get('difficulty_concordance')
+                entry['spearman_depth_rank'] = oa.get('spearman_depth_rank')
+                entry['spearman_ncands_rank'] = oa.get('spearman_ncands_rank')
                 entry['given_mean_rank'] = oa.get('given_mean_rank')
                 entry['blank_mean_rank'] = oa.get('blank_mean_rank')
                 entry['n_cands_vs_rank'] = oa.get('n_cands_vs_rank')
             dynamics['gen_checkpoints'].append(entry)
-            dc_str = f"conc={entry.get('difficulty_concordance', 0):.3f}" if oa else ""
+            dc_str = ''
+            if oa:
+                conc = entry.get('difficulty_concordance', 0)
+                sp_d = entry.get('spearman_depth_rank')
+                sp_nc = entry.get('spearman_ncands_rank')
+                dc_str = f"conc={conc:.3f}"
+                if sp_d is not None: dc_str += f" ρ_depth={sp_d:.3f}"
+                if sp_nc is not None: dc_str += f" ρ_ncands={sp_nc:.3f}"
             bl_acc = r.get('blank_cell_acc', 0)
             print(f"    [gen ep {epoch}] acc={r['accuracy']:.4f} blank={bl_acc:.4f} "
                   f"{dc_str} | {time.time()-t_gen:.0f}s")
@@ -1191,17 +1428,20 @@ def _analyse_orders(decode_orders, prefix_len, metas):
     # Per-cell category
     cat_ids = torch.zeros(N, ANS_LEN, dtype=torch.long)
     n_cands_t = torch.zeros(N, ANS_LEN, dtype=torch.long)
+    n_cands_cp_t = torch.zeros(N, ANS_LEN, dtype=torch.long)
     is_blank = torch.zeros(N, ANS_LEN, dtype=torch.bool)
     for si in range(N):
         for j in range(ANS_LEN):
             m = metas[si][j]
             cat_ids[si, j] = DEPTH_CAT_TO_ID[_depth_to_cat(m)]
             n_cands_t[si, j] = m['n_candidates']
+            n_cands_cp_t[si, j] = m.get('n_cands_after_cp', 0)
             is_blank[si, j] = not m['is_given']
 
     cat_v = cat_ids[valid_mask].reshape(-1)
     rank_v = rop_valid.reshape(-1)
     nc_v = n_cands_t[valid_mask].reshape(-1)
+    nc_cp_v = n_cands_cp_t[valid_mask].reshape(-1)
     blank_v = is_blank[valid_mask].reshape(-1)
 
     # depth_vs_rank
@@ -1223,6 +1463,15 @@ def _analyse_orders(decode_orders, prefix_len, metas):
         m = blank_mask & (nc_v == nc_val)
         if m.any():
             n_cands_vs_rank[int(nc_val)] = rank_v[m].mean().item()
+
+    # n_cands_after_cp vs rank (depth_hard cells only — gradient within hard)
+    hard_mask = blank_mask & (cat_v == DEPTH_CAT_TO_ID['depth_hard'])
+    n_cands_cp_vs_rank = {}
+    for nc_val in nc_cp_v[hard_mask].unique().tolist():
+        if nc_val == 0: continue
+        m = hard_mask & (nc_cp_v == nc_val)
+        if m.any():
+            n_cands_cp_vs_rank[int(nc_val)] = rank_v[m].mean().item()
 
     # Difficulty concordance (blank cells only)
     # For each sample, for each pair of blank cells (i, j) where depth_i < depth_j:
@@ -1254,12 +1503,67 @@ def _analyse_orders(decode_orders, prefix_len, metas):
                         conc_correct += 1
     difficulty_concordance = conc_correct / max(conc_total, 1)
 
+    # ── Spearman rank correlations (blank cells only, per-sample then averaged) ──
+    # More robust than concordance: directly measures monotonic relationship
+    # between difficulty measures and decode order.
+    spearman_depth_rank = []      # ρ(prop_depth, decode_rank)
+    spearman_ncands_rank = []     # ρ(n_candidates, decode_rank)
+    for si in range(n_valid):
+        orig_si = valid_mask.nonzero(as_tuple=True)[0][si].item()
+        meta = metas[orig_si]
+        ranks = rop_valid[si]
+        # Collect blank cell data for this sample
+        b_depths, b_ncands, b_ranks = [], [], []
+        for j in range(ANS_LEN):
+            if not meta[j]['is_given']:
+                d = meta[j]['prop_depth']
+                b_depths.append(d if d >= 0 else 100)  # -1 → hardest
+                b_ncands.append(meta[j]['n_candidates'])
+                b_ranks.append(ranks[j].item())
+        if len(b_depths) < 5:
+            continue  # too few blanks for meaningful correlation
+
+        def _spearman(x, y):
+            """Spearman ρ between two lists."""
+            n = len(x)
+            if n < 3: return None
+            # Rank transform
+            def _rank(vals):
+                order = sorted(range(n), key=lambda i: vals[i])
+                r = [0.0] * n
+                for rank_val, idx in enumerate(order):
+                    r[idx] = rank_val
+                return r
+            rx, ry = _rank(x), _rank(y)
+            mx = sum(rx) / n
+            my = sum(ry) / n
+            cov = sum((rx[i] - mx) * (ry[i] - my) for i in range(n))
+            sx = sum((rx[i] - mx)**2 for i in range(n)) ** 0.5
+            sy = sum((ry[i] - my)**2 for i in range(n)) ** 0.5
+            if sx == 0 or sy == 0: return 0.0
+            return cov / (sx * sy)
+
+        rho_d = _spearman(b_depths, b_ranks)
+        rho_nc = _spearman(b_ncands, b_ranks)
+        if rho_d is not None:
+            spearman_depth_rank.append(rho_d)
+        if rho_nc is not None:
+            spearman_ncands_rank.append(rho_nc)
+
+    avg_spearman_depth = (sum(spearman_depth_rank) / len(spearman_depth_rank)
+                          if spearman_depth_rank else None)
+    avg_spearman_ncands = (sum(spearman_ncands_rank) / len(spearman_ncands_rank)
+                           if spearman_ncands_rank else None)
+
     return {
         'depth_vs_rank': depth_vs_rank,
         'difficulty_concordance': difficulty_concordance,
+        'spearman_depth_rank': avg_spearman_depth,
+        'spearman_ncands_rank': avg_spearman_ncands,
         'given_mean_rank': given_mean_rank,
         'blank_mean_rank': blank_mean_rank,
         'n_cands_vs_rank': n_cands_vs_rank,
+        'n_cands_cp_vs_rank': n_cands_cp_vs_rank,
     }
 
 
@@ -1435,6 +1739,17 @@ def run(tag=''):
     test_data = gen_sudoku_data(N_TEST, seed=9000)
     print(f"  Test:  {len(test_data)} puzzles")
 
+    # OOD test sets (distribution-shifted)
+    print("  Generating OOD test data (harder)...")
+    test_hard = gen_sudoku_data(max(N_TEST // 2, 100), seed=9100,
+                                 min_blanks=56, max_blanks=64)
+    print(f"  Test-hard: {len(test_hard)} puzzles (56-64 blanks)")
+
+    print("  Generating OOD test data (easier)...")
+    test_easy = gen_sudoku_data(max(N_TEST // 2, 100), seed=9200,
+                                 min_blanks=30, max_blanks=40)
+    print(f"  Test-easy: {len(test_easy)} puzzles (30-40 blanks)")
+
     # Diagnostics
     depth_dist = defaultdict(int)
     blanks_dist = defaultdict(int)
@@ -1497,6 +1812,18 @@ def run(tag=''):
                 if ncr:
                     parts = [f"nc={k}→{v:.1f}" for k, v in sorted(ncr.items())]
                     print(f"    N_cands→rank: {' '.join(parts)}")
+                # Spearman correlations
+                sp_d = oa.get('spearman_depth_rank')
+                sp_nc = oa.get('spearman_ncands_rank')
+                sp_parts = []
+                if sp_d is not None: sp_parts.append(f"ρ(depth,rank)={sp_d:.3f}")
+                if sp_nc is not None: sp_parts.append(f"ρ(n_cands,rank)={sp_nc:.3f}")
+                if sp_parts:
+                    print(f"    Spearman: {' '.join(sp_parts)}")
+                nc_cp_r = oa.get('n_cands_cp_vs_rank', {})
+                if nc_cp_r:
+                    parts = [f"nc_cp={k}→{v:.1f}" for k, v in sorted(nc_cp_r.items())]
+                    print(f"    Hard cells CP-cands→rank: {' '.join(parts)}")
             ca = r.get('category_accuracy', {})
             if ca:
                 parts = [f"{cat}={v:.3f}" for cat, v in ca.items()]
@@ -1513,6 +1840,35 @@ def run(tag=''):
             sg = info['same_group_delta']
             dg = info['diff_group_delta']
             print(f"    reveal={cat}: same={sg:+.4f} diff={dg:+.4f}")
+
+        # ── Selective masking probe (parallel reasoning test) ──
+        print(f"  Selective masking probe...")
+        sel = probe_selective_masking(m, tok, test_data, max_len, device=DEVICE)
+        all_final[_fk('diffusion', mt, 'selective')] = sel
+        for cond, accs in sel.items():
+            parts = [f"{cat}={v:.3f}" for cat, v in accs.items()]
+            print(f"    {cond}: {' '.join(parts)}")
+
+        # ── OOD evaluation (distribution-shifted test sets) ──
+        for ood_name, ood_data in [('harder', test_hard), ('easier', test_easy)]:
+            if not ood_data:
+                continue
+            print(f"  OOD eval ({ood_name}, {len(ood_data)} puzzles)...")
+            r_ood = final_evaluate(m, tok, ood_data, 'diffusion',
+                                   decode_policy='confidence', batch_size=16)
+            all_final[_fk('diffusion', mt, f'ood_{ood_name}')] = r_ood
+            bl_acc = r_ood.get('blank_cell_acc', 0)
+            print(f"    acc={r_ood['accuracy']:.4f} blank_cell={bl_acc:.4f}")
+            ca = r_ood.get('category_accuracy', {})
+            if ca:
+                parts = [f"{cat}={v:.3f}" for cat, v in ca.items()]
+                print(f"    Cat: {' '.join(parts)}")
+            oa = r_ood.get('decode_order_analysis')
+            if oa:
+                sp_d = oa.get('spearman_depth_rank')
+                dc = oa.get('difficulty_concordance')
+                if sp_d is not None and dc is not None:
+                    print(f"    conc={dc:.3f} ρ_depth={sp_d:.3f}")
 
         del m; torch.cuda.empty_cache() if torch.cuda.is_available() else None
 
