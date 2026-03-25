@@ -54,23 +54,23 @@ ANS_LEN = 81
 
 N_TRAIN = 5000
 N_TEST = 500
-MIN_BLANKS = 30
-MAX_BLANKS = 55
+MIN_BLANKS = 45
+MAX_BLANKS = 58
 
 BATCH_SIZE = 64
 MAX_EPOCHS = 3000
 EVAL_EVERY = 50
 LOG_EVERY = 20
 GEN_EVAL_EVERY = 200
-GEN_EVAL_N = 200
+GEN_EVAL_N = 100
 THRESHOLD = 0.95
 
 MASK_TYPES = ['random', 'puma']
 DECODE_POLICIES = ['confidence']
 
-N_LAYER = 4
-N_HEAD = 4
-N_EMBD = 256
+N_LAYER = 2
+N_HEAD = 2
+N_EMBD = 128
 DROPOUT = 0.2
 POS_ENC = 'absolute'
 
@@ -480,8 +480,16 @@ def probe_per_position(model, tokenizer, test_data, objective,
             confs = F.softmax(logits[batch_idx, pred_pos], dim=-1).max(dim=-1).values * valid.float()
             v_count = valid.float()
         else:
+            # Only mask blank positions (given cells visible as context)
             xm = ids.clone()
-            xm[batch_idx, ans_pos] = mask_id
+            blank_batch = torch.zeros(B, ANS_LEN, dtype=torch.bool, device=device)
+            for bi in range(B):
+                si = st + bi
+                puzzle_str = test_data[si]['string'].split('=')[0]
+                for j in range(ANS_LEN):
+                    if puzzle_str[j] == '0':
+                        blank_batch[bi, j] = True
+            xm[batch_idx[blank_batch], ans_pos[blank_batch]] = mask_id
             logits = model(xm)
             ans_logits = logits[batch_idx, ans_pos]
             tgt_ids = ids[batch_idx, ans_pos]
@@ -493,21 +501,24 @@ def probe_per_position(model, tokenizer, test_data, objective,
             confs = probs.max(dim=-1).values
             preds = probs.argmax(dim=-1)
             corrects = (preds == tgt_ids).float()
-            v_count = torch.ones(B, ANS_LEN, device=device)
+            # Only count blank positions (given cells are trivial)
+            v_count = blank_batch.float()
 
         for j in range(ANS_LEN):
-            total_loss[j] += losses[:, j].sum()
-            total_correct[j] += corrects[:, j].sum()
-            total_conf[j] += confs[:, j].sum()
-            total_n[j] += v_count[:, j].sum()
+            w = v_count[:, j]  # 1.0 for blank/valid, 0.0 for given/invalid
+            total_loss[j] += (losses[:, j] * w).sum()
+            total_correct[j] += (corrects[:, j] * w).sum()
+            total_conf[j] += (confs[:, j] * w).sum()
+            total_n[j] += w.sum()
 
-        # Per-category (vectorized)
+        # Per-category (vectorized, blank-only for diffusion)
         cat_batch = cat_ids[st:en]
+        v_flat = v_count.reshape(-1)
         confs_flat = confs.reshape(-1)
         corrects_flat = corrects.reshape(-1)
         cat_flat = cat_batch.reshape(-1)
         for ci, cname in enumerate(DEPTH_CATS):
-            mask = (cat_flat == ci)
+            mask = (cat_flat == ci) & (v_flat > 0)
             if mask.any():
                 cat_conf_sum[cname] += confs_flat[mask].sum().item()
                 cat_acc_sum[cname] += corrects_flat[mask].sum().item()
@@ -517,8 +528,9 @@ def probe_per_position(model, tokenizer, test_data, objective,
     pos_loss = (total_loss / N_safe).tolist()
     pos_acc = (total_correct / N_safe).tolist()
     pos_conf = (total_conf / N_safe).tolist()
-    overall_loss = total_loss.sum().item() / total_n.sum().item()
-    overall_acc = total_correct.sum().item() / total_n.sum().item()
+    total_n_sum = max(total_n.sum().item(), 1)
+    overall_loss = total_loss.sum().item() / total_n_sum
+    overall_acc = total_correct.sum().item() / total_n_sum
 
     # Per-category summary
     depth_context = {}
@@ -579,13 +591,18 @@ def analyse_constraint_cascade(model, tokenizer, test_data, max_len,
         puzzle_str, sol_str = _parse_sudoku(s)
         prefix = puzzle_str + '='
         penc = tokenizer.encode(prefix)
+        sol_enc = tokenizer.encode(sol_str)
         T_pre = len(penc)
 
-        # Build input: prefix + MASK * 81
-        x = torch.full((1, T_pre + ANS_LEN), mask_id, dtype=torch.long, device=device)
-        x[0, :T_pre] = torch.tensor(penc, device=device)
-        unmasked = torch.zeros(T_pre + ANS_LEN, dtype=torch.bool, device=device)
-        unmasked[:T_pre] = True
+        # Build input: prefix + solution (given cells filled, blanks masked)
+        x = torch.tensor(penc + sol_enc, dtype=torch.long, device=device).unsqueeze(0)
+        unmasked = torch.ones(T_pre + ANS_LEN, dtype=torch.bool, device=device)
+        blank_js = set()
+        for j in range(ANS_LEN):
+            if puzzle_str[j] == '0':
+                x[0, T_pre + j] = mask_id
+                unmasked[T_pre + j] = False
+                blank_js.add(j)
 
         # Precompute cell peer sets (flat index → set of flat indices)
         peer_flat = {}
@@ -593,21 +610,21 @@ def analyse_constraint_cascade(model, tokenizer, test_data, max_len,
             r, c = _flat_idx_to_rc(j)
             peer_flat[j] = {_rc_to_flat_idx(pr, pc) for pr, pc in PEERS[(r, c)]}
 
-        # Initial confidence
+        # Initial confidence (only for blank positions)
         logits = model(x)
         prev_conf = torch.zeros(ANS_LEN, device=device)
-        for j in range(ANS_LEN):
+        for j in blank_js:
             cl = logits[0, T_pre + j].clone()
             cl[mask_id] = -float('inf')
             prev_conf[j] = F.softmax(cl, dim=-1).max()
 
-        # Step-by-step decode (confidence policy)
-        for step in range(ANS_LEN):
+        # Step-by-step decode (confidence policy, blank positions only)
+        for step in range(len(blank_js)):
             logits = model(x)
 
-            # Find highest-confidence masked position
+            # Find highest-confidence masked (blank) position
             best_conf, best_j = -1.0, -1
-            for j in range(ANS_LEN):
+            for j in blank_js:
                 if unmasked[T_pre + j]:
                     continue
                 cl = logits[0, T_pre + j].clone()
@@ -629,7 +646,7 @@ def analyse_constraint_cascade(model, tokenizer, test_data, max_len,
             # New confidences
             logits_new = model(x)
             new_conf = torch.zeros(ANS_LEN, device=device)
-            for j in range(ANS_LEN):
+            for j in blank_js:
                 if unmasked[T_pre + j]:
                     new_conf[j] = 1.0
                     continue
@@ -641,8 +658,8 @@ def analyse_constraint_cascade(model, tokenizer, test_data, max_len,
             rev_cat = _depth_to_cat(meta[best_j])
             rev_peers = peer_flat[best_j]
 
-            # Record Δconf for remaining masked cells
-            for j in range(ANS_LEN):
+            # Record Δconf for remaining masked (blank) cells
+            for j in blank_js:
                 if unmasked[T_pre + j] or j == best_j:
                     continue
                 delta = (new_conf[j] - prev_conf[j]).item()
@@ -719,6 +736,20 @@ def train_with_dynamics(
     pad_id = tokenizer.special_ids['pad']
     is_causal = (objective == 'ar')
 
+    # Precompute blank masks: [N, ANS_LEN] — True = blank (needs prediction)
+    # Only blank positions receive masking during training, so ALL gradient
+    # signal goes to constraint solving rather than trivial "copy given" tasks.
+    blank_masks = torch.zeros(N, ANS_LEN, dtype=torch.bool, device=device)
+    for si, d in enumerate(train_data):
+        puzzle_str = d['string'].split('=')[0]
+        for j in range(ANS_LEN):
+            blank_masks[si, j] = (puzzle_str[j] == '0')
+    n_blank_total = blank_masks.sum().item()
+    n_given_total = N * ANS_LEN - n_blank_total
+    print(f"    Blank-only masking: {n_blank_total} blank positions, "
+          f"{n_given_total} given (skipped), "
+          f"avg {n_blank_total/N:.1f} blanks/puzzle")
+
     model = Transformer(
         vocab_size=len(tokenizer), block_size=max_len + 8,
         n_layer=N_LAYER, n_head=N_HEAD, n_embd=N_EMBD,
@@ -768,9 +799,10 @@ def train_with_dynamics(
                 puma_z[bi] = train_ids[si].clone()
                 a_s = train_ans[si].item()
                 puma_ans[bi] = a_s
+                # Only mask blank positions
                 for j in range(ANS_LEN):
                     p = a_s + j
-                    if p < T:
+                    if p < T and blank_masks[si, j]:
                         puma_z[bi, p] = mask_id
                 puma_stage[bi] = 0
 
@@ -819,6 +851,7 @@ def train_with_dynamics(
 
     def _do_eval(epoch):
         nonlocal best_loss, best_state
+        t_eval = time.time()
         probe = probe_per_position(
             model, tokenizer, test_data, objective, max_len, device)
         dynamics['checkpoints'].append({
@@ -827,21 +860,38 @@ def train_with_dynamics(
         if pl < best_loss and epoch > 0:
             best_loss = pl
             best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+        # Log depth context
+        dc = probe.get('depth_context', {})
+        dc_parts = []
+        for cat in DEPTH_CATS:
+            if cat in dc and cat != 'given':
+                dc_parts.append(f"{cat}={dc[cat]['mean_acc']:.3f}")
+        dc_str = ' '.join(dc_parts) if dc_parts else ''
+        print(f"    [eval ep {epoch}] loss={pl:.4f} acc={probe['overall_acc']:.4f} "
+              f"{dc_str} | {time.time()-t_eval:.0f}s")
 
     def _do_gen_eval(epoch):
         """Lightweight generation eval with decode order analysis."""
-        test_strings = [d['string'] for d in test_data[:GEN_EVAL_N]]
-        test_metas = [d['meta'] for d in test_data[:GEN_EVAL_N]]
-        r = final_evaluate(model, tokenizer, test_data[:GEN_EVAL_N],
-                           'diffusion', decode_policy='confidence')
-        entry = {'epoch': epoch, 'gen_acc': r['accuracy']}
-        oa = r.get('decode_order_analysis')
-        if oa:
-            entry['depth_vs_rank'] = oa.get('depth_vs_rank')
-            entry['difficulty_concordance'] = oa.get('difficulty_concordance')
-            entry['given_mean_rank'] = oa.get('given_mean_rank')
-            entry['blank_mean_rank'] = oa.get('blank_mean_rank')
-        dynamics['gen_checkpoints'].append(entry)
+        t_gen = time.time()
+        try:
+            r = final_evaluate(model, tokenizer, test_data[:GEN_EVAL_N],
+                               'diffusion', decode_policy='confidence', batch_size=16)
+            entry = {'epoch': epoch, 'gen_acc': r['accuracy'],
+                     'blank_cell_acc': r.get('blank_cell_acc', 0)}
+            oa = r.get('decode_order_analysis')
+            if oa:
+                entry['depth_vs_rank'] = oa.get('depth_vs_rank')
+                entry['difficulty_concordance'] = oa.get('difficulty_concordance')
+                entry['given_mean_rank'] = oa.get('given_mean_rank')
+                entry['blank_mean_rank'] = oa.get('blank_mean_rank')
+                entry['n_cands_vs_rank'] = oa.get('n_cands_vs_rank')
+            dynamics['gen_checkpoints'].append(entry)
+            dc_str = f"conc={entry.get('difficulty_concordance', 0):.3f}" if oa else ""
+            bl_acc = r.get('blank_cell_acc', 0)
+            print(f"    [gen ep {epoch}] acc={r['accuracy']:.4f} blank={bl_acc:.4f} "
+                  f"{dc_str} | {time.time()-t_gen:.0f}s")
+        except Exception as e:
+            print(f"    [gen ep {epoch}] FAILED: {e}")
 
     # ── Main training loop ──
     if uses_streaming:
@@ -900,19 +950,30 @@ def train_with_dynamics(
                     batch_idx = torch.arange(B, device=device).unsqueeze(1).expand_as(ans_pos)
 
                     if mask_type == 'random':
-                        pos_all = torch.arange(T_batch, device=device).unsqueeze(0)
-                        ans_mask = pos_all >= ans_starts.unsqueeze(1)
+                        # Only mask blank positions (given cells are never masked)
+                        bl = blank_masks[idx]  # [B, ANS_LEN]
                         t_ratio = torch.rand(B, device=device)
-                        m_probs = t_ratio.unsqueeze(1) * ans_mask.float()
+                        # Per-position mask probability: t_ratio * is_blank
+                        m_probs = torch.zeros(B, T_batch, dtype=torch.float, device=device)
+                        m_probs[batch_idx, ans_pos] = t_ratio.unsqueeze(1) * bl.float()
                         m = torch.bernoulli(m_probs).bool()
+                        # Guarantee at least one mask per sample
                         no_m = ~(m.any(dim=1))
                         if no_m.any():
-                            rand_j = torch.randint(ANS_LEN, (no_m.sum(),), device=device)
-                            fix_pos = ans_pos[no_m].gather(1, rand_j.unsqueeze(1)).squeeze(1)
-                            m[no_m, fix_pos] = True
+                            # Pick random blank position for each no-mask sample
+                            for bi_local in no_m.nonzero(as_tuple=True)[0]:
+                                bi_global = idx[bi_local]
+                                blank_js = blank_masks[bi_global].nonzero(as_tuple=True)[0]
+                                if len(blank_js) > 0:
+                                    rj = blank_js[torch.randint(len(blank_js), (1,))].item()
+                                    m[bi_local, ans_pos[bi_local, rj]] = True
                     elif mask_type == 'confidence':
+                        bl = blank_masks[idx]  # [B, ANS_LEN]
                         xm_probe = ids.clone()
-                        xm_probe[batch_idx, ans_pos] = mask_id
+                        # Only mask blank positions for probe
+                        blank_pos_mask = torch.zeros(B, T_batch, dtype=torch.bool, device=device)
+                        blank_pos_mask[batch_idx, ans_pos] = bl
+                        xm_probe[blank_pos_mask] = mask_id
                         model.eval()
                         with torch.no_grad():
                             logits_probe = model(xm_probe)
@@ -920,12 +981,14 @@ def train_with_dynamics(
                         lp = logits_probe[batch_idx, ans_pos]
                         lp[:, :, mask_id] = -float('inf')
                         confs = F.softmax(lp, dim=-1).max(dim=-1).values
-                        ranked = confs.argsort(dim=1)
+                        confs[~bl] = float('inf')  # given positions → never mask
+                        ranked = confs.argsort(dim=1)  # ascending: lowest conf first
+                        n_blanks_per = bl.sum(dim=1).float()
                         t_ratio = torch.rand(B, device=device)
-                        nm = (t_ratio * ANS_LEN).ceil().long().clamp(min=1)
+                        nm = (t_ratio * n_blanks_per).ceil().long().clamp(min=1)
                         rank_of_pos = torch.zeros_like(ranked)
                         rank_of_pos.scatter_(1, ranked, torch.arange(ANS_LEN, device=device).expand(B, -1))
-                        to_mask = rank_of_pos < nm.unsqueeze(1)
+                        to_mask = (rank_of_pos < nm.unsqueeze(1)) & bl
                         m = torch.zeros(B, T_batch, dtype=torch.bool, device=device)
                         m[batch_idx, ans_pos] = to_mask
 
@@ -1032,13 +1095,24 @@ def final_evaluate(model, tokenizer, test_data, objective,
     pos_acc = [sum(r['pos_correct'][j] for r in results) / max(n, 1)
                for j in range(ANS_LEN)]
 
-    # Per-category accuracy
+    # Per-category accuracy (blank categories only for meaningful comparison)
     cat_correct = defaultdict(list)
     for r in results:
         for j in range(ANS_LEN):
             cat = _depth_to_cat(r['meta'][j])
-            cat_correct[cat].append(r['pos_correct'][j])
+            if cat != 'given':
+                cat_correct[cat].append(r['pos_correct'][j])
     cat_acc = {cat: sum(v)/len(v) for cat, v in cat_correct.items() if v}
+
+    # Overall blank-only accuracy (per-cell, not per-puzzle)
+    blank_correct_total = 0
+    blank_total = 0
+    for r in results:
+        for j in range(ANS_LEN):
+            if not r['meta'][j]['is_given']:
+                blank_total += 1
+                blank_correct_total += r['pos_correct'][j]
+    blank_cell_acc = blank_correct_total / max(blank_total, 1)
 
     # By n_blanks
     blanks_acc = defaultdict(list)
@@ -1054,7 +1128,8 @@ def final_evaluate(model, tokenizer, test_data, objective,
         oa = _analyse_orders(oc, pl, [r['meta'] for r in results])
 
     return {
-        'accuracy': acc, 'n_samples': n, 'position_accuracy': pos_acc,
+        'accuracy': acc, 'blank_cell_acc': blank_cell_acc,
+        'n_samples': n, 'position_accuracy': pos_acc,
         'category_accuracy': cat_acc, 'by_blanks': by_blanks,
         'decode_order_analysis': oa,
     }
@@ -1379,11 +1454,10 @@ def run(tag=''):
             print(f"\n  Final eval: {key}")
             r = final_evaluate(m, tok, test_data, 'diffusion', decode_policy=dp)
             all_final[key] = r
-            print(f"  Acc: {r['accuracy']:.4f}")
+            print(f"  Acc: {r['accuracy']:.4f}  Blank cell acc: {r.get('blank_cell_acc', 0):.4f}")
             oa = r.get('decode_order_analysis')
             if oa:
                 dvr = oa.get('depth_vs_rank', {})
-                dc = oa.get('difficulty_concordance')
                 dc = oa.get('difficulty_concordance')
                 if dc is not None:
                     print(f"    Difficulty concordance: {dc:.4f}")
@@ -1447,7 +1521,8 @@ def run(tag=''):
     print(f"\n{'='*70}\n  SUMMARY\n{'='*70}")
     for key, r in all_final.items():
         if 'accuracy' in r:
-            print(f"  {key:<40s} acc={r['accuracy']:.4f}")
+            bl_acc = r.get('blank_cell_acc', 0)
+            print(f"  {key:<40s} acc={r['accuracy']:.4f}  blank_cell={bl_acc:.4f}")
             ca = r.get('category_accuracy', {})
             if ca:
                 for cat in DEPTH_CATS:
