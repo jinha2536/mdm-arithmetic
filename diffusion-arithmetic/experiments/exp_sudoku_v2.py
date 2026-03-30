@@ -262,14 +262,20 @@ def _compute_puzzle_meta(puzzle_str, sol_str):
 
 def _compute_meta_worker(args):
     """Worker for parallel meta computation."""
-    puzzle_str, sol_str, rating = args
+    puzzle_str, sol_str, rating = args[:3]
+    source = args[3] if len(args) > 3 else ''
     d = _compute_puzzle_meta(puzzle_str, sol_str)
     d['rating'] = rating
+    d['source'] = source
     return d
 
 
 def load_hf_data(n_easy, n_hard, n_test, hard_threshold, seed=42, cache_dir='.sudoku_cache'):
-    """Load from HuggingFace sapientinc/sudoku-extreme."""
+    """Load from HuggingFace sapientinc/sudoku-extreme.
+    Columns: source, question (puzzle), answer (solution), rating (tdoku backtracks).
+    Source encodes origin: puzzles0_kaggle (easy), puzzles4_forum_hardest_1905 (hard), etc.
+    Blanks may be '.' or '0' — _compute_puzzle_meta handles both.
+    """
     print("  Loading HuggingFace sudoku-extreme dataset...")
     from datasets import load_dataset
     ds = load_dataset('sapientinc/sudoku-extreme', cache_dir=cache_dir)
@@ -278,20 +284,40 @@ def load_hf_data(n_easy, n_hard, n_test, hard_threshold, seed=42, cache_dir='.su
     train_raw = ds['train']
     test_raw = ds['test']
 
-    # Convert to lists for sampling
+    # Log source distribution (first 100K for speed)
+    print("  Source distribution (train, sampled):")
+    src_counts = defaultdict(int)
+    sample_size = min(len(train_raw), 100000)
+    for i in range(sample_size):
+        src_counts[train_raw[i]['source']] += 1
+    for src, cnt in sorted(src_counts.items(), key=lambda x: -x[1]):
+        print(f"    {src}: ~{cnt * len(train_raw) // sample_size:,}")
+
+    # Efficient sampling: batch-read ratings first, then filter
     def _sample_by_rating(data, lo, hi, n, rng_inst):
-        indices = [i for i in range(len(data)) if lo <= data[i]['rating'] <= hi]
+        # Read all ratings at once (much faster than per-item access)
+        ratings = data['rating']
+        indices = [i for i, r in enumerate(ratings) if lo <= r <= hi]
         if len(indices) > n:
             indices = rng_inst.sample(indices, n)
-        return [(data[i]['puzzle'], data[i]['solution'], data[i]['rating']) for i in indices]
+        print(f"    rating [{lo},{hi}]: {len(indices)} available, sampling {min(len(indices), n)}")
+        # Batch-read selected rows
+        if not indices:
+            return []
+        rows = data.select(indices)
+        return [(rows[i]['question'], rows[i]['answer'], rows[i]['rating'],
+                 rows[i].get('source', ''))
+                for i in range(len(rows))]
 
     # Train: easy-dominant mix
+    print("  Sampling train data...")
     easy_train = _sample_by_rating(train_raw, 0, 0, n_easy, rng)
     hard_train = _sample_by_rating(train_raw, hard_threshold, 999999, n_hard, rng)
     train_tuples = easy_train + hard_train
     rng.shuffle(train_tuples)
 
     # Test: separate tiers
+    print("  Sampling test data...")
     rng2 = random.Random(seed + 1000)
     test_tiers = {}
     for tier_name, (lo, hi) in RATING_TIERS.items():
@@ -858,10 +884,12 @@ def evaluate(model, tokenizer, test_data, decode_policy='confidence',
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 def analyse_rating_correlation(data):
-    """Correlate our depth/n_cands metrics with external tdoku rating."""
-    features, ratings = [], []
+    """Correlate our depth/n_cands metrics with external tdoku rating.
+    Also analyzes by source (puzzle origin) for SE-rating-equivalent grouping."""
+    features, ratings, sources = [], [], []
     for d in data:
         r = d.get('rating', 0)
+        src = d.get('source', '')
         meta = d['meta']
         n_hard = sum(1 for j in range(81) if meta[j]['prop_depth'] == -1)
         blanks = [j for j in range(81) if not meta[j]['is_given']]
@@ -876,6 +904,7 @@ def analyse_rating_correlation(data):
             'frac_hard': n_hard / max(len(blanks), 1),
         })
         ratings.append(r)
+        sources.append(src)
 
     if len(ratings) < 10: return {}
 
@@ -891,15 +920,40 @@ def analyse_rating_correlation(data):
         xs = [f[feat_name] for f in features]
         correlations[feat_name] = _corr(xs, ratings)
 
-    # Map rating ranges to SE-equivalent tiers (conceptual)
+    # Rating distribution by tdoku backtrack ranges → conceptual SE mapping
+    # tdoku rating=0 ↔ CP-solvable ↔ SE ~1-4 (singles only)
+    # tdoku rating=1-9 ↔ light search ↔ SE ~4-7 (pairs, triples)
+    # tdoku rating=10-99 ↔ moderate search ↔ SE ~7-10 (X-wing, coloring)
+    # tdoku rating=100+ ↔ deep search ↔ SE ~10+ (forcing chains, unique rect)
     se_mapping = {
-        'rating=0 → SE<4 (singles only)': sum(1 for r in ratings if r == 0),
-        'rating=1-9 → SE 4-7 (moderate search)': sum(1 for r in ratings if 1 <= r <= 9),
-        'rating=10-99 → SE 7-10 (hard techniques)': sum(1 for r in ratings if 10 <= r <= 99),
-        'rating=100+ → SE 10+ (extreme)': sum(1 for r in ratings if r >= 100),
+        'rating=0 (CP-solvable, ~SE 1-4)': sum(1 for r in ratings if r == 0),
+        'rating=1-9 (light search, ~SE 4-7)': sum(1 for r in ratings if 1 <= r <= 9),
+        'rating=10-99 (mod search, ~SE 7-10)': sum(1 for r in ratings if 10 <= r <= 99),
+        'rating=100+ (deep search, ~SE 10+)': sum(1 for r in ratings if r >= 100),
     }
 
+    # Source-based analysis: map puzzle source to difficulty profile
+    source_stats = defaultdict(lambda: {'ratings': [], 'n_hard_cells': [], 'n': 0})
+    for i in range(len(ratings)):
+        src = sources[i] if sources[i] else 'unknown'
+        # Simplify source name (remove path prefixes)
+        src_short = src.split('/')[-1] if '/' in src else src
+        source_stats[src_short]['ratings'].append(ratings[i])
+        source_stats[src_short]['n_hard_cells'].append(features[i]['n_depth_hard'])
+        source_stats[src_short]['n'] += 1
+    source_summary = {}
+    for src, stats in source_stats.items():
+        rs = stats['ratings']
+        source_summary[src] = {
+            'n': stats['n'],
+            'mean_rating': sum(rs)/len(rs),
+            'median_rating': sorted(rs)[len(rs)//2],
+            'mean_n_hard_cells': sum(stats['n_hard_cells'])/len(stats['n_hard_cells']),
+            'frac_cp_solvable': sum(1 for r in rs if r == 0) / len(rs),
+        }
+
     return {'correlations': correlations, 'se_mapping': se_mapping,
+            'source_summary': source_summary,
             'features': features, 'ratings': ratings}
 
 
@@ -1170,6 +1224,14 @@ def run(tag=''):
     if corr.get('se_mapping'):
         for desc, n in corr['se_mapping'].items():
             print(f"    {desc}: n={n}")
+    if corr.get('source_summary'):
+        print(f"  Source-based difficulty profile:")
+        for src, info in sorted(corr['source_summary'].items(),
+                                 key=lambda x: x[1]['mean_rating']):
+            print(f"    {src:<35s}: n={info['n']:>6d} "
+                  f"mean_rating={info['mean_rating']:>6.1f} "
+                  f"mean_hard_cells={info['mean_n_hard_cells']:>4.1f} "
+                  f"cp_solvable={info['frac_cp_solvable']:.0%}")
 
     # ── Merge all test tiers for eval ──
     # Keep separate by tier for rating-stratified eval
