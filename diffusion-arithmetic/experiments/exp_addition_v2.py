@@ -1185,6 +1185,465 @@ def analyse_confidence_cascade(model, tokenizer, test_samples, fmt, max_len,
     }
 
 
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Extended analysis: corner cases, coverage deficit
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+def _chain_stats(a, b):
+    """Rich carry-chain statistics for a single (a, b) pair.
+    Returns dict with max_chain_len, n_propagate, n_chains,
+    chain_reaches_msb, msb_carry_out, msb_chain_len,
+    overflow_depends_on_chain, gkp (list).
+    """
+    a_s, b_s = _pad(a, ND), _pad(b, ND)
+    gkp = []
+    for i in range(ND - 1, -1, -1):
+        s = int(a_s[i]) + int(b_s[i])
+        gkp.append('g' if s >= 10 else ('p' if s == 9 else 'k'))
+
+    carry = 0
+    for i in range(ND - 1, -1, -1):
+        s = int(a_s[i]) + int(b_s[i]) + carry
+        carry = s // 10
+
+    chains, run_start, run_len = [], None, 0
+    for d in range(ND):
+        if gkp[d] == 'p':
+            if run_start is None: run_start, run_len = d, 1
+            else: run_len += 1
+        else:
+            if run_start is not None: chains.append((run_start, run_len))
+            run_start, run_len = None, 0
+    if run_start is not None: chains.append((run_start, run_len))
+
+    chain_lens = [ln for _, ln in chains]
+    reaches_msb = (gkp[ND - 1] == 'p')
+    msb_cl = 0
+    if reaches_msb:
+        d = ND - 1
+        while d >= 0 and gkp[d] == 'p': msb_cl += 1; d -= 1
+
+    return {
+        'max_chain_len': max(chain_lens, default=0),
+        'n_propagate': sum(1 for g in gkp if g == 'p'),
+        'n_chains': len(chains),
+        'chain_reaches_msb': reaches_msb,
+        'msb_carry_out': bool(carry),
+        'msb_chain_len': msb_cl,
+        'overflow_depends_on_chain': reaches_msb,
+        'gkp': gkp,
+    }
+
+
+def gen_corner_case_test(n, fmt, seed, category='all'):
+    """Generate pathological corner-case samples.
+    Categories: msb_chain, full_propagate, long_chain, msb_chain_only, all.
+    """
+    rng = random.Random(seed)
+    lo, hi = 10**(ND - 1), 10**ND - 1
+
+    def _accept(a, b):
+        st = _chain_stats(a, b)
+        if category == 'msb_chain': return st['chain_reaches_msb']
+        if category == 'full_propagate': return st['n_propagate'] == ND
+        if category == 'long_chain': return st['max_chain_len'] >= ND // 2
+        if category == 'msb_chain_only':
+            return st['chain_reaches_msb'] and st['msb_chain_len'] < ND
+        if category == 'all':
+            return st['chain_reaches_msb'] or st['max_chain_len'] >= ND // 2
+        return False
+
+    results, attempts = [], 0
+    while len(results) < n and attempts < n * 3000:
+        attempts += 1
+        if category == 'full_propagate':
+            ad = [rng.randint(1, 8)] + [rng.randint(0, 9) for _ in range(ND - 1)]
+            bd = [9 - d for d in ad]
+            if bd[0] < 1: ad[0] = rng.randint(1, 8); bd[0] = 9 - ad[0]
+            a = int(''.join(str(d) for d in ad))
+            b = int(''.join(str(d) for d in bd))
+        else:
+            a, b = rng.randint(lo, hi), rng.randint(lo, hi)
+        if _accept(a, b):
+            results.append(FMT_FN[fmt](a, b))
+    if len(results) < n:
+        print(f"    WARNING: corner_case({category}) got {len(results)}/{n}")
+    return results[:n]
+
+
+@torch.no_grad()
+def gen_eval_with_stats(model, tokenizer, test_samples, fmt, max_len,
+                        decode_policy='confidence', device=None):
+    """Per-sample generation with chain stats, error positions, gkp, dep_ctx."""
+    if device is None: device = DEVICE
+    mask_id = tokenizer.special_ids['mask']
+    pad_id = tokenizer.special_ids['pad']
+    model.eval()
+    out = []
+    for st in range(0, len(test_samples), 128):
+        batch = test_samples[st:min(st+128, len(test_samples))]
+        B = len(batch)
+        penc = [tokenizer.encode(s.split('=')[0]+'=') for s in batch]
+        pm = max(len(p) for p in penc)
+        pids = torch.full((B, pm), pad_id, dtype=torch.long)
+        for i, e in enumerate(penc): pids[i, :len(e)] = torch.tensor(e)
+        policy = _lsb_policy(fmt) if decode_policy == 'lsb' else 'confidence'
+        gen, _, _ = generate_diffusion(
+            model, pids, ANS_LEN, mask_id,
+            policy=policy, greedy=True, device=device)
+        pred_ids = gen[:, pm:pm+ANS_LEN]
+        for i in range(B):
+            s = batch[i]
+            ps = tokenizer.decode(pred_ids[i].cpu().tolist())
+            gs = get_answer(s, fmt)
+            a, b = _parse_operands(s)
+            pc = [ps[j] == gs[j] if j < len(ps) else False for j in range(len(gs))]
+            errs = [j for j in range(len(gs)) if j >= len(ps) or ps[j] != gs[j]]
+            out.append({
+                'correct': ps == gs, 'pos_correct': pc,
+                'n_errors': len(errs), 'error_positions': errs,
+                'chain_stats': _chain_stats(a, b),
+                'gkp_at_pos': _gkp_at_answer_pos(a, b, fmt),
+                'dep_ctx': _dependency_context_at_pos(a, b, fmt),
+            })
+    return out
+
+
+def stratify_results(per_sample):
+    """Stratify per-sample results by chain properties."""
+    def _mcl_bin(mcl):
+        if mcl == 0: return 'cl=0'
+        if mcl <= 2: return 'cl=1-2'
+        if mcl <= 4: return 'cl=3-4'
+        if mcl <= 7: return 'cl=5-7'
+        return 'cl=8+'
+    def _pfrac_bin(n_p):
+        frac = n_p / ND
+        if frac == 0: return 'p=0'
+        if frac < 0.25: return 'p<25%'
+        if frac < 0.5: return 'p<50%'
+        return 'p>=50%'
+    strata = {
+        'reaches_msb': lambda st: 'msb_yes' if st['chain_reaches_msb'] else 'msb_no',
+        'max_chain': lambda st: _mcl_bin(st['max_chain_len']),
+        'overflow_dep': lambda st: 'ovf_dep' if st['overflow_depends_on_chain'] else 'ovf_free',
+        'p_fraction': lambda st: _pfrac_bin(st['n_propagate']),
+        'msb_x_carry': lambda st: (
+            'msb+carry' if st['chain_reaches_msb'] and st['msb_carry_out']
+            else 'msb+nocarry' if st['chain_reaches_msb']
+            else 'nomsb+carry' if st['msb_carry_out']
+            else 'nomsb+nocarry'),
+    }
+    out = {}
+    for name, fn in strata.items():
+        buckets = defaultdict(list)
+        for r in per_sample:
+            buckets[fn(r['chain_stats'])].append(r['correct'])
+        out[name] = {k: {'acc': sum(v)/len(v), 'n': len(v)}
+                     for k, v in sorted(buckets.items())}
+    return out
+
+
+def analyse_error_positions(per_sample, fmt):
+    """Classify errors by gkp type: overflow, in_p_chain, above_p_chain, at_g_or_k."""
+    counts = {'overflow': 0, 'in_p_chain': 0, 'above_p_chain': 0,
+              'at_g_or_k': 0, 'total': 0}
+    n_failed = 0
+    for r in per_sample:
+        if r['correct']: continue
+        n_failed += 1
+        gkp, dep = r['gkp_at_pos'], r['dep_ctx']
+        for ej in r['error_positions']:
+            if ej >= ANS_LEN: continue
+            counts['total'] += 1
+            if gkp[ej] == 'carry_out': counts['overflow'] += 1
+            elif gkp[ej] == 'p':
+                counts['in_p_chain'] += 1
+                if dep[ej] == 'p_above_p': counts['above_p_chain'] += 1
+            elif gkp[ej] in ('g', 'k'): counts['at_g_or_k'] += 1
+    t = max(counts['total'], 1)
+    return {'n_failed_samples': n_failed, **counts,
+            'frac_overflow': counts['overflow']/t, 'frac_in_p': counts['in_p_chain']/t,
+            'frac_above_p': counts['above_p_chain']/t, 'frac_g_or_k': counts['at_g_or_k']/t}
+
+
+def analyse_carry_rarity(per_sample_results, test_samples, fmt):
+    """Per-position carry-in base rate × conditional accuracy."""
+    carry_flags = [_carry_at_answer_pos(*_parse_operands(s), fmt) for s in test_samples]
+    N = len(per_sample_results)
+    per_pos = []
+    for j in range(ANS_LEN):
+        ci1, ci0 = [], []
+        for i in range(N):
+            c_j = per_sample_results[i]['pos_correct'][j] if j < len(per_sample_results[i]['pos_correct']) else False
+            (ci1 if carry_flags[i][j] else ci0).append(c_j)
+        br = len(ci1) / max(N, 1)
+        a1 = sum(ci1)/len(ci1) if ci1 else None
+        a0 = sum(ci0)/len(ci0) if ci0 else None
+        gap = (a0 - a1) if a0 is not None and a1 is not None else None
+        per_pos.append({'position': j, 'base_rate': br, 'n_carry_1': len(ci1),
+                        'n_carry_0': len(ci0), 'acc_carry_1': a1,
+                        'acc_carry_0': a0, 'acc_gap': gap})
+
+    bins = {'rare(<15%)': lambda br: br < 0.15, 'low(15-30%)': lambda br: 0.15 <= br < 0.30,
+            'mid(30-50%)': lambda br: 0.30 <= br < 0.50, 'high(>=50%)': lambda br: br >= 0.50}
+    binned = {}
+    for bn, bfn in bins.items():
+        ps = [p for p in per_pos if p['acc_gap'] is not None and bfn(p['base_rate'])]
+        if ps:
+            binned[bn] = {'n_positions': len(ps),
+                          'mean_gap': sum(p['acc_gap'] for p in ps)/len(ps),
+                          'mean_acc_carry_1': sum(p['acc_carry_1'] for p in ps)/len(ps),
+                          'mean_acc_carry_0': sum(p['acc_carry_0'] for p in ps)/len(ps)}
+
+    valid = [(p['base_rate'], p['acc_gap']) for p in per_pos if p['acc_gap'] is not None]
+    corr = None
+    if len(valid) >= 3:
+        brs, gaps = [v[0] for v in valid], [v[1] for v in valid]
+        mb, mg = sum(brs)/len(brs), sum(gaps)/len(gaps)
+        c = sum((b-mb)*(g-mg) for b, g in zip(brs, gaps))
+        sb = sum((b-mb)**2 for b in brs)**0.5
+        sg = sum((g-mg)**2 for g in gaps)**0.5
+        corr = c / (sb * sg) if sb > 0 and sg > 0 else 0.0
+
+    return {'per_position': per_pos, 'binned': binned, 'base_rate_gap_corr': corr}
+
+
+@torch.no_grad()
+def simulate_puma_coverage(model, tokenizer, test_samples, fmt, max_len,
+                           K=None, tau=None, n_samples=200, device=None):
+    """Simulate PUMA teacher-forced chains and measure coverage per position.
+
+    Coverage(j, condition) := fraction of chain steps where j stays masked.
+    Random masking has uniform coverage ≈ 0.5.
+    PUMA reveals high-confidence positions early → lower coverage there.
+
+    Key metric: coverage_deficit = coverage(carry=0) − coverage(carry=1).
+    Positive deficit = carry-in=1 cases get LESS training signal.
+    """
+    if device is None: device = DEVICE
+    if K is None: K = PUMA_K_END
+    if tau is None: tau = PUMA_TAU
+    model.eval()
+    mask_id = tokenizer.special_ids['mask']
+
+    carry_flags = [_carry_at_answer_pos(*_parse_operands(s), fmt)
+                   for s in test_samples[:n_samples]]
+    N = min(len(test_samples), n_samples)
+
+    cov_c1_sum = torch.zeros(ANS_LEN)
+    cov_c0_sum = torch.zeros(ANS_LEN)
+    cov_c1_n = torch.zeros(ANS_LEN, dtype=torch.long)
+    cov_c0_n = torch.zeros(ANS_LEN, dtype=torch.long)
+    cov_all_sum = torch.zeros(ANS_LEN)
+
+    for si in range(N):
+        s = test_samples[si]
+        ci = carry_flags[si]
+        prefix = s.split('=')[0] + '='
+        answer = get_answer(s, fmt)
+        penc = tokenizer.encode(prefix)
+        aenc = tokenizer.encode(answer)
+        T_pre = len(penc)
+
+        x = torch.tensor(penc + [mask_id]*ANS_LEN, dtype=torch.long,
+                          device=device).unsqueeze(0)
+        x0_ans = torch.tensor(aenc[:ANS_LEN], dtype=torch.long, device=device)
+        is_masked = torch.ones(ANS_LEN, dtype=torch.bool, device=device)
+        steps_masked = torch.zeros(ANS_LEN)
+        total_steps = 0
+
+        for step in range(K):
+            if not is_masked.any(): break
+            total_steps += 1
+            steps_masked += is_masked.cpu().float()
+
+            logits = model(x)
+            n_masked = is_masked.sum().item()
+            n_reveal = max(1, int(math.ceil(n_masked / max(K - step, 1))))
+
+            confs = torch.full((ANS_LEN,), -float('inf'), device=device)
+            for j in range(ANS_LEN):
+                if is_masked[j]:
+                    cl = logits[0, T_pre + j].clone()
+                    cl[mask_id] = -float('inf')
+                    confs[j] = F.softmax(cl, dim=-1).max()
+
+            ranked = confs.argsort(descending=True)
+            reveal = torch.zeros(ANS_LEN, dtype=torch.bool, device=device)
+            for ri in range(ANS_LEN):
+                j = ranked[ri].item()
+                if not is_masked[j]: continue
+                if reveal.sum() < n_reveal or confs[j] > tau:
+                    reveal[j] = True
+
+            for j in range(ANS_LEN):
+                if reveal[j]:
+                    x[0, T_pre + j] = x0_ans[j]
+                    is_masked[j] = False
+
+        frac = steps_masked / max(total_steps, 1)
+        cov_all_sum += frac
+        for j in range(ANS_LEN):
+            if ci[j]:
+                cov_c1_sum[j] += frac[j]; cov_c1_n[j] += 1
+            else:
+                cov_c0_sum[j] += frac[j]; cov_c0_n[j] += 1
+
+    per_pos = []
+    for j in range(ANS_LEN):
+        n1, n0 = cov_c1_n[j].item(), cov_c0_n[j].item()
+        c1 = cov_c1_sum[j].item()/n1 if n1 > 0 else None
+        c0 = cov_c0_sum[j].item()/n0 if n0 > 0 else None
+        c_all = cov_all_sum[j].item()/N
+        br = n1/max(n1+n0, 1)
+        deficit = (c0 - c1) if c0 is not None and c1 is not None else None
+        per_pos.append({'position': j, 'base_rate': br, 'coverage_all': c_all,
+                        'coverage_carry_1': c1, 'coverage_carry_0': c0,
+                        'n_carry_1': n1, 'n_carry_0': n0,
+                        'coverage_deficit': deficit})
+
+    valid = [(p['base_rate'], p['coverage_deficit'])
+             for p in per_pos if p['coverage_deficit'] is not None]
+    corr = None
+    if len(valid) >= 3:
+        brs, defs = [v[0] for v in valid], [v[1] for v in valid]
+        mb, md = sum(brs)/len(brs), sum(defs)/len(defs)
+        c = sum((b-mb)*(d-md) for b, d in zip(brs, defs))
+        sb = sum((b-mb)**2 for b in brs)**0.5
+        sd = sum((d-md)**2 for d in defs)**0.5
+        corr = c / (sb * sd) if sb > 0 and sd > 0 else 0.0
+
+    rare_ps = [p for p in per_pos
+               if p['coverage_deficit'] is not None and p['base_rate'] < 0.3]
+    mdr = sum(p['coverage_deficit'] for p in rare_ps)/len(rare_ps) if rare_ps else None
+
+    return {'per_position': per_pos, 'base_rate_deficit_corr': corr,
+            'mean_deficit_rare': mdr, 'random_coverage': 0.5}
+
+
+def find_threshold_epochs(dynamics, thresholds=(0.90, 0.95, 0.99, 0.995)):
+    """First epoch where gen accuracy crosses each threshold."""
+    gcs = dynamics.get('gen_checkpoints', [])
+    result = {}
+    for thresh in thresholds:
+        for gc in gcs:
+            acc = gc.get('gen_acc')
+            if isinstance(acc, dict): acc = acc.get('confidence', 0)
+            if acc is not None and acc >= thresh:
+                result[thresh] = gc['epoch']; break
+        else:
+            result[thresh] = None
+    return result
+
+
+def run_carry_ext(model, tokenizer, test_data, fmt, max_len,
+                  mt, dynamics, all_final, device=None):
+    """Extended carry analysis — corner cases + stratification + error analysis."""
+    if device is None: device = DEVICE
+    print(f"\n  ── Extended Carry Analysis (mask={mt}) ──")
+
+    # Corner case categories
+    corner_cats = {'msb_chain': 'p-chain reaches MSB',
+                   'full_propagate': 'all positions are p',
+                   'long_chain': f'max chain >= {ND//2}',
+                   'msb_chain_only': 'MSB chain, not full-length'}
+    for cat, desc in corner_cats.items():
+        data = gen_corner_case_test(N_TEST, fmt, seed=6000, category=cat)
+        if not data:
+            print(f"    corner/{cat}: 0 samples"); continue
+        for dp in DECODE_POLICIES:
+            ps = gen_eval_with_stats(model, tokenizer, data, fmt, max_len,
+                                     decode_policy=dp, device=device)
+            acc = sum(r['correct'] for r in ps) / len(ps)
+            key = _fk('diffusion', fmt, mt, f'corner_{cat}_{dp}')
+            all_final[key] = {'accuracy': acc, 'n': len(data),
+                              'stratified': stratify_results(ps),
+                              'errors': analyse_error_positions(ps, fmt)}
+            print(f"    corner/{cat} {dp}: acc={acc:.4f} (n={len(data)})")
+
+    # Stratified on standard test
+    print(f"  Stratified on standard test...")
+    for dp in DECODE_POLICIES:
+        ps = gen_eval_with_stats(model, tokenizer, test_data, fmt, max_len,
+                                 decode_policy=dp, device=device)
+        strat = stratify_results(ps)
+        key = _fk('diffusion', fmt, mt, f'strat_std_{dp}')
+        all_final[key] = strat
+        for sn, bk in strat.items():
+            parts = [f"{k}={v['acc']:.4f}(n={v['n']})" for k, v in bk.items()]
+            print(f"    {dp}/{sn}: {' '.join(parts)}")
+
+    # Stratified on carry-heavy
+    print(f"  Stratified on carry-heavy...")
+    heavy_data = gen_carry_heavy_test(N_TEST, fmt, seed=7000, min_max_chain=3)
+    for dp in DECODE_POLICIES:
+        ps = gen_eval_with_stats(model, tokenizer, heavy_data, fmt, max_len,
+                                 decode_policy=dp, device=device)
+        strat = stratify_results(ps)
+        errs = analyse_error_positions(ps, fmt)
+        key = _fk('diffusion', fmt, mt, f'strat_heavy_{dp}')
+        all_final[key] = {'stratified': strat, 'errors': errs}
+        for sn, bk in strat.items():
+            parts = [f"{k}={v['acc']:.4f}(n={v['n']})" for k, v in bk.items()]
+            print(f"    {dp}/{sn}: {' '.join(parts)}")
+        nf = errs['n_failed_samples']
+        if nf > 0:
+            print(f"    {dp} errors ({nf} failures): overflow={errs['frac_overflow']:.0%} "
+                  f"in_p={errs['frac_in_p']:.0%} g_or_k={errs['frac_g_or_k']:.0%}")
+
+    # Threshold epochs
+    thresholds = find_threshold_epochs(dynamics)
+    all_final[_fk('diffusion', fmt, mt, 'thresh_epochs')] = thresholds
+    print(f"  Threshold epochs: " +
+          ' '.join(f"{t:.0%}->ep{e}" if e else f"{t:.0%}->N/A"
+                   for t, e in thresholds.items()))
+
+
+def run_coverage_analysis(model, tokenizer, test_data, fmt, max_len,
+                          mt, all_final, device=None):
+    """Coverage deficit + carry rarity analyses."""
+    if device is None: device = DEVICE
+    print(f"\n  ── Coverage Deficit Analysis (mask={mt}) ──")
+
+    # Carry rarity × accuracy
+    for dp in DECODE_POLICIES:
+        print(f"  Carry-in rarity x accuracy ({dp})...")
+        ps = gen_eval_with_stats(model, tokenizer, test_data, fmt, max_len,
+                                 decode_policy=dp, device=device)
+        rarity = analyse_carry_rarity(ps, test_data, fmt)
+        key = _fk('diffusion', fmt, mt, f'carry_rarity_{dp}')
+        all_final[key] = rarity
+        corr = rarity['base_rate_gap_corr']
+        print(f"    corr(base_rate, acc_gap) = {corr:.3f}" if corr else
+              f"    corr = N/A")
+        for bn, bd in rarity['binned'].items():
+            print(f"    {bn}: gap={bd['mean_gap']:+.4f} "
+                  f"acc(c=1)={bd['mean_acc_carry_1']:.4f} "
+                  f"acc(c=0)={bd['mean_acc_carry_0']:.4f} "
+                  f"(n_pos={bd['n_positions']})")
+
+    # PUMA coverage simulation (puma only)
+    if mt == 'puma':
+        print(f"  Simulating PUMA coverage on test data...")
+        cov = simulate_puma_coverage(model, tokenizer, test_data, fmt, max_len,
+                                     device=device)
+        key = _fk('diffusion', fmt, mt, 'coverage')
+        all_final[key] = cov
+        corr = cov['base_rate_deficit_corr']
+        mdr = cov['mean_deficit_rare']
+        print(f"    corr(base_rate, deficit) = {corr:.3f}" if corr is not None else
+              f"    corr = N/A")
+        print(f"    mean deficit (rare) = {mdr:+.4f}" if mdr is not None else
+              f"    mean deficit = N/A")
+        labs = _pos_labels(fmt)
+        for p in cov['per_position']:
+            if p['coverage_deficit'] is not None:
+                print(f"      {labs[p['position']]}: br={p['base_rate']:.2f} "
+                      f"cov(c=1)={p['coverage_carry_1']:.3f} "
+                      f"cov(c=0)={p['coverage_carry_0']:.3f} "
+                      f"deficit={p['coverage_deficit']:+.4f}")
+
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Training (epoch-based, fixed budget)
@@ -2698,6 +3157,158 @@ def make_figures(all_dyn, all_final):
     return figs
 
 
+def make_ext_figures(all_final, fmt):
+    """Figures for corner case comparison and coverage deficit analysis."""
+    figs = {}
+    labels = _pos_labels(fmt)
+
+    # ── Corner case accuracy: PUMA vs Random ──
+    corner_cats = ['msb_chain', 'full_propagate', 'long_chain', 'msb_chain_only']
+    fig, axes = plt.subplots(1, len(DECODE_POLICIES),
+                             figsize=(7*len(DECODE_POLICIES), 5), squeeze=False)
+    axes = axes[0]
+    for ai, dp in enumerate(DECODE_POLICIES):
+        ax = axes[ai]
+        labs, r_a, p_a = [], [], []
+        for cat in corner_cats:
+            kr = _fk('diffusion', fmt, 'random', f'corner_{cat}_{dp}')
+            kp = _fk('diffusion', fmt, 'puma', f'corner_{cat}_{dp}')
+            rr, rp = all_final.get(kr), all_final.get(kp)
+            if rr and rp:
+                labs.append(cat.replace('_', '\n'))
+                r_a.append(rr['accuracy']); p_a.append(rp['accuracy'])
+        if not labs: continue
+        x = range(len(labs)); w = 0.35
+        ax.bar([i-w/2 for i in x], r_a, w, label='random', color='#3498db', alpha=0.8)
+        ax.bar([i+w/2 for i in x], p_a, w, label='puma', color='#8e44ad', alpha=0.8)
+        for i in range(len(labs)):
+            d = p_a[i] - r_a[i]; y = max(r_a[i], p_a[i]) + 0.005
+            ax.text(i, y, f'{d:+.3f}', ha='center', fontsize=8,
+                    color='#c0392b' if d < -0.005 else '#27ae60')
+        ax.set_xticks(list(x)); ax.set_xticklabels(labs, fontsize=8)
+        ax.set_ylabel('Accuracy'); ax.set_title(f'{dp} decode')
+        ax.legend(fontsize=8); ax.grid(alpha=0.3, axis='y')
+        all_a = r_a + p_a
+        if all_a: ax.set_ylim(max(0, min(all_a) - 0.05), 1.005)
+    fig.suptitle(f'Corner Case Accuracy — {fmt}', fontsize=13, y=1.02)
+    fig.tight_layout(); figs[f'corner_cases_{fmt}'] = fig
+
+    # ── Stratified accuracy (confidence decode, standard test) ──
+    strata_names = ['reaches_msb', 'max_chain', 'msb_x_carry', 'p_fraction']
+    fig, axes = plt.subplots(2, 2, figsize=(15, 10))
+    for ai, sn in enumerate(strata_names):
+        ax = axes[ai//2][ai%2]; all_labels = None
+        for mi, mt in enumerate(['random', 'puma']):
+            key = _fk('diffusion', fmt, mt, 'strat_std_confidence')
+            strat = all_final.get(key, {})
+            sd = strat.get(sn, {})
+            if not sd: continue
+            ls = list(sd.keys())
+            if all_labels is None: all_labels = ls
+            a_s = [sd[l]['acc'] for l in ls]
+            n_s = [sd[l]['n'] for l in ls]
+            xi = range(len(ls)); w = 0.35
+            off = -w/2 if mi == 0 else w/2
+            col = '#3498db' if mt == 'random' else '#8e44ad'
+            bars = ax.bar([i+off for i in xi], a_s, w, label=mt, color=col, alpha=0.8)
+            for i, (bar, n_) in enumerate(zip(bars, n_s)):
+                ax.text(bar.get_x()+bar.get_width()/2, bar.get_height()+0.003,
+                        f'n={n_}', ha='center', fontsize=5, color='gray')
+        if all_labels:
+            ax.set_xticks(list(range(len(all_labels))))
+            ax.set_xticklabels(all_labels, fontsize=7)
+        ax.set_ylabel('Accuracy'); ax.set_title(sn)
+        ax.legend(fontsize=7); ax.grid(alpha=0.3, axis='y')
+    fig.suptitle(f'Stratified Accuracy (confidence, standard test) — {fmt}',
+                 fontsize=12, y=1.02)
+    fig.tight_layout(); figs[f'stratified_std_{fmt}'] = fig
+
+    # ── Carry-in rarity × accuracy gap ──
+    fig, axes = plt.subplots(1, 2, figsize=(16, 6))
+    ax = axes[0]
+    for mt, color, marker in [('random', '#3498db', 'o'), ('puma', '#8e44ad', 's')]:
+        key = _fk('diffusion', fmt, mt, 'carry_rarity_confidence')
+        rarity = all_final.get(key)
+        if not rarity: continue
+        brs = [p['base_rate'] for p in rarity['per_position'] if p['acc_gap'] is not None]
+        gaps = [p['acc_gap'] for p in rarity['per_position'] if p['acc_gap'] is not None]
+        corr = rarity['base_rate_gap_corr']
+        label = f"{mt} (r={corr:.2f})" if corr else mt
+        ax.scatter(brs, gaps, c=color, marker=marker, s=50, alpha=0.7, label=label)
+        # Annotate position names
+        pos_idx = 0
+        for p in rarity['per_position']:
+            if p['acc_gap'] is not None:
+                ax.annotate(labels[p['position']], (p['base_rate'], p['acc_gap']),
+                           fontsize=5, alpha=0.5)
+    ax.axhline(0, color='gray', ls=':', lw=1)
+    ax.set_xlabel('Carry-in base rate'); ax.set_ylabel('acc(c=0) - acc(c=1)')
+    ax.set_title('Carry-in penalty vs base rate'); ax.legend(fontsize=8); ax.grid(alpha=0.3)
+
+    ax = axes[1]
+    bin_names = ['rare(<15%)', 'low(15-30%)', 'mid(30-50%)', 'high(>=50%)']
+    for mi, (mt, color) in enumerate([('random', '#3498db'), ('puma', '#8e44ad')]):
+        key = _fk('diffusion', fmt, mt, 'carry_rarity_confidence')
+        rarity = all_final.get(key)
+        if not rarity: continue
+        bn = rarity['binned']
+        bl = [b for b in bin_names if b in bn]
+        gs = [bn[b]['mean_gap'] for b in bl]
+        xi = range(len(bl)); w = 0.35; off = -w/2 if mi == 0 else w/2
+        ax.bar([i+off for i in xi], gs, w, label=mt, color=color, alpha=0.8)
+    if bl:
+        ax.set_xticks(list(range(len(bl)))); ax.set_xticklabels(bl, fontsize=8)
+    ax.axhline(0, color='gray', ls=':', lw=1)
+    ax.set_ylabel('Mean acc gap'); ax.set_title('Carry penalty by rarity bin')
+    ax.legend(fontsize=8); ax.grid(alpha=0.3, axis='y')
+    fig.suptitle(f'Carry-in Rarity x Accuracy — {fmt}', fontsize=11, y=1.05)
+    fig.tight_layout(); figs[f'carry_rarity_{fmt}'] = fig
+
+    # ── PUMA coverage deficit ──
+    cov_key = _fk('diffusion', fmt, 'puma', 'coverage')
+    cov = all_final.get(cov_key)
+    if cov:
+        fig, axes = plt.subplots(1, 2, figsize=(16, 6))
+        ax = axes[0]
+        positions = range(ANS_LEN)
+        c1 = [p['coverage_carry_1'] or 0 for p in cov['per_position']]
+        c0 = [p['coverage_carry_0'] or 0 for p in cov['per_position']]
+        ax.bar([i-0.2 for i in positions], c0, 0.4,
+               label='carry_in=0', color='#2ecc71', alpha=0.7)
+        ax.bar([i+0.2 for i in positions], c1, 0.4,
+               label='carry_in=1', color='#e74c3c', alpha=0.7)
+        ax.axhline(0.5, color='gray', ls='--', lw=1, alpha=0.7, label='random baseline')
+        ax.set_xticks(list(positions))
+        ax.set_xticklabels(labels, fontsize=7, rotation=45)
+        ax.set_ylabel('PUMA Coverage (frac steps masked)')
+        ax.set_title('Coverage by carry-in condition')
+        ax.legend(fontsize=7); ax.grid(alpha=0.3, axis='y')
+
+        ax = axes[1]
+        brs = [p['base_rate'] for p in cov['per_position']
+               if p['coverage_deficit'] is not None]
+        defs = [p['coverage_deficit'] for p in cov['per_position']
+                if p['coverage_deficit'] is not None]
+        ax.scatter(brs, defs, c='#8e44ad', s=60, alpha=0.7)
+        ax.axhline(0, color='gray', ls=':', lw=1)
+        ax.set_xlabel('Carry-in base rate')
+        ax.set_ylabel('Coverage deficit (cov(c=0) - cov(c=1))')
+        corr_str = (f" (r={cov['base_rate_deficit_corr']:.2f})"
+                    if cov['base_rate_deficit_corr'] is not None else '')
+        ax.set_title(f'Coverage deficit vs rarity{corr_str}')
+        ax.grid(alpha=0.3)
+        for p in cov['per_position']:
+            if p['coverage_deficit'] is not None:
+                ax.annotate(labels[p['position']], (p['base_rate'], p['coverage_deficit']),
+                           fontsize=6, alpha=0.6)
+        fig.suptitle(f'PUMA Coverage Deficit — {fmt}\n'
+                     '(positive = carry-in=1 gets less training signal)',
+                     fontsize=11, y=1.05)
+        fig.tight_layout(); figs[f'coverage_deficit_{fmt}'] = fig
+
+    return figs
+
+
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Main
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -2855,11 +3466,21 @@ def run(tag=''):
             all_final[_fk('diffusion', fmt, mt, 'cascade')] = cascade
             print(f"    {cascade['summary']}")
 
+            # ── Extended carry analysis (corner cases, stratification) ──
+            run_carry_ext(m, tok, test_data, fmt, max_len, mt,
+                          all_dyn[kb], all_final, device=DEVICE)
+
+            # ── Coverage deficit analysis (carry rarity × accuracy) ──
+            run_coverage_analysis(m, tok, test_data, fmt, max_len, mt,
+                                  all_final, device=DEVICE)
+
             del m; torch.cuda.empty_cache() if torch.cuda.is_available() else None
 
     # ── Figures ──
     print(f"\n{'='*70}\n  Generating figures...\n{'='*70}")
     figs = make_figures(all_dyn, all_final)
+    for fmt in FORMATS:
+        figs.update(make_ext_figures(all_final, fmt))
 
     # ── Save ──
     sd = {'config': {
