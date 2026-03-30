@@ -87,7 +87,7 @@ def parse_args():
     p.add_argument('--tag', type=str, default='')
     p.add_argument('--seed', type=int, default=None)
     p.add_argument('--seeds', nargs='+', type=int, default=None)
-    args = p.parse_args()
+    args, _ = p.parse_known_args()
     g = globals()
     for a, gl in {'data_source': 'DATA_SOURCE', 'csv_path': 'CSV_PATH',
                    'n_easy': 'N_EASY', 'n_hard': 'N_HARD', 'hard_threshold': 'HARD_THRESHOLD',

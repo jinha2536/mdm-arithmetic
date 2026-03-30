@@ -146,7 +146,7 @@ def parse_args():
     p.add_argument('--seeds', nargs='+', type=int, default=None,
                    help='Multiple seeds for repeated runs (e.g. --seeds 42 43 44)')
 
-    args = p.parse_args()
+    args, _ = p.parse_known_args()  # parse_known_args ignores IPython/Colab kernel args
 
     # Update globals
     g = globals()
