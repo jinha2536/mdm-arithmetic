@@ -37,12 +37,13 @@ EXP_NAME = 'exp_sudoku_v2'
 ANS_LEN = 81
 
 # Data (easy-dominant by default)
-N_EASY = 45000          # rating = 0 (CP-solvable)
-N_HARD = 5000           # rating >= HARD_THRESHOLD
+N_EASY = 100000         # rating = 0 (CP-solvable)
+N_HARD = 50000          # rating >= HARD_THRESHOLD
 N_TEST_PER_TIER = 500
 HARD_THRESHOLD = 10     # tdoku backtracks
 DATA_SOURCE = 'hf'      # 'hf', 'csv', 'generate'
 CSV_PATH = ''
+TRAIN_CONDITION = 'mixed'  # 'mixed' (N_EASY+N_HARD), 'hard_only', 'easy_dominant'
 
 # Model (PUMA paper Sudoku config)
 N_LAYER = 8; N_HEAD = 8; N_EMBD = 256
@@ -56,7 +57,7 @@ EMA_DECAY = 0.9999
 EVAL_EVERY = 2000; LOG_EVERY = 500; GEN_EVAL_EVERY = 5000; GEN_EVAL_N = 100
 
 MASK_TYPES = ['random', 'puma']
-DECODE_POLICIES = ['confidence', 'n_cands', 'random']
+DECODE_POLICIES = ['confidence', 'adaptive_n_cands', 'random']
 PUMA_TAU = 0.9; PUMA_K = 8
 SEED = 42
 
@@ -84,10 +85,14 @@ def parse_args():
     p.add_argument('--decode', nargs='+', default=None)
     p.add_argument('--puma-k', type=int, default=None)
     p.add_argument('--puma-tau', type=float, default=None)
+    p.add_argument('--train-condition', default=None, choices=['mixed', 'hard_only', 'easy_dominant'])
     p.add_argument('--tag', type=str, default='')
     p.add_argument('--seed', type=int, default=None)
     p.add_argument('--seeds', nargs='+', type=int, default=None)
-    args, _ = p.parse_known_args()
+    try:
+        args, _ = p.parse_known_args()
+    except SystemExit:
+        args, _ = p.parse_known_args([])
     g = globals()
     for a, gl in {'data_source': 'DATA_SOURCE', 'csv_path': 'CSV_PATH',
                    'n_easy': 'N_EASY', 'n_hard': 'N_HARD', 'hard_threshold': 'HARD_THRESHOLD',
@@ -98,6 +103,7 @@ def parse_args():
         v = getattr(args, a); g[gl] = v if v is not None else g[gl]
     if args.masks: g['MASK_TYPES'] = args.masks
     if args.decode: g['DECODE_POLICIES'] = args.decode
+    if args.train_condition: g['TRAIN_CONDITION'] = args.train_condition
     return args
 
 
@@ -222,6 +228,19 @@ def compute_n_cands_after_cp(puzzle_flat):
     return {i: POPCOUNT[cands[i]] for i in range(81)
             if puzzle_flat[i] == 0 and POPCOUNT[cands[i]] > 1}
 
+
+def compute_live_candidates(grid_flat):
+    """Compute candidate count for each unfilled cell in a partially-solved grid.
+    Used by adaptive_n_cands decode: recomputes at every decode step.
+    Returns dict: cell_index → n_candidates (only for cells with value 0).
+    """
+    result = {}
+    for i in range(81):
+        if grid_flat[i] == 0:
+            used = {grid_flat[p] for p in PEERS_FLAT[i]} - {0}
+            result[i] = 9 - len(used)
+    return result
+
 DEPTH_CATS = ['given', 'depth_0', 'depth_1', 'depth_2', 'depth_3plus', 'depth_hard']
 DEPTH_CAT_TO_ID = {n: i for i, n in enumerate(DEPTH_CATS)}
 
@@ -309,10 +328,18 @@ def load_hf_data(n_easy, n_hard, n_test, hard_threshold, seed=42, cache_dir='.su
                  rows[i].get('source', ''))
                 for i in range(len(rows))]
 
-    # Train: easy-dominant mix
-    print("  Sampling train data...")
-    easy_train = _sample_by_rating(train_raw, 0, 0, n_easy, rng)
-    hard_train = _sample_by_rating(train_raw, hard_threshold, 999999, n_hard, rng)
+    # Train: condition-dependent mix
+    print(f"  Sampling train data (condition={TRAIN_CONDITION})...")
+    if TRAIN_CONDITION == 'hard_only':
+        hard_train = _sample_by_rating(train_raw, hard_threshold, 999999, n_easy + n_hard, rng)
+        easy_train = []
+    elif TRAIN_CONDITION == 'easy_dominant':
+        easy_train = _sample_by_rating(train_raw, 0, 0, n_easy, rng)
+        n_hard_reduced = max(n_hard // 10, 100)
+        hard_train = _sample_by_rating(train_raw, hard_threshold, 999999, n_hard_reduced, rng)
+    else:  # 'mixed' (default)
+        easy_train = _sample_by_rating(train_raw, 0, 0, n_easy, rng)
+        hard_train = _sample_by_rating(train_raw, hard_threshold, 999999, n_hard, rng)
     train_tuples = easy_train + hard_train
     rng.shuffle(train_tuples)
 
@@ -635,7 +662,8 @@ def train(mask_type, tokenizer, train_data, test_data_dict, max_len, device=None
             confs = F.softmax(lp, dim=-1).max(dim=-1).values
             confs[~is_m] = -float('inf')
             nm = is_m.sum(dim=1).float()
-            nr = (nm / max(PUMA_K, 1)).ceil().long().clamp(min=1)
+            K_rem = (PUMA_K - buf_stage).clamp(min=1).float()  # ← FIX: remaining stages
+            nr = (nm / K_rem).ceil().long().clamp(min=1)        # ← was: nm / PUMA_K (wrong)
             ranked = confs.argsort(dim=1, descending=True)
             rop = torch.zeros_like(ranked)
             rop.scatter_(1, ranked, _arange.expand(B_buf, -1))
@@ -742,14 +770,20 @@ def train(mask_type, tokenizer, train_data, test_data_dict, max_len, device=None
 def generate_blanks(model, tokenizer, test_data, decode_policy='confidence',
                     batch_size=32, device=None):
     """Decode blank cells with configurable policy.
-    Policies: 'confidence' (model max prob), 'n_cands' (fewest initial candidates first),
-              'n_cands_cp' (fewest CP candidates first), 'random'.
+    Policies:
+      'confidence':       model max prob (adaptive, standard MDM)
+      'adaptive_n_cands': fewest candidates in current grid state (adaptive, solver-like)
+      'n_cands':          fewest initial candidates (static)
+      'n_cands_cp':       fewest CP candidates (static)
+      'random':           random order (baseline)
     """
     if device is None: device = DEVICE
     mask_id = tokenizer.special_ids['mask']
     pad_id = tokenizer.special_ids['pad']
     model.eval()
     results = []
+    # Digit token IDs for grid reconstruction (tokenizer maps '0'->id, '1'->id, etc.)
+    digit_ids = {tokenizer.encode(str(d))[0]: d for d in range(10)}
 
     for st in range(0, len(test_data), batch_size):
         batch = test_data[st:st+batch_size]; B = len(batch)
@@ -777,7 +811,7 @@ def generate_blanks(model, tokenizer, test_data, decode_policy='confidence',
         n_blanks = blank_m.sum(dim=1)
         max_steps = n_blanks.max().item()
 
-        # Precompute static decode order for n_cands / n_cands_cp / random
+        # Precompute static decode order for static policies
         static_order = None
         if decode_policy in ('n_cands', 'n_cands_cp', 'random'):
             static_order = torch.full((B, ANS_LEN), 9999, dtype=torch.long, device=device)
@@ -808,8 +842,26 @@ def generate_blanks(model, tokenizer, test_data, decode_policy='confidence',
                 confs = probs.max(dim=-1).values
                 confs[~still_m] = -float('inf')
                 best_j = confs.argmax(dim=1)
+
+            elif decode_policy == 'adaptive_n_cands':
+                # Reconstruct current grid per sample, compute live candidates
+                priority = torch.full((B, ANS_LEN), 9999, dtype=torch.long, device=device)
+                for i in range(B):
+                    if not still_m[i].any(): continue
+                    # Extract current grid from token sequence
+                    grid = [0] * 81
+                    a_s = ans_starts[i].item()
+                    for j in range(81):
+                        tok_id = x[i, a_s + j].item()
+                        grid[j] = digit_ids.get(tok_id, 0)
+                    live = compute_live_candidates(grid)
+                    for j in range(81):
+                        if still_m[i, j].item() and j in live:
+                            priority[i, j] = live[j]
+                best_j = priority.argmin(dim=1)
+
             else:
-                # Use static order: pick the cell with lowest static_order that is still masked
+                # Static order policies
                 order = static_order.clone()
                 order[~still_m] = 9999
                 best_j = order.argmin(dim=1)
@@ -1199,7 +1251,7 @@ def run(tag=''):
     exp_name = f"{EXP_NAME}_{tag}" if tag else EXP_NAME
     print(f"\n{'='*70}")
     print(f"  {exp_name}")
-    print(f"  Model: {N_LAYER}L/{N_EMBD}D/{N_HEAD}H  Data: {N_EASY}easy+{N_HARD}hard")
+    print(f"  Model: {N_LAYER}L/{N_EMBD}D/{N_HEAD}H  Data: {N_EASY}easy+{N_HARD}hard ({TRAIN_CONDITION})")
     print(f"  Training: {MAX_ITERS} iters, batch={BATCH_SIZE}")
     print(f"  Masks: {MASK_TYPES}  Decode: {DECODE_POLICIES}")
     print(f"  PUMA: K={PUMA_K}, tau={PUMA_TAU}")
@@ -1306,7 +1358,7 @@ def run(tag=''):
     # ── Save ──
     sd = {'config': {k: globals()[k] for k in ['N_EASY', 'N_HARD', 'HARD_THRESHOLD',
            'N_LAYER', 'N_EMBD', 'N_HEAD', 'MAX_ITERS', 'BATCH_SIZE',
-           'MASK_TYPES', 'DECODE_POLICIES', 'PUMA_K', 'PUMA_TAU']}}
+           'MASK_TYPES', 'DECODE_POLICIES', 'PUMA_K', 'PUMA_TAU', 'TRAIN_CONDITION']}}
     for k, v in all_results.items(): sd[f'result_{k}'] = v
     for k, v in all_dyn.items():
         sd[f'dyn_{k}'] = {'checkpoints': v['checkpoints'], 'train_loss': v['train_loss']}

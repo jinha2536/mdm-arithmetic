@@ -42,6 +42,7 @@ N_LAYER = 2; N_HEAD = 2; N_EMBD = 128; DROPOUT = 0.2; POS_ENC = 'absolute'
 LR = 1e-3; MIN_LR = 1e-4; WARMUP_EPOCHS = 10; GRAD_CLIP = 1.0
 PUMA_TAU = 0.9; PUMA_K_START = 3; PUMA_K_END = ANS_LEN
 SEED = 42; RUN_AR = False
+DATA_MODE = 'natural'  # 'balanced' or 'natural'
 
 
 def parse_args():
@@ -58,6 +59,7 @@ def parse_args():
     p.add_argument('--formats', nargs='+'); p.add_argument('--masks', nargs='+')
     p.add_argument('--decode', nargs='+'); p.add_argument('--no-ar', action='store_true')
     p.add_argument('--ar', action='store_true')
+    p.add_argument('--data-mode', choices=['balanced', 'natural'])
     p.add_argument('--tag', type=str, default=''); p.add_argument('--seed', type=int)
     p.add_argument('--seeds', nargs='+', type=int)
     # Colab/IPython safe parsing
@@ -82,6 +84,7 @@ def parse_args():
     if args.decode: g['DECODE_POLICIES'] = args.decode
     if args.no_ar: g['RUN_AR'] = False
     if args.ar: g['RUN_AR'] = True
+    if args.data_mode: g['DATA_MODE'] = args.data_mode
     return args
 
 
@@ -222,8 +225,19 @@ def gen_data(n, fmt, seed):
     rng.shuffle(out)
     return [FMT_FN[fmt](a, b) for a, b in out[:n]]
 
+def gen_data_natural(n, fmt, seed):
+    """Natural distribution training data — NO carry balancing.
+    At ND=32, MSB carry-in base rate drops to ~3-5%, creating the
+    rare-event gradient needed for coverage deficit analysis.
+    """
+    rng = random.Random(seed)
+    lo, hi = 10**(ND-1), 10**ND - 1
+    return [FMT_FN[fmt](rng.randint(lo, hi), rng.randint(lo, hi)) for _ in range(n)]
+
 def gen_test_data(n, fmt, seed):
-    """Full ND-digit test data, carry-balanced."""
+    """Full ND-digit test data. Uses DATA_MODE for consistency with training."""
+    if DATA_MODE == 'natural':
+        return gen_data_natural(n, fmt, seed)
     rng = random.Random(seed); lo, hi = 10**(ND-1), 10**ND-1
     pool = defaultdict(list); seen = set()
     for _ in range(max(n*200, 100000)):
@@ -879,7 +893,7 @@ def _fk(obj, fmt, mt='', dp=''):
 def run(tag=''):
     exp_name = f"{EXP_NAME}_{tag}" if tag else EXP_NAME
     print(f"\n{'='*70}\n  {exp_name}")
-    print(f"  ND={ND} Model={N_LAYER}L/{N_EMBD}D/{N_HEAD}H")
+    print(f"  ND={ND} Model={N_LAYER}L/{N_EMBD}D/{N_HEAD}H data={DATA_MODE}")
     print(f"  N_TRAIN={N_TRAIN} N_TEST={N_TEST} epochs={MAX_EPOCHS}")
     print(f"  masks={MASK_TYPES} decode={DECODE_POLICIES}")
     print(f"{'='*70}")
@@ -890,9 +904,22 @@ def run(tag=''):
     all_dyn, all_final = {}, {}
 
     for fmt in FORMATS:
-        train_data = gen_data(N_TRAIN, fmt, seed=SEED)
+        if DATA_MODE == 'natural':
+            train_data = gen_data_natural(N_TRAIN, fmt, seed=SEED)
+        else:
+            train_data = gen_data(N_TRAIN, fmt, seed=SEED)
         test_data = gen_test_data(N_TEST, fmt, seed=9000)
-        print(f"\n  [{fmt}] train={len(train_data)} test={len(test_data)}")
+        # Show carry-in base rate distribution
+        ci_counts = [0] * ANS_LEN; ci_totals = [0] * ANS_LEN
+        for s in test_data:
+            a, b = _parse_operands(s); ci = _carry_at_answer_pos(a, b, fmt)
+            for j in range(ANS_LEN):
+                ci_totals[j] += 1
+                if ci[j]: ci_counts[j] += 1
+        labs = _pos_labels(fmt)
+        br_str = ' '.join(f"{labs[j]}={ci_counts[j]/max(ci_totals[j],1):.2f}" for j in range(ANS_LEN))
+        print(f"\n  [{fmt}] train={len(train_data)} test={len(test_data)} mode={DATA_MODE}")
+        print(f"    carry-in base rates: {br_str}")
 
         if RUN_AR:
             key = _fk('ar', fmt); print(f"\n▶ {key}")
@@ -966,7 +993,7 @@ def run(tag=''):
 
     # Save
     sd = {'config': {k: globals()[k] for k in ['ND','ANS_LEN','N_TRAIN','N_TEST','MAX_EPOCHS',
-           'BATCH_SIZE','N_LAYER','N_HEAD','N_EMBD','MASK_TYPES','DECODE_POLICIES']}}
+           'BATCH_SIZE','N_LAYER','N_HEAD','N_EMBD','MASK_TYPES','DECODE_POLICIES','DATA_MODE']}}
     for k, v in all_dyn.items():
         sd[f'dyn_{k}'] = {'checkpoints': v['checkpoints'], 'train_loss': v['train_loss'],
                           'gen_checkpoints': v.get('gen_checkpoints', [])}
