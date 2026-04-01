@@ -281,6 +281,20 @@ def gen_corner_case_test(n, fmt, seed, category='msb_chain'):
     if len(results) < n: print(f"    WARNING: corner/{category}: {len(results)}/{n}")
     return results[:n]
 
+def gen_min_chain_test(n, fmt, seed, min_chain):
+    """Generate samples where max propagate chain length >= min_chain.
+    For chain length sweep: tests PUMA's generalization boundary.
+    """
+    rng = random.Random(seed); lo, hi = 10**(ND-1), 10**ND-1; results = []
+    for _ in range(n * 500):
+        a, b = rng.randint(lo, hi), rng.randint(lo, hi)
+        if _chain_stats(a, b)['max_chain_len'] >= min_chain:
+            results.append(FMT_FN[fmt](a, b))
+        if len(results) >= n: break
+    if len(results) < n:
+        print(f"    WARNING: chain>={min_chain}: {len(results)}/{n}")
+    return results[:n]
+
 def gen_counterfactual_pairs(n, seed):
     rng = random.Random(seed); lo, hi = 10**(ND-1), 10**ND-1; results = []
     for _ in range(n * 500):
@@ -880,6 +894,34 @@ def make_figures(all_dyn, all_final, fmt):
         fig.suptitle(f'PUMA Coverage Deficit — {fmt}', y=1.02); fig.tight_layout()
         figs[f'coverage_{fmt}'] = fig
 
+    # Fig 6: Chain length sweep (generalization boundary)
+    sweep_cls = sorted(set(int(k.split('_')[-2]) for k in all_final
+                           if 'chain_sweep' in k and k.endswith('confidence')))
+    if sweep_cls:
+        fig, ax = plt.subplots(figsize=(10, 6))
+        for mt, col, mk in [('puma', '#8e44ad', 's'), ('random', '#3498db', 'o')]:
+            cls, accs = [], []
+            for cl in sweep_cls:
+                r = all_final.get(_fk('diffusion', mt, f'chain_sweep_{cl}_confidence'))
+                if r:
+                    cls.append(cl); accs.append(r['accuracy'])
+            if cls:
+                ax.plot(cls, accs, f'-{mk}', color=col, label=mt, ms=8, lw=2, alpha=0.8)
+        # Add full_propagate as rightmost point
+        for mt, col, mk in [('puma', '#8e44ad', 's'), ('random', '#3498db', 'o')]:
+            fp = all_final.get(_fk('diffusion', mt, f'corner_full_propagate_confidence'))
+            if fp:
+                ax.plot(ANS_LEN, fp['accuracy'], mk, color=col, ms=12, alpha=0.8,
+                        markeredgecolor='black', markeredgewidth=1.5)
+                ax.annotate(f"full_prop\n{fp['accuracy']:.3f}",
+                           (ANS_LEN, fp['accuracy']), fontsize=7,
+                           textcoords='offset points', xytext=(10, 5))
+        ax.set_xlabel('Min chain length'); ax.set_ylabel('Accuracy')
+        ax.set_title(f'Chain Length Sweep — Generalization Boundary')
+        ax.legend(fontsize=10); ax.grid(alpha=0.3)
+        ax.set_ylim(-0.05, 1.05)
+        fig.tight_layout(); figs[f'chain_sweep_{fmt}'] = fig
+
     return figs
 
 
@@ -960,6 +1002,23 @@ def run(tag=''):
                     all_final[_fk('diffusion', fmt, mt, f'corner_{cat}_{dp}')] = {'accuracy': acc, 'n': len(cc)}
                     print(f"    corner/{cat} {dp}: {acc:.4f} (n={len(cc)})")
 
+            # ── Chain length sweep (PUMA generalization boundary) ──
+            print(f"  Chain length sweep...")
+            sweep_lengths = [2, 3, 4, 6, 8, 12]
+            if ND >= 24: sweep_lengths += [16, 20]
+            if ND >= 32: sweep_lengths += [24, 28]
+            sweep_lengths = [cl for cl in sweep_lengths if cl <= ND]
+            sweep_n = min(500, N_TEST)
+            for min_cl in sweep_lengths:
+                cc = gen_min_chain_test(sweep_n, fmt, seed=6500+min_cl, min_chain=min_cl)
+                if not cc: continue
+                for dp in DECODE_POLICIES:
+                    ps = gen_eval_with_stats(m, tok, cc, fmt, max_len, decode_policy=dp, device=DEVICE)
+                    acc = sum(r['correct'] for r in ps) / len(ps)
+                    key = _fk('diffusion', fmt, mt, f'chain_sweep_{min_cl}_{dp}')
+                    all_final[key] = {'accuracy': acc, 'n': len(cc), 'min_chain': min_cl}
+                    print(f"    chain>={min_cl:2d} {dp}: {acc:.4f} (n={len(cc)})")
+
             # Counterfactual
             cf = gen_counterfactual_pairs(200, seed=SEED+42)
             cfr = eval_counterfactual(m, tok, cf, fmt, max_len, device=DEVICE)
@@ -1004,12 +1063,27 @@ def run(tag=''):
     print(f"\n{'='*70}\n  SUMMARY\n{'='*70}")
     for fmt in FORMATS:
         print(f"\n  ── {fmt} ──")
-        for mt in MASK_TYPES:
-            for dp in DECODE_POLICIES:
-                for tt in ['standard', 'heavy', 'corner_msb_chain', 'corner_full_propagate']:
-                    key = _fk('diffusion', fmt, mt, f'{tt}_{dp}')
-                    r = all_final.get(key)
-                    if r: print(f"    {mt:>8s} {dp:>10s} {tt:>25s}: {r['accuracy']:.4f}")
+        print(f"  {'Test':<35s}", end='')
+        for mt in MASK_TYPES: print(f" {mt:>10s}", end='')
+        print()
+        for dp in DECODE_POLICIES:
+            for tt in ['standard', 'heavy', 'corner_msb_chain', 'corner_full_propagate']:
+                key_parts = [_fk('diffusion', fmt, mt, f'{tt}_{dp}') for mt in MASK_TYPES]
+                accs = [all_final.get(k, {}).get('accuracy') for k in key_parts]
+                if any(a is not None for a in accs):
+                    print(f"  {tt+'_'+dp:<35s}", end='')
+                    for a in accs: print(f" {a:>10.4f}" if a is not None else f" {'N/A':>10s}", end='')
+                    print()
+            # Chain sweep
+            for min_cl in [2, 3, 4, 6, 8, 12, 16, 20, 24, 28]:
+                key_parts = [_fk('diffusion', fmt, mt, f'chain_sweep_{min_cl}_{dp}') for mt in MASK_TYPES]
+                accs = [all_final.get(k, {}).get('accuracy') for k in key_parts]
+                if any(a is not None for a in accs):
+                    print(f"  {'chain>='+str(min_cl)+'_'+dp:<35s}", end='')
+                    for a in accs: print(f" {a:>10.4f}" if a is not None else f" {'N/A':>10s}", end='')
+                    d = (accs[0] or 0) - (accs[1] or 0) if len(accs) >= 2 and all(a is not None for a in accs) else None
+                    if d is not None: print(f"  Δ={d:+.4f}", end='')
+                    print()
     return all_dyn, all_final
 
 

@@ -1011,7 +1011,15 @@ def analyse_rating_correlation(data):
 
 @torch.no_grad()
 def probe_selective_masking(model, tokenizer, test_data, max_len, device=None):
-    """Compare accuracy with different masking: all_blank vs hard_only vs easy_only."""
+    """Compare accuracy with different masking conditions.
+
+    Conditions:
+      all_blank:        all blank cells masked (standard)
+      hard_only:        only depth_hard cells masked, easy cells get ground truth
+      easy_only:        only depth_0 cells masked
+      hard_no_stepping: depth_hard cells masked, easy cells ALSO masked
+                        (removes PUMA's stepping-stone advantage)
+    """
     if device is None: device = DEVICE
     model.eval()
     mask_id = tokenizer.special_ids['mask']
@@ -1025,6 +1033,7 @@ def probe_selective_masking(model, tokenizer, test_data, max_len, device=None):
         'all_blank': lambda m: not m['is_given'],
         'hard_only': lambda m: m['prop_depth'] == -1,
         'easy_only': lambda m: m['prop_depth'] == 0 and not m['is_given'],
+        'hard_no_stepping': lambda m: not m['is_given'],  # mask ALL blanks, but only MEASURE hard
     }
     results = {}
     for cn, fn in conditions.items():
@@ -1046,9 +1055,34 @@ def probe_selective_masking(model, tokenizer, test_data, max_len, device=None):
             corrects = (preds == tgt)
             for b in range(B):
                 for j in range(ANS_LEN):
-                    if mc[b, j]:
+                    if cn == 'hard_no_stepping':
+                        # Mask everything, but only record accuracy for depth_hard cells
+                        if mc[b, j] and metas[st+b][j]['prop_depth'] == -1:
+                            cat_correct['depth_hard'].append(corrects[b,j].item())
+                    elif mc[b, j]:
                         cat_correct[_depth_to_cat(metas[st+b][j])].append(corrects[b,j].item())
         results[cn] = {c: sum(v)/len(v) for c, v in cat_correct.items() if v}
+    return results
+
+
+def filter_by_hard_frac(test_data, min_hard_frac):
+    """Filter puzzles by fraction of blank cells that are depth_hard.
+    Sudoku analog of addition's chain length sweep.
+    min_hard_frac=0.5 → some easy stepping stones
+    min_hard_frac=0.9 → almost no stepping stones
+    min_hard_frac=1.0 → "Sudoku full propagate" (all blanks are depth_hard)
+    """
+    results = []
+    for d in test_data:
+        meta = d['meta']
+        blanks = [j for j in range(81) if not meta[j]['is_given']]
+        if not blanks: continue
+        n_hard = sum(1 for j in blanks if meta[j]['prop_depth'] == -1)
+        frac = n_hard / len(blanks)
+        if frac >= min_hard_frac:
+            d_copy = dict(d)
+            d_copy['hard_frac'] = frac
+            results.append(d_copy)
     return results
 
 
@@ -1240,6 +1274,28 @@ def make_figures(all_results, all_dyn, corr_data):
         fig.suptitle('Selective Masking Probe (Parallel vs Sequential Reasoning)', fontsize=12, y=1.02)
         fig.tight_layout(); figs['selective'] = fig
 
+    # ── Fig 8: Hard fraction sweep (generalization boundary) ──
+    hard_fracs = [0.3, 0.5, 0.7, 0.8, 0.9, 0.95, 1.0]
+    sweep_data = {}
+    for mt in MASK_TYPES:
+        xs, ys = [], []
+        for hf in hard_fracs:
+            r = all_results.get(f'{mt}_hardfrac_{hf:.2f}_confidence', {})
+            if r and 'blank_cell_acc' in r:
+                xs.append(hf); ys.append(r['blank_cell_acc'])
+        if xs: sweep_data[mt] = (xs, ys)
+    if sweep_data:
+        fig, ax = plt.subplots(figsize=(10, 6))
+        for mt, (xs, ys) in sweep_data.items():
+            col = '#8e44ad' if mt == 'puma' else '#3498db'
+            mk = 's' if mt == 'puma' else 'o'
+            ax.plot(xs, ys, f'-{mk}', color=col, label=mt, ms=8, lw=2, alpha=0.8)
+        ax.set_xlabel('Min hard fraction (depth_hard / n_blanks)')
+        ax.set_ylabel('Blank Cell Accuracy')
+        ax.set_title('Hard Fraction Sweep — PUMA Generalization Boundary')
+        ax.legend(fontsize=10); ax.grid(alpha=0.3); ax.set_ylim(0, 1.05)
+        fig.tight_layout(); figs['hard_frac_sweep'] = fig
+
     return figs
 
 
@@ -1320,6 +1376,23 @@ def run(tag=''):
             parts = [f"{c}={v:.3f}" for c, v in accs.items()]
             print(f"    {cn}: {' '.join(parts)}")
 
+        # ── Hard fraction sweep (PUMA generalization boundary) ──
+        print(f"  Hard fraction sweep...")
+        hard_fracs = [0.3, 0.5, 0.7, 0.8, 0.9, 0.95, 1.0]
+        for hf in hard_fracs:
+            subset = filter_by_hard_frac(all_test, hf)
+            if len(subset) < 10:
+                print(f"    hard_frac>={hf:.0%}: {len(subset)} puzzles (skipped)")
+                continue
+            subset_eval = subset[:min(200, len(subset))]
+            for dp in ['confidence']:
+                r = evaluate(model, tok, subset_eval, decode_policy=dp, batch_size=16, device=DEVICE)
+                key = f'{mt}_hardfrac_{hf:.2f}_{dp}'
+                all_results[key] = r
+                print(f"    hard_frac>={hf:.0%} {dp}: "
+                      f"cell={r['blank_cell_acc']:.4f} exact={r['accuracy']:.4f} "
+                      f"(n={len(subset_eval)}, available={len(subset)})")
+
         # ── PUMA coverage (puma model only) ──
         if mt == 'puma':
             print(f"  PUMA coverage simulation...")
@@ -1336,7 +1409,7 @@ def run(tag=''):
     figs = make_figures(all_results, all_dyn, corr)
 
     # ── Summary table ──
-    print(f"\n{'='*70}\n  SUMMARY\n{'='*70}")
+    print(f"\n{'='*70}\n  SUMMARY — Rating-Stratified Accuracy (exact match)\n{'='*70}")
     header = f"  {'Condition':<25}"
     for tn in RATING_TIERS:
         has = any(tn in all_results.get(f'{mt}_{dp}', {}).get('rating_accuracy', {})
@@ -1354,6 +1427,47 @@ def run(tag=''):
                 ra = r.get('rating_accuracy', {}).get(tn)
                 if ra: row += f" {ra['exact']:>10.4f}"
             print(row)
+
+    # ── Hard fraction sweep (generalization boundary) ──
+    hard_fracs = [0.3, 0.5, 0.7, 0.8, 0.9, 0.95, 1.0]
+    has_sweep = any(f'{mt}_hardfrac_{hf:.2f}_confidence' in all_results
+                    for mt in MASK_TYPES for hf in hard_fracs)
+    if has_sweep:
+        print(f"\n{'='*70}\n  Hard Fraction Sweep (cell acc, confidence decode)\n{'='*70}")
+        print(f"  {'hard_frac':<12}", end='')
+        for mt in MASK_TYPES: print(f" {mt:>10s}", end='')
+        print(f" {'Δ(P-R)':>10s}")
+        print(f"  {'─'*45}")
+        for hf in hard_fracs:
+            accs = []
+            for mt in MASK_TYPES:
+                r = all_results.get(f'{mt}_hardfrac_{hf:.2f}_confidence', {})
+                accs.append(r.get('blank_cell_acc'))
+            if any(a is not None for a in accs):
+                print(f"  {'>=' + str(int(hf*100)) + '%':<12}", end='')
+                for a in accs: print(f" {a:>10.4f}" if a is not None else f" {'N/A':>10s}", end='')
+                if len(accs) >= 2 and all(a is not None for a in accs[:2]):
+                    d = accs[0] - accs[1] if MASK_TYPES[0] == 'puma' else accs[1] - accs[0]
+                    print(f" {d:>+10.4f}", end='')
+                print()
+
+    # ── Selective masking comparison ──
+    has_sel = any(f'{mt}_selective' in all_results for mt in MASK_TYPES)
+    if has_sel:
+        print(f"\n{'='*70}\n  Selective Masking — depth_hard accuracy\n{'='*70}")
+        for cn in ['all_blank', 'hard_only', 'hard_no_stepping']:
+            accs = []
+            for mt in MASK_TYPES:
+                sel = all_results.get(f'{mt}_selective', {}).get(cn, {})
+                accs.append(sel.get('depth_hard'))
+            if any(a is not None for a in accs):
+                print(f"  {cn:<25s}", end='')
+                for mt, a in zip(MASK_TYPES, accs):
+                    print(f" {mt}={a:.3f}" if a is not None else f" {mt}=N/A", end='')
+                if len(accs) >= 2 and all(a is not None for a in accs[:2]):
+                    d = accs[0] - accs[1] if MASK_TYPES[0] == 'puma' else accs[1] - accs[0]
+                    print(f"  Δ(P-R)={d:+.3f}", end='')
+                print()
 
     # ── Save ──
     sd = {'config': {k: globals()[k] for k in ['N_EASY', 'N_HARD', 'HARD_THRESHOLD',
