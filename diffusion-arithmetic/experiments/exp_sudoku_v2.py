@@ -57,7 +57,7 @@ EMA_DECAY = 0.9999
 EVAL_EVERY = 2000; LOG_EVERY = 500; GEN_EVAL_EVERY = 5000; GEN_EVAL_N = 100
 
 MASK_TYPES = ['random', 'puma']
-DECODE_POLICIES = ['confidence', 'adaptive_n_cands', 'random']
+DECODE_POLICIES = ['confidence', 'oracle_depth', 'random']
 PUMA_TAU = 0.9; PUMA_K = 8
 SEED = 42
 
@@ -772,7 +772,9 @@ def generate_blanks(model, tokenizer, test_data, decode_policy='confidence',
     """Decode blank cells with configurable policy.
     Policies:
       'confidence':       model max prob (adaptive, standard MDM)
-      'adaptive_n_cands': fewest candidates in current grid state (adaptive, solver-like)
+      'oracle_depth':     prop_depth ascending, depth_hard last by n_cands_cp
+                          (static oracle — Sudoku analog of addition's LSB)
+      'adaptive_n_cands': fewest candidates in current grid state (adaptive)
       'n_cands':          fewest initial candidates (static)
       'n_cands_cp':       fewest CP candidates (static)
       'random':           random order (baseline)
@@ -782,7 +784,6 @@ def generate_blanks(model, tokenizer, test_data, decode_policy='confidence',
     pad_id = tokenizer.special_ids['pad']
     model.eval()
     results = []
-    # Digit token IDs for grid reconstruction (tokenizer maps '0'->id, '1'->id, etc.)
     digit_ids = {tokenizer.encode(str(d))[0]: d for d in range(10)}
 
     for st in range(0, len(test_data), batch_size):
@@ -813,13 +814,22 @@ def generate_blanks(model, tokenizer, test_data, decode_policy='confidence',
 
         # Precompute static decode order for static policies
         static_order = None
-        if decode_policy in ('n_cands', 'n_cands_cp', 'random'):
+        if decode_policy in ('oracle_depth', 'n_cands', 'n_cands_cp', 'random'):
             static_order = torch.full((B, ANS_LEN), 9999, dtype=torch.long, device=device)
             for i in range(B):
                 meta = batch[i]['meta']
                 blank_js = [j for j in range(ANS_LEN) if not meta[j]['is_given']]
                 if decode_policy == 'random':
                     random.shuffle(blank_js)
+                    for rank, j in enumerate(blank_js): static_order[i, j] = rank
+                elif decode_policy == 'oracle_depth':
+                    # Sort by prop_depth ascending; depth_hard (-1) → last, sorted by n_cands_cp
+                    def _depth_key(j):
+                        d = meta[j]['prop_depth']
+                        nc = meta[j].get('n_cands_after_cp', 9) or 9
+                        if d == -1: return (1000, nc)  # depth_hard last, then by n_cands
+                        return (d, nc)
+                    blank_js.sort(key=_depth_key)
                     for rank, j in enumerate(blank_js): static_order[i, j] = rank
                 elif decode_policy == 'n_cands':
                     blank_js.sort(key=lambda j: meta[j]['n_candidates'])
@@ -1278,22 +1288,26 @@ def make_figures(all_results, all_dyn, corr_data):
     hard_fracs = [0.3, 0.5, 0.7, 0.8, 0.9, 0.95, 1.0]
     sweep_data = {}
     for mt in MASK_TYPES:
-        xs, ys = [], []
-        for hf in hard_fracs:
-            r = all_results.get(f'{mt}_hardfrac_{hf:.2f}_confidence', {})
-            if r and 'blank_cell_acc' in r:
-                xs.append(hf); ys.append(r['blank_cell_acc'])
-        if xs: sweep_data[mt] = (xs, ys)
+        for dp in ['confidence', 'oracle_depth']:
+            xs, ys = [], []
+            for hf in hard_fracs:
+                r = all_results.get(f'{mt}_hardfrac_{hf:.2f}_{dp}', {})
+                if r and 'blank_cell_acc' in r:
+                    xs.append(hf); ys.append(r['blank_cell_acc'])
+            if xs: sweep_data[f'{mt}_{dp}'] = (xs, ys)
     if sweep_data:
         fig, ax = plt.subplots(figsize=(10, 6))
-        for mt, (xs, ys) in sweep_data.items():
-            col = '#8e44ad' if mt == 'puma' else '#3498db'
-            mk = 's' if mt == 'puma' else 'o'
-            ax.plot(xs, ys, f'-{mk}', color=col, label=mt, ms=8, lw=2, alpha=0.8)
+        styles = {'puma_confidence': ('#8e44ad', 's', '-'),
+                  'puma_oracle_depth': ('#8e44ad', 's', '--'),
+                  'random_confidence': ('#3498db', 'o', '-'),
+                  'random_oracle_depth': ('#3498db', 'o', '--')}
+        for key, (xs, ys) in sweep_data.items():
+            col, mk, ls = styles.get(key, ('#333', 'x', '-'))
+            ax.plot(xs, ys, f'{ls}', color=col, marker=mk, label=key, ms=8, lw=2, alpha=0.8)
         ax.set_xlabel('Min hard fraction (depth_hard / n_blanks)')
         ax.set_ylabel('Blank Cell Accuracy')
         ax.set_title('Hard Fraction Sweep — PUMA Generalization Boundary')
-        ax.legend(fontsize=10); ax.grid(alpha=0.3); ax.set_ylim(0, 1.05)
+        ax.legend(fontsize=8); ax.grid(alpha=0.3); ax.set_ylim(0, 1.05)
         fig.tight_layout(); figs['hard_frac_sweep'] = fig
 
     return figs
@@ -1385,7 +1399,7 @@ def run(tag=''):
                 print(f"    hard_frac>={hf:.0%}: {len(subset)} puzzles (skipped)")
                 continue
             subset_eval = subset[:min(200, len(subset))]
-            for dp in ['confidence']:
+            for dp in ['confidence', 'oracle_depth']:
                 r = evaluate(model, tok, subset_eval, decode_policy=dp, batch_size=16, device=DEVICE)
                 key = f'{mt}_hardfrac_{hf:.2f}_{dp}'
                 all_results[key] = r
@@ -1433,23 +1447,25 @@ def run(tag=''):
     has_sweep = any(f'{mt}_hardfrac_{hf:.2f}_confidence' in all_results
                     for mt in MASK_TYPES for hf in hard_fracs)
     if has_sweep:
-        print(f"\n{'='*70}\n  Hard Fraction Sweep (cell acc, confidence decode)\n{'='*70}")
-        print(f"  {'hard_frac':<12}", end='')
-        for mt in MASK_TYPES: print(f" {mt:>10s}", end='')
-        print(f" {'Δ(P-R)':>10s}")
-        print(f"  {'─'*45}")
-        for hf in hard_fracs:
-            accs = []
-            for mt in MASK_TYPES:
-                r = all_results.get(f'{mt}_hardfrac_{hf:.2f}_confidence', {})
-                accs.append(r.get('blank_cell_acc'))
-            if any(a is not None for a in accs):
-                print(f"  {'>=' + str(int(hf*100)) + '%':<12}", end='')
-                for a in accs: print(f" {a:>10.4f}" if a is not None else f" {'N/A':>10s}", end='')
-                if len(accs) >= 2 and all(a is not None for a in accs[:2]):
-                    d = accs[0] - accs[1] if MASK_TYPES[0] == 'puma' else accs[1] - accs[0]
-                    print(f" {d:>+10.4f}", end='')
-                print()
+        print(f"\n{'='*70}\n  Hard Fraction Sweep (cell acc)\n{'='*70}")
+        for dp in ['confidence', 'oracle_depth']:
+            print(f"\n  decode={dp}:")
+            print(f"  {'hard_frac':<12}", end='')
+            for mt in MASK_TYPES: print(f" {mt:>10s}", end='')
+            print(f" {'Δ(P-R)':>10s}")
+            print(f"  {'─'*45}")
+            for hf in hard_fracs:
+                accs = []
+                for mt in MASK_TYPES:
+                    r = all_results.get(f'{mt}_hardfrac_{hf:.2f}_{dp}', {})
+                    accs.append(r.get('blank_cell_acc'))
+                if any(a is not None for a in accs):
+                    print(f"  {'>=' + str(int(hf*100)) + '%':<12}", end='')
+                    for a in accs: print(f" {a:>10.4f}" if a is not None else f" {'N/A':>10s}", end='')
+                    if len(accs) >= 2 and all(a is not None for a in accs[:2]):
+                        d = accs[0] - accs[1] if MASK_TYPES[0] == 'puma' else accs[1] - accs[0]
+                        print(f" {d:>+10.4f}", end='')
+                    print()
 
     # ── Selective masking comparison ──
     has_sel = any(f'{mt}_selective' in all_results for mt in MASK_TYPES)
