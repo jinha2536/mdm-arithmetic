@@ -446,8 +446,16 @@ def gen_fallback_data(n, seed=42, min_bl=45, max_bl=58):
     return results[:n]
 
 
+def _make_train_entry(puzzle_str, sol_str, rating, source=''):
+    """Lightweight train entry — NO metadata computation."""
+    pf = [int(c) if c.isdigit() else 0 for c in puzzle_str]
+    pstr = ''.join(str(v) for v in pf)
+    return {'string': f"{pstr}={sol_str}", 'rating': rating,
+            'n_blanks': sum(1 for v in pf if v == 0)}
+
+
 def prepare_datasets(source=None, seed=42):
-    """Load data and compute per-puzzle metadata in parallel."""
+    """Load data. Train = lightweight (no meta), Test = full metadata."""
     source = source or DATA_SOURCE
     if source == 'hf':
         train_tuples, test_tiers = load_hf_data(TRAIN_DIST, N_TEST_PER_TIER, seed)
@@ -460,28 +468,32 @@ def prepare_datasets(source=None, seed=42):
         test_raw = gen_fallback_data(N_TEST_PER_TIER * 2, seed + 5000)
         test_tiers = {'all': test_raw}
 
-    # Compute metadata in parallel
-    print("  Computing puzzle metadata...")
+    # Train data: lightweight (just string + rating, NO metadata)
+    print(f"  Preparing {len(train_tuples)} train entries (lightweight)...")
+    t0 = time.time()
+    train_data = [_make_train_entry(*t[:3], t[3] if len(t) > 3 else '')
+                  for t in train_tuples]
+    print(f"  Train prepared in {time.time()-t0:.1f}s")
+
+    # Test data: full metadata (only ~2K puzzles, fast)
+    test_tuples = [t for ts in test_tiers.values() for t in ts]
+    print(f"  Computing metadata for {len(test_tuples)} test puzzles...")
     t0 = time.time()
     workers = min(os.cpu_count() or 1, 16)
-    all_tuples = train_tuples + [t for ts in test_tiers.values() for t in ts]
-
     with ProcessPoolExecutor(max_workers=workers) as pool:
-        all_data = list(pool.map(_compute_meta_worker, all_tuples,
-                                  chunksize=max(1, len(all_tuples) // (workers*4))))
-
-    n_train = len(train_tuples)
-    train_data = all_data[:n_train]
-    idx = n_train
-    test_data = {}
+        test_entries = list(pool.map(_compute_meta_worker, test_tuples,
+                                     chunksize=max(1, len(test_tuples) // (workers*4))))
+    test_data = {}; idx = 0
     for tn, ts in test_tiers.items():
-        test_data[tn] = all_data[idx:idx+len(ts)]
-        idx += len(ts)
-
-    print(f"  Metadata computed in {time.time()-t0:.1f}s")
+        test_data[tn] = test_entries[idx:idx+len(ts)]; idx += len(ts)
+    print(f"  Test metadata computed in {time.time()-t0:.1f}s")
 
     # Diagnostics
-    for name, data in [('train', train_data)] + list(test_data.items()):
+    train_ratings = [d.get('rating', 0) for d in train_data]
+    print(f"  [train] n={len(train_data)} rating: "
+          f"min={min(train_ratings)} med={sorted(train_ratings)[len(train_ratings)//2]} "
+          f"max={max(train_ratings)}")
+    for name, data in test_data.items():
         if not data: continue
         ratings = [d.get('rating', 0) for d in data]
         depth_dist = defaultdict(int)
@@ -595,12 +607,10 @@ def train(mask_type, tokenizer, train_data, test_data_dict, max_len, device=None
     mask_id = tokenizer.special_ids['mask']
     pad_id = tokenizer.special_ids['pad']
 
-    # Blank masks [N, ANS_LEN]
-    blank_masks = torch.zeros(N, ANS_LEN, dtype=torch.bool, device=device)
-    for si, d in enumerate(train_data):
-        ps = d['string'].split('=')[0]
-        for j in range(ANS_LEN):
-            if ps[j] == '0': blank_masks[si, j] = True
+    # Blank masks [N, ANS_LEN] — vectorized
+    # Format: "puzzle=solution", puzzle is first 81 tokens, '0' marks blanks
+    zero_id = tokenizer.encode('0')[0]
+    blank_masks = (train_ids[:, :ANS_LEN] == zero_id)  # [N, 81]
 
     _arange = torch.arange(ANS_LEN, device=device)
     model = Transformer(vocab_size=len(tokenizer), block_size=max_len+8,
@@ -1096,6 +1106,122 @@ def filter_by_hard_frac(test_data, min_hard_frac):
 
 
 @torch.no_grad()
+def analyse_decode_strategy(model, tokenizer, test_data, max_len,
+                            n_samples=200, device=None):
+    """Uncover the model's solving strategy by correlating confidence decode rank
+    with multiple cell features.
+
+    Features per blank cell:
+      prop_depth:       CP propagation depth (-1→99 for depth_hard)
+      n_candidates:     initial candidate count
+      n_cands_cp:       candidate count after CP
+      n_given_peers:    how many of 20 peers are given (constraint density)
+      box_occupancy:    given cells in same box
+      row_occupancy:    given cells in same row
+      col_occupancy:    given cells in same column
+      min_unit_vacancy: min(empty in row, col, box) — closest to unit completion
+
+    If |ρ(n_given_peers, rank)| > |ρ(prop_depth, rank)| → model uses global constraint
+    density rather than sequential propagation. (Sudoku carry-lookahead analog.)
+    """
+    if device is None: device = DEVICE
+    model.eval()
+    mask_id = tokenizer.special_ids['mask']
+    samples = test_data[:n_samples]
+
+    all_ranks = []
+    all_feats = defaultdict(list)
+
+    for si, d in enumerate(samples):
+        s = d['string']; meta = d['meta']
+        puzzle_str = s.split('=')[0]
+        puzzle_flat = [int(c) if c.isdigit() else 0 for c in puzzle_str]
+
+        enc = tokenizer.encode(s)
+        ids = torch.tensor(enc, dtype=torch.long, device=device).unsqueeze(0)
+        T = ids.shape[1]
+        eq_id = tokenizer.encode('=')[0]
+        ans_s = 0
+        for t in range(T):
+            if ids[0, t].item() == eq_id: ans_s = t + 1; break
+
+        x = ids.clone()
+        blank_js = []
+        for j in range(ANS_LEN):
+            if puzzle_flat[j] == 0:
+                x[0, ans_s + j] = mask_id; blank_js.append(j)
+        if not blank_js: continue
+
+        logits = model(x)
+        confs = torch.zeros(ANS_LEN, device=device)
+        for j in blank_js:
+            cl = logits[0, ans_s + j].clone(); cl[mask_id] = -float('inf')
+            confs[j] = F.softmax(cl, dim=-1).max()
+
+        blank_confs = sorted([(j, confs[j].item()) for j in blank_js], key=lambda x: -x[1])
+        rank_of = {j: rank for rank, (j, _) in enumerate(blank_confs)}
+
+        for j in blank_js:
+            r, c = j // 9, j % 9
+            box_r, box_c = (r // 3) * 3, (c // 3) * 3
+            given_peers = sum(1 for p in PEERS_FLAT[j] if puzzle_flat[p] != 0)
+            row_occ = sum(1 for cc in range(9) if puzzle_flat[r*9+cc] != 0)
+            col_occ = sum(1 for rr in range(9) if puzzle_flat[rr*9+c] != 0)
+            box_occ = sum(1 for dr in range(3) for dc in range(3)
+                         if puzzle_flat[(box_r+dr)*9+(box_c+dc)] != 0)
+            row_vac = 9 - row_occ; col_vac = 9 - col_occ
+            box_vac = sum(1 for dr in range(3) for dc in range(3)
+                         if puzzle_flat[(box_r+dr)*9+(box_c+dc)] == 0)
+            min_vac = min(row_vac, col_vac, box_vac)
+
+            pd = meta[j]['prop_depth']
+            nc = meta[j]['n_candidates']
+            nc_cp = meta[j].get('n_cands_after_cp', nc) or nc
+
+            all_ranks.append(rank_of[j])
+            all_feats['prop_depth'].append(pd if pd >= 0 else 99)
+            all_feats['n_candidates'].append(nc)
+            all_feats['n_cands_cp'].append(nc_cp)
+            all_feats['n_given_peers'].append(given_peers)
+            all_feats['box_occupancy'].append(box_occ)
+            all_feats['row_occupancy'].append(row_occ)
+            all_feats['col_occupancy'].append(col_occ)
+            all_feats['min_unit_vacancy'].append(min_vac)
+
+    if len(all_ranks) < 20: return {}
+
+    def _rank(xs):
+        sx = sorted(range(len(xs)), key=lambda i: xs[i])
+        ranks = [0.0] * len(xs)
+        for r, i in enumerate(sx): ranks[i] = r
+        return ranks
+
+    def _spearman(xs, ys):
+        n = len(xs); rx, ry = _rank(xs), _rank(ys)
+        mx, my = sum(rx)/n, sum(ry)/n
+        c = sum((a-mx)*(b-my) for a, b in zip(rx, ry))
+        sx = sum((a-mx)**2 for a in rx)**0.5
+        sy = sum((b-my)**2 for b in ry)**0.5
+        return c/(sx*sy) if sx > 0 and sy > 0 else 0.0
+
+    correlations = {}
+    for feat_name, feat_vals in all_feats.items():
+        correlations[feat_name] = _spearman(feat_vals, all_ranks)
+
+    sorted_feats = sorted(correlations.items(), key=lambda x: abs(x[1]), reverse=True)
+
+    binned = {}
+    for feat_name in ['prop_depth', 'n_given_peers', 'n_candidates', 'min_unit_vacancy']:
+        bins = defaultdict(list)
+        for i in range(len(all_ranks)):
+            bins[all_feats[feat_name][i]].append(all_ranks[i])
+        binned[feat_name] = {k: sum(v)/len(v) for k, v in sorted(bins.items()) if len(v) >= 5}
+
+    return {'correlations': correlations, 'sorted_features': sorted_feats,
+            'binned': binned, 'n_cells': len(all_ranks)}
+
+
+@torch.no_grad()
 def simulate_puma_coverage(model, tokenizer, test_data, max_len,
                            n_samples=100, device=None):
     """Measure PUMA chain coverage by depth category."""
@@ -1336,10 +1462,10 @@ def run(tag=''):
     max_len = max(len(tok.encode(d['string'])) for d in train_data)
     print(f"  max_len={max_len}")
 
-    # ── Rating correlation analysis ──
+    # ── Rating correlation analysis (test data only — has metadata) ──
     print(f"\n{'━'*60}\n  Rating Correlation Analysis\n{'━'*60}")
-    all_data_for_corr = train_data + [d for ds in test_data.values() for d in ds]
-    corr = analyse_rating_correlation(all_data_for_corr)
+    all_test_for_corr = [d for ds in test_data.values() for d in ds]
+    corr = analyse_rating_correlation(all_test_for_corr)
     if corr.get('correlations'):
         for fn, r in corr['correlations'].items():
             print(f"    corr({fn}, tdoku_rating) = {r:.3f}")
@@ -1406,6 +1532,30 @@ def run(tag=''):
                 print(f"    hard_frac>={hf:.0%} {dp}: "
                       f"cell={r['blank_cell_acc']:.4f} exact={r['accuracy']:.4f} "
                       f"(n={len(subset_eval)}, available={len(subset)})")
+
+        # ── Decode strategy analysis (what does the model actually look at?) ──
+        print(f"  Decode strategy analysis...")
+        strat = analyse_decode_strategy(model, tok, all_test[:200], max_len, device=DEVICE)
+        all_results[f'{mt}_decode_strategy'] = strat
+        if strat.get('sorted_features'):
+            print(f"    Feature importance (|ρ| with decode rank):")
+            for feat, rho in strat['sorted_features']:
+                print(f"      {feat:<20s}: ρ={rho:+.3f}")
+            # Key comparison
+            rho_depth = strat['correlations'].get('prop_depth', 0)
+            rho_peers = strat['correlations'].get('n_given_peers', 0)
+            rho_ncands = strat['correlations'].get('n_candidates', 0)
+            rho_minvac = strat['correlations'].get('min_unit_vacancy', 0)
+            print(f"    → Model strategy: ", end='')
+            best = strat['sorted_features'][0]
+            if best[0] in ('n_given_peers', 'box_occupancy', 'row_occupancy', 'col_occupancy'):
+                print(f"CONSTRAINT DENSITY (ρ={best[1]:+.3f}) > prop_depth (ρ={rho_depth:+.3f})")
+            elif best[0] == 'min_unit_vacancy':
+                print(f"UNIT COMPLETION (ρ={best[1]:+.3f}) > prop_depth (ρ={rho_depth:+.3f})")
+            elif best[0] == 'n_candidates':
+                print(f"CANDIDATE COUNT (ρ={best[1]:+.3f}) > prop_depth (ρ={rho_depth:+.3f})")
+            else:
+                print(f"CP-LIKE (prop_depth ρ={rho_depth:+.3f})")
 
         # ── PUMA coverage (puma model only) ──
         if mt == 'puma':
