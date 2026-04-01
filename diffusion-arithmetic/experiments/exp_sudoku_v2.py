@@ -36,32 +36,34 @@ EXP_NAME = 'exp_sudoku_v2'
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 ANS_LEN = 81
 
-# Data (easy-dominant by default)
-N_EASY = 100000         # rating = 0 (CP-solvable)
-N_HARD = 50000          # rating >= HARD_THRESHOLD
+# Data — 4-tier curriculum (like a math problem set)
+TRAIN_DIST = {
+    'easy':    200000,   # rating = 0, CP-solvable (bulk)
+    'medium':  200000,   # rating 1-9, light search
+    'hard':    100000,   # rating 10-99, moderate search
+    'extreme':   5000,   # rating 100+, deep search (rare corner case ~1%)
+}
 N_TEST_PER_TIER = 500
-HARD_THRESHOLD = 10     # tdoku backtracks
 DATA_SOURCE = 'hf'      # 'hf', 'csv', 'generate'
 CSV_PATH = ''
-TRAIN_CONDITION = 'mixed'  # 'mixed' (N_EASY+N_HARD), 'hard_only', 'easy_dominant'
 
 # Model (PUMA paper Sudoku config)
 N_LAYER = 8; N_HEAD = 8; N_EMBD = 256
 DROPOUT = 0.0; POS_ENC = 'absolute'
 
 # Training
-MAX_ITERS = 60000; BATCH_SIZE = 64
+MAX_ITERS = 120000; BATCH_SIZE = 64
 LR = 3e-4; MIN_LR = 1e-5; WARMUP_ITERS = 1000
 GRAD_CLIP = 1.0; WEIGHT_DECAY = 0.01
 EMA_DECAY = 0.9999
-EVAL_EVERY = 2000; LOG_EVERY = 500; GEN_EVAL_EVERY = 5000; GEN_EVAL_N = 100
+EVAL_EVERY = 4000; LOG_EVERY = 1000; GEN_EVAL_EVERY = 10000; GEN_EVAL_N = 100
 
 MASK_TYPES = ['random', 'puma']
 DECODE_POLICIES = ['confidence', 'oracle_depth', 'random']
 PUMA_TAU = 0.9; PUMA_K = 8
 SEED = 42
 
-# Rating tiers for analysis
+# Rating tiers for analysis (matches TRAIN_DIST keys)
 RATING_TIERS = {'easy': (0, 0), 'medium': (1, 9), 'hard': (10, 99), 'extreme': (100, 99999)}
 
 
@@ -70,9 +72,11 @@ def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument('--data-source', default=None, choices=['hf', 'csv', 'generate'])
     p.add_argument('--csv-path', default=None)
+    # 4-tier training distribution
     p.add_argument('--n-easy', type=int, default=None)
+    p.add_argument('--n-medium', type=int, default=None)
     p.add_argument('--n-hard', type=int, default=None)
-    p.add_argument('--hard-threshold', type=int, default=None)
+    p.add_argument('--n-extreme', type=int, default=None)
     p.add_argument('--n-test', type=int, default=None)
     p.add_argument('--max-iters', type=int, default=None)
     p.add_argument('--batch-size', type=int, default=None)
@@ -85,7 +89,6 @@ def parse_args():
     p.add_argument('--decode', nargs='+', default=None)
     p.add_argument('--puma-k', type=int, default=None)
     p.add_argument('--puma-tau', type=float, default=None)
-    p.add_argument('--train-condition', default=None, choices=['mixed', 'hard_only', 'easy_dominant'])
     p.add_argument('--tag', type=str, default='')
     p.add_argument('--seed', type=int, default=None)
     p.add_argument('--seeds', nargs='+', type=int, default=None)
@@ -95,15 +98,19 @@ def parse_args():
         args, _ = p.parse_known_args([])
     g = globals()
     for a, gl in {'data_source': 'DATA_SOURCE', 'csv_path': 'CSV_PATH',
-                   'n_easy': 'N_EASY', 'n_hard': 'N_HARD', 'hard_threshold': 'HARD_THRESHOLD',
                    'n_test': 'N_TEST_PER_TIER', 'max_iters': 'MAX_ITERS',
                    'batch_size': 'BATCH_SIZE', 'n_layer': 'N_LAYER', 'n_head': 'N_HEAD',
                    'n_embd': 'N_EMBD', 'dropout': 'DROPOUT', 'lr': 'LR',
                    'puma_k': 'PUMA_K', 'puma_tau': 'PUMA_TAU', 'seed': 'SEED'}.items():
-        v = getattr(args, a); g[gl] = v if v is not None else g[gl]
+        v = getattr(args, a, None)
+        if v is not None: g[gl] = v
+    # Update TRAIN_DIST per-tier
+    if args.n_easy is not None: g['TRAIN_DIST']['easy'] = args.n_easy
+    if args.n_medium is not None: g['TRAIN_DIST']['medium'] = args.n_medium
+    if args.n_hard is not None: g['TRAIN_DIST']['hard'] = args.n_hard
+    if args.n_extreme is not None: g['TRAIN_DIST']['extreme'] = args.n_extreme
     if args.masks: g['MASK_TYPES'] = args.masks
     if args.decode: g['DECODE_POLICIES'] = args.decode
-    if args.train_condition: g['TRAIN_CONDITION'] = args.train_condition
     return args
 
 
@@ -289,11 +296,9 @@ def _compute_meta_worker(args):
     return d
 
 
-def load_hf_data(n_easy, n_hard, n_test, hard_threshold, seed=42, cache_dir='.sudoku_cache'):
-    """Load from HuggingFace sapientinc/sudoku-extreme.
-    Columns: source, question (puzzle), answer (solution), rating (tdoku backtracks).
-    Source encodes origin: puzzles0_kaggle (easy), puzzles4_forum_hardest_1905 (hard), etc.
-    Blanks may be '.' or '0' — _compute_puzzle_meta handles both.
+def load_hf_data(train_dist, n_test, seed=42, cache_dir='.sudoku_cache'):
+    """Load from HuggingFace sapientinc/sudoku-extreme with 4-tier curriculum.
+    train_dist: dict like {'easy': 200000, 'medium': 200000, 'hard': 100000, 'extreme': 5000}
     """
     print("  Loading HuggingFace sudoku-extreme dataset...")
     from datasets import load_dataset
@@ -314,33 +319,28 @@ def load_hf_data(n_easy, n_hard, n_test, hard_threshold, seed=42, cache_dir='.su
 
     # Efficient sampling: batch-read ratings first, then filter
     def _sample_by_rating(data, lo, hi, n, rng_inst):
-        # Read all ratings at once (much faster than per-item access)
         ratings = data['rating']
         indices = [i for i, r in enumerate(ratings) if lo <= r <= hi]
+        actual_n = min(len(indices), n)
         if len(indices) > n:
             indices = rng_inst.sample(indices, n)
-        print(f"    rating [{lo},{hi}]: {len(indices)} available, sampling {min(len(indices), n)}")
-        # Batch-read selected rows
-        if not indices:
-            return []
+        print(f"    rating [{lo},{hi}]: {len(indices)} available → sampling {actual_n}")
+        if not indices: return []
         rows = data.select(indices)
         return [(rows[i]['question'], rows[i]['answer'], rows[i]['rating'],
                  rows[i].get('source', ''))
                 for i in range(len(rows))]
 
-    # Train: condition-dependent mix
-    print(f"  Sampling train data (condition={TRAIN_CONDITION})...")
-    if TRAIN_CONDITION == 'hard_only':
-        hard_train = _sample_by_rating(train_raw, hard_threshold, 999999, n_easy + n_hard, rng)
-        easy_train = []
-    elif TRAIN_CONDITION == 'easy_dominant':
-        easy_train = _sample_by_rating(train_raw, 0, 0, n_easy, rng)
-        n_hard_reduced = max(n_hard // 10, 100)
-        hard_train = _sample_by_rating(train_raw, hard_threshold, 999999, n_hard_reduced, rng)
-    else:  # 'mixed' (default)
-        easy_train = _sample_by_rating(train_raw, 0, 0, n_easy, rng)
-        hard_train = _sample_by_rating(train_raw, hard_threshold, 999999, n_hard, rng)
-    train_tuples = easy_train + hard_train
+    # Train: 4-tier curriculum
+    print(f"  Sampling train data (4-tier curriculum)...")
+    train_tuples = []
+    tier_counts = {}
+    for tier_name, (lo, hi) in RATING_TIERS.items():
+        n_tier = train_dist.get(tier_name, 0)
+        if n_tier <= 0: continue
+        samples = _sample_by_rating(train_raw, lo, hi, n_tier, rng)
+        train_tuples.extend(samples)
+        tier_counts[tier_name] = len(samples)
     rng.shuffle(train_tuples)
 
     # Test: separate tiers
@@ -349,18 +349,23 @@ def load_hf_data(n_easy, n_hard, n_test, hard_threshold, seed=42, cache_dir='.su
     test_tiers = {}
     for tier_name, (lo, hi) in RATING_TIERS.items():
         samples = _sample_by_rating(test_raw, lo, hi, n_test, rng2)
-        if not samples:  # try train set if test doesn't have this tier
+        if not samples:
             samples = _sample_by_rating(train_raw, lo, hi, n_test, rng2)
         test_tiers[tier_name] = samples
 
-    print(f"  Train: {len(easy_train)} easy + {len(hard_train)} hard = {len(train_tuples)}")
+    total = sum(tier_counts.values())
+    dist_str = ' + '.join(f"{v} {k}" for k, v in tier_counts.items())
+    print(f"  Train: {dist_str} = {total}")
+    if total > 0:
+        pct_str = ' '.join(f"{k}={v/total:.1%}" for k, v in tier_counts.items())
+        print(f"  Train distribution: {pct_str}")
     for tn, ts in test_tiers.items():
         print(f"  Test/{tn}: {len(ts)}")
 
     return train_tuples, test_tiers
 
 
-def load_csv_data(csv_path, n_easy, n_hard, n_test, hard_threshold, seed=42):
+def load_csv_data(csv_path, total_n, n_test, seed=42):
     """Load from local CSV (puzzle,solution,rating or puzzle,solution,difficulty)."""
     import csv
     print(f"  Loading CSV: {csv_path}")
@@ -368,21 +373,16 @@ def load_csv_data(csv_path, n_easy, n_hard, n_test, hard_threshold, seed=42):
     with open(csv_path) as f:
         reader = csv.DictReader(f)
         for row in reader:
-            p = row.get('puzzle', row.get('quizzes', ''))
-            s = row.get('solution', row.get('solutions', ''))
+            p = row.get('puzzle', row.get('quizzes', row.get('question', '')))
+            s = row.get('solution', row.get('solutions', row.get('answer', '')))
             r = int(row.get('rating', row.get('difficulty', 0)))
             if len(p) == 81 and len(s) == 81:
                 rows.append((p, s, r))
     print(f"  Loaded {len(rows)} puzzles from CSV")
     rng = random.Random(seed)
     rng.shuffle(rows)
-    easy = [r for r in rows if r[2] <= 0][:n_easy]
-    hard = [r for r in rows if r[2] >= hard_threshold][:n_hard]
-    train_tuples = easy + hard
-    rng.shuffle(train_tuples)
-    # Simple test split from remainder
-    used = set(id(t) for t in train_tuples)
-    rest = [r for r in rows if id(r) not in used]
+    train_tuples = rows[:total_n]
+    rest = rows[total_n:]
     test_tiers = {}
     for tn, (lo, hi) in RATING_TIERS.items():
         test_tiers[tn] = [r for r in rest if lo <= r[2] <= hi][:n_test]
@@ -450,13 +450,12 @@ def prepare_datasets(source=None, seed=42):
     """Load data and compute per-puzzle metadata in parallel."""
     source = source or DATA_SOURCE
     if source == 'hf':
-        train_tuples, test_tiers = load_hf_data(
-            N_EASY, N_HARD, N_TEST_PER_TIER, HARD_THRESHOLD, seed)
+        train_tuples, test_tiers = load_hf_data(TRAIN_DIST, N_TEST_PER_TIER, seed)
     elif source == 'csv':
         train_tuples, test_tiers = load_csv_data(
-            CSV_PATH, N_EASY, N_HARD, N_TEST_PER_TIER, HARD_THRESHOLD, seed)
+            CSV_PATH, sum(TRAIN_DIST.values()), N_TEST_PER_TIER, seed)
     else:
-        raw = gen_fallback_data(N_EASY + N_HARD, seed)
+        raw = gen_fallback_data(sum(TRAIN_DIST.values()), seed)
         train_tuples = raw
         test_raw = gen_fallback_data(N_TEST_PER_TIER * 2, seed + 5000)
         test_tiers = {'all': test_raw}
@@ -1321,7 +1320,8 @@ def run(tag=''):
     exp_name = f"{EXP_NAME}_{tag}" if tag else EXP_NAME
     print(f"\n{'='*70}")
     print(f"  {exp_name}")
-    print(f"  Model: {N_LAYER}L/{N_EMBD}D/{N_HEAD}H  Data: {N_EASY}easy+{N_HARD}hard ({TRAIN_CONDITION})")
+    dist_str = ' '.join(f"{k}={v}" for k, v in TRAIN_DIST.items())
+    print(f"  Model: {N_LAYER}L/{N_EMBD}D/{N_HEAD}H  Train: {dist_str} (total={sum(TRAIN_DIST.values())})")
     print(f"  Training: {MAX_ITERS} iters, batch={BATCH_SIZE}")
     print(f"  Masks: {MASK_TYPES}  Decode: {DECODE_POLICIES}")
     print(f"  PUMA: K={PUMA_K}, tau={PUMA_TAU}")
@@ -1486,9 +1486,9 @@ def run(tag=''):
                 print()
 
     # ── Save ──
-    sd = {'config': {k: globals()[k] for k in ['N_EASY', 'N_HARD', 'HARD_THRESHOLD',
+    sd = {'config': {k: globals()[k] for k in ['TRAIN_DIST',
            'N_LAYER', 'N_EMBD', 'N_HEAD', 'MAX_ITERS', 'BATCH_SIZE',
-           'MASK_TYPES', 'DECODE_POLICIES', 'PUMA_K', 'PUMA_TAU', 'TRAIN_CONDITION']}}
+           'MASK_TYPES', 'DECODE_POLICIES', 'PUMA_K', 'PUMA_TAU']}}
     for k, v in all_results.items(): sd[f'result_{k}'] = v
     for k, v in all_dyn.items():
         sd[f'dyn_{k}'] = {'checkpoints': v['checkpoints'], 'train_loss': v['train_loss']}
