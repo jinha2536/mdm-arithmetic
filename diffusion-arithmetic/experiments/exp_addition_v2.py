@@ -282,15 +282,47 @@ def gen_corner_case_test(n, fmt, seed, category='msb_chain'):
     return results[:n]
 
 def gen_min_chain_test(n, fmt, seed, min_chain):
-    """Generate samples where max propagate chain length >= min_chain.
-    For chain length sweep: tests PUMA's generalization boundary.
+    """Construct samples with a propagate chain of exactly min_chain length.
+    Places min_chain consecutive p-positions (digit pairs summing to 9)
+    at a random location, fills the rest with g/k positions.
     """
-    rng = random.Random(seed); lo, hi = 10**(ND-1), 10**ND-1; results = []
-    for _ in range(n * 500):
-        a, b = rng.randint(lo, hi), rng.randint(lo, hi)
-        if _chain_stats(a, b)['max_chain_len'] >= min_chain:
-            results.append(FMT_FN[fmt](a, b))
+    rng = random.Random(seed); results = []; seen = set()
+    for _ in range(n * 50):
         if len(results) >= n: break
+        # Choose where to place the p-chain
+        max_start = ND - min_chain
+        if max_start < 0: break
+        chain_start = rng.randint(0, max_start)  # digit index (LSB=0)
+
+        a_digits = [0] * ND; b_digits = [0] * ND
+        for d in range(ND):
+            if chain_start <= d < chain_start + min_chain:
+                # p-position: a+b = 9
+                a_d = rng.randint(0, 9); b_d = 9 - a_d
+            else:
+                # g or k position: a+b != 9 (and a+b < 10 for k, >= 10 for g)
+                a_d = rng.randint(0, 9); b_d = rng.randint(0, 9)
+                while a_d + b_d == 9:
+                    b_d = rng.randint(0, 9)
+            a_digits[d] = a_d; b_digits[d] = b_d
+
+        # Ensure MSB is nonzero
+        if a_digits[ND-1] == 0: a_digits[ND-1] = rng.randint(1, 9)
+        if b_digits[ND-1] == 0: b_digits[ND-1] = rng.randint(1, 9)
+        # Fix MSB if it was in chain and got overwritten
+        if chain_start <= ND-1 < chain_start + min_chain:
+            a_digits[ND-1] = rng.randint(1, 8)
+            b_digits[ND-1] = 9 - a_digits[ND-1]
+
+        # Convert digit arrays (LSB=index 0) to integers
+        a = int(''.join(str(a_digits[d]) for d in range(ND-1, -1, -1)))
+        b = int(''.join(str(b_digits[d]) for d in range(ND-1, -1, -1)))
+
+        # Verify actual chain length
+        st = _chain_stats(a, b)
+        if st['max_chain_len'] >= min_chain and (a, b) not in seen:
+            seen.add((a, b)); results.append(FMT_FN[fmt](a, b))
+
     if len(results) < n:
         print(f"    WARNING: chain>={min_chain}: {len(results)}/{n}")
     return results[:n]
