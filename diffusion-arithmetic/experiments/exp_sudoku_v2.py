@@ -38,10 +38,11 @@ ANS_LEN = 81
 
 # Data — 4-tier curriculum (like a math problem set)
 TRAIN_DIST = {
-    'easy':    200000,   # rating = 0, CP-solvable (bulk)
-    'medium':  200000,   # rating 1-9, light search
-    'hard':    100000,   # rating 10-99, moderate search
-    'extreme':   5000,   # rating 100+, deep search (rare corner case ~1%)
+    'easy':    500000,   # rating = 0, CP-solvable (bulk)
+    'medium':  500000,   # rating 1-9, light search
+    'hard':    300000,   # rating 10-99, moderate search
+    'extreme':  50000,   # rating 100-999, deep search
+    'nightmare': 5000,   # rating 1000+, very deep (rare, ~0.4%)
 }
 N_TEST_PER_TIER = 500
 DATA_SOURCE = 'hf'      # 'hf', 'csv', 'generate'
@@ -52,19 +53,22 @@ N_LAYER = 8; N_HEAD = 8; N_EMBD = 256
 DROPOUT = 0.0; POS_ENC = 'absolute'
 
 # Training
-MAX_ITERS = 120000; BATCH_SIZE = 64
-LR = 3e-4; MIN_LR = 1e-5; WARMUP_ITERS = 1000
+MAX_ITERS = 400000; BATCH_SIZE = 64
+LR = 3e-4; MIN_LR = 1e-5; WARMUP_ITERS = 2000
 GRAD_CLIP = 1.0; WEIGHT_DECAY = 0.01
 EMA_DECAY = 0.9999
-EVAL_EVERY = 4000; LOG_EVERY = 1000; GEN_EVAL_EVERY = 10000; GEN_EVAL_N = 100
+EVAL_EVERY = 8000; LOG_EVERY = 2000; GEN_EVAL_EVERY = 20000; GEN_EVAL_N = 100
 
 MASK_TYPES = ['random', 'puma']
-DECODE_POLICIES = ['confidence', 'oracle_depth', 'random']
+DECODE_POLICIES = ['confidence', 'oracle_solver', 'random']
 PUMA_TAU = 0.9; PUMA_K = 8
 SEED = 42
 
-# Rating tiers for analysis (matches TRAIN_DIST keys)
-RATING_TIERS = {'easy': (0, 0), 'medium': (1, 9), 'hard': (10, 99), 'extreme': (100, 99999)}
+# Rating tiers for analysis (matches TRAIN_DIST keys + nightmare)
+RATING_TIERS = {
+    'easy': (0, 0), 'medium': (1, 9), 'hard': (10, 99),
+    'extreme': (100, 999), 'nightmare': (1000, 99999),
+}
 
 
 def parse_args():
@@ -236,6 +240,73 @@ def compute_n_cands_after_cp(puzzle_flat):
             if puzzle_flat[i] == 0 and POPCOUNT[cands[i]] > 1}
 
 
+def compute_guess_depth(puzzle_flat):
+    """Per-cell guess depth + solve order via MRV backtracking solver.
+    Returns:
+      cell_depth: dict cell → guess_depth (0=CP, 1+=after k-th guess)
+      solve_order: dict cell → rank in solver's determination sequence (0=first determined)
+      total_guesses: int (≈ tdoku rating)
+    The solve_order is the TRUE oracle ordering — the Sudoku analog of LSB in addition.
+    """
+    cands = _bm_init(puzzle_flat)
+    blanks = [i for i in range(81) if puzzle_flat[i] == 0]
+    if cands is None:
+        return ({i: -1 for i in blanks}, {i: i for i in blanks}, 0)
+
+    cell_depth = {}
+    solve_order = {}
+    order_counter = [0]
+    total_guesses = [0]
+
+    # Mark cells determined by initial CP (guess_depth=0)
+    for i in blanks:
+        if POPCOUNT[cands[i]] == 1:
+            cell_depth[i] = 0
+            solve_order[i] = order_counter[0]; order_counter[0] += 1
+
+    def _search(cands_state, guess_count):
+        best_i, best_n = -1, 10
+        for i in range(81):
+            n = POPCOUNT[cands_state[i]]
+            if 1 < n < best_n:
+                best_i, best_n = i, n
+        if best_i == -1:
+            # Solved — mark any remaining unassigned blanks
+            for i in blanks:
+                if i not in cell_depth and POPCOUNT[cands_state[i]] == 1:
+                    cell_depth[i] = guess_count
+                    solve_order[i] = order_counter[0]; order_counter[0] += 1
+            return True
+
+        guess_count += 1; total_guesses[0] += 1
+        c = cands_state[best_i]
+        while c:
+            bit = LOWEST_BIT[c]
+            cp = list(cands_state)
+            if _bm_assign(cp, best_i, BIT_VAL[bit]):
+                newly = []
+                for i in blanks:
+                    if i not in cell_depth and POPCOUNT[cp[i]] == 1:
+                        cell_depth[i] = guess_count
+                        solve_order[i] = order_counter[0]; order_counter[0] += 1
+                        newly.append(i)
+                if _search(cp, guess_count):
+                    return True
+                # Backtrack
+                for i in newly:
+                    del cell_depth[i]; del solve_order[i]
+                order_counter[0] -= len(newly)
+            c &= ~bit
+        return False
+
+    _search(list(cands), 0)
+    for i in blanks:
+        if i not in cell_depth:
+            cell_depth[i] = -1
+            solve_order[i] = order_counter[0]; order_counter[0] += 1
+    return cell_depth, solve_order, total_guesses[0]
+
+
 def compute_live_candidates(grid_flat):
     """Compute candidate count for each unfilled cell in a partially-solved grid.
     Used by adaptive_n_cands decode: recomputes at every decode step.
@@ -251,6 +322,9 @@ def compute_live_candidates(grid_flat):
 DEPTH_CATS = ['given', 'depth_0', 'depth_1', 'depth_2', 'depth_3plus', 'depth_hard']
 DEPTH_CAT_TO_ID = {n: i for i, n in enumerate(DEPTH_CATS)}
 
+GUESS_CATS = ['guess_0', 'guess_1', 'guess_2', 'guess_3plus']
+GUESS_CAT_TO_ID = {n: i for i, n in enumerate(GUESS_CATS)}
+
 def _depth_to_cat(meta):
     if meta['is_given']: return 'given'
     d = meta['prop_depth']
@@ -259,6 +333,13 @@ def _depth_to_cat(meta):
     if d == 2: return 'depth_2'
     if d >= 3: return 'depth_3plus'
     return 'depth_hard'
+
+def _guess_to_cat(meta):
+    gd = meta.get('guess_depth', 0)
+    if gd <= 0: return 'guess_0'
+    if gd == 1: return 'guess_1'
+    if gd == 2: return 'guess_2'
+    return 'guess_3plus'
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -272,6 +353,8 @@ def _compute_puzzle_meta(puzzle_str, sol_str):
     depths = compute_prop_depth(puzzle_flat)
     n_cands = compute_n_candidates(puzzle_flat)
     n_cands_cp = compute_n_cands_after_cp(puzzle_flat)
+    # Per-cell guess depth via backtracking
+    guess_depths, solve_order, total_guesses = compute_guess_depth(puzzle_flat)
     meta = {}
     for i in range(81):
         is_given = puzzle_flat[i] != 0
@@ -280,10 +363,13 @@ def _compute_puzzle_meta(puzzle_str, sol_str):
             'prop_depth': -99 if is_given else depths.get(i, -1),
             'n_candidates': 0 if is_given else n_cands.get(i, 0),
             'n_cands_after_cp': 0 if is_given else n_cands_cp.get(i, 0),
+            'guess_depth': 0 if is_given else guess_depths.get(i, -1),
+            'solve_order': -1 if is_given else solve_order.get(i, 999),
         }
     # Normalize puzzle string to use '0' for blanks
     pstr = ''.join(str(v) for v in puzzle_flat)
-    return {'string': f"{pstr}={sol_str}", 'meta': meta, 'n_blanks': n_blanks}
+    return {'string': f"{pstr}={sol_str}", 'meta': meta, 'n_blanks': n_blanks,
+            'total_guesses': total_guesses}
 
 
 def _compute_meta_worker(args):
@@ -497,12 +583,19 @@ def prepare_datasets(source=None, seed=42):
         if not data: continue
         ratings = [d.get('rating', 0) for d in data]
         depth_dist = defaultdict(int)
+        guess_dist = defaultdict(int)
         for d in data:
             for j in range(81):
                 depth_dist[_depth_to_cat(d['meta'][j])] += 1
+                if not d['meta'][j]['is_given']:
+                    guess_dist[_guess_to_cat(d['meta'][j])] += 1
+        tg = [d.get('total_guesses', 0) for d in data]
         print(f"  [{name}] n={len(data)} rating: "
-              f"min={min(ratings)} med={sorted(ratings)[len(ratings)//2]} max={max(ratings)} "
-              f"depth: {dict(sorted(depth_dist.items()))}")
+              f"min={min(ratings)} med={sorted(ratings)[len(ratings)//2]} max={max(ratings)}")
+        print(f"    depth: {dict(sorted(depth_dist.items()))}")
+        print(f"    guess: {dict(sorted(guess_dist.items()))}")
+        if tg:
+            print(f"    total_guesses: min={min(tg)} med={sorted(tg)[len(tg)//2]} max={max(tg)}")
 
     return train_data, test_data
 
@@ -781,7 +874,7 @@ def generate_blanks(model, tokenizer, test_data, decode_policy='confidence',
     """Decode blank cells with configurable policy.
     Policies:
       'confidence':       model max prob (adaptive, standard MDM)
-      'oracle_depth':     prop_depth ascending, depth_hard last by n_cands_cp
+      'oracle_solver':     backtracking solver determination order (true oracle)
                           (static oracle — Sudoku analog of addition's LSB)
       'adaptive_n_cands': fewest candidates in current grid state (adaptive)
       'n_cands':          fewest initial candidates (static)
@@ -823,7 +916,7 @@ def generate_blanks(model, tokenizer, test_data, decode_policy='confidence',
 
         # Precompute static decode order for static policies
         static_order = None
-        if decode_policy in ('oracle_depth', 'n_cands', 'n_cands_cp', 'random'):
+        if decode_policy in ('oracle_solver', 'oracle_depth', 'n_cands', 'n_cands_cp', 'random'):
             static_order = torch.full((B, ANS_LEN), 9999, dtype=torch.long, device=device)
             for i in range(B):
                 meta = batch[i]['meta']
@@ -831,12 +924,15 @@ def generate_blanks(model, tokenizer, test_data, decode_policy='confidence',
                 if decode_policy == 'random':
                     random.shuffle(blank_js)
                     for rank, j in enumerate(blank_js): static_order[i, j] = rank
+                elif decode_policy == 'oracle_solver':
+                    # TRUE oracle: solver's actual determination order
+                    blank_js.sort(key=lambda j: meta[j].get('solve_order', 999))
+                    for rank, j in enumerate(blank_js): static_order[i, j] = rank
                 elif decode_policy == 'oracle_depth':
-                    # Sort by prop_depth ascending; depth_hard (-1) → last, sorted by n_cands_cp
                     def _depth_key(j):
                         d = meta[j]['prop_depth']
                         nc = meta[j].get('n_cands_after_cp', 9) or 9
-                        if d == -1: return (1000, nc)  # depth_hard last, then by n_cands
+                        if d == -1: return (1000, nc)
                         return (d, nc)
                     blank_js.sort(key=_depth_key)
                     for rank, j in enumerate(blank_js): static_order[i, j] = rank
@@ -933,6 +1029,15 @@ def evaluate(model, tokenizer, test_data, decode_policy='confidence',
             if cat != 'given': cat_acc[cat].append(r['pos_correct'][j])
     cat_acc = {c: sum(v)/len(v) for c, v in cat_acc.items() if v}
 
+    # Per guess_depth category
+    guess_acc = defaultdict(list)
+    for r in results:
+        for j in range(81):
+            if not r['meta'][j]['is_given']:
+                gc = _guess_to_cat(r['meta'][j])
+                guess_acc[gc].append(r['pos_correct'][j])
+    guess_acc = {c: sum(v)/len(v) for c, v in guess_acc.items() if v}
+
     # Per rating tier
     rating_acc = {}
     for tn, (lo, hi) in RATING_TIERS.items():
@@ -947,7 +1052,8 @@ def evaluate(model, tokenizer, test_data, decode_policy='confidence',
             }
 
     return {'accuracy': acc, 'blank_cell_acc': bl_acc, 'n': n,
-            'category_accuracy': cat_acc, 'rating_accuracy': rating_acc}
+            'category_accuracy': cat_acc, 'guess_accuracy': guess_acc,
+            'rating_accuracy': rating_acc}
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -967,12 +1073,19 @@ def analyse_rating_correlation(data):
         if not blanks: continue
         n_cands_cp = [meta[j]['n_cands_after_cp'] for j in blanks if meta[j]['n_cands_after_cp'] > 0]
         max_depth = max((meta[j]['prop_depth'] for j in blanks if meta[j]['prop_depth'] >= 0), default=0)
+        guess_depths = [meta[j].get('guess_depth', 0) for j in blanks]
+        max_guess = max(guess_depths) if guess_depths else 0
+        mean_guess = sum(guess_depths)/len(guess_depths) if guess_depths else 0
+        n_guess_hard = sum(1 for gd in guess_depths if gd >= 2)
         features.append({
             'n_depth_hard': n_hard,
             'n_blanks': len(blanks),
             'mean_n_cands_cp': sum(n_cands_cp)/len(n_cands_cp) if n_cands_cp else 0,
             'max_depth': max_depth,
             'frac_hard': n_hard / max(len(blanks), 1),
+            'max_guess_depth': max_guess,
+            'mean_guess_depth': mean_guess,
+            'n_guess_hard': n_guess_hard,
         })
         ratings.append(r)
         sources.append(src)
@@ -987,7 +1100,8 @@ def analyse_rating_correlation(data):
         return c/(sx*sy) if sx > 0 and sy > 0 else 0.0
 
     correlations = {}
-    for feat_name in ['n_depth_hard', 'n_blanks', 'mean_n_cands_cp', 'max_depth', 'frac_hard']:
+    for feat_name in ['n_depth_hard', 'n_blanks', 'mean_n_cands_cp', 'max_depth', 'frac_hard',
+                       'max_guess_depth', 'mean_guess_depth', 'n_guess_hard']:
         xs = [f[feat_name] for f in features]
         correlations[feat_name] = _corr(xs, ratings)
 
@@ -1187,6 +1301,7 @@ def analyse_decode_strategy(model, tokenizer, test_data, max_len,
             all_feats['row_occupancy'].append(row_occ)
             all_feats['col_occupancy'].append(col_occ)
             all_feats['min_unit_vacancy'].append(min_vac)
+            all_feats['guess_depth'].append(meta[j].get('guess_depth', 0))
 
     if len(all_ranks) < 20: return {}
 
@@ -1211,7 +1326,7 @@ def analyse_decode_strategy(model, tokenizer, test_data, max_len,
     sorted_feats = sorted(correlations.items(), key=lambda x: abs(x[1]), reverse=True)
 
     binned = {}
-    for feat_name in ['prop_depth', 'n_given_peers', 'n_candidates', 'min_unit_vacancy']:
+    for feat_name in ['prop_depth', 'n_given_peers', 'n_candidates', 'min_unit_vacancy', 'guess_depth']:
         bins = defaultdict(list)
         for i in range(len(all_ranks)):
             bins[all_feats[feat_name][i]].append(all_ranks[i])
@@ -1332,6 +1447,25 @@ def make_figures(all_results, all_dyn, corr_data):
     fig.suptitle('Per-Category Accuracy by Decode Policy', fontsize=12, y=1.02)
     fig.tight_layout(); figs['cat_acc'] = fig
 
+    # ── Fig 2b: Per-guess-depth accuracy comparison (PUMA vs Random) ──
+    has_guess = any(all_results.get(f'{mt}_confidence', {}).get('guess_accuracy')
+                    for mt in MASK_TYPES)
+    if has_guess:
+        fig, ax = plt.subplots(figsize=(10, 5))
+        mt_colors = {'random': '#3498db', 'puma': '#8e44ad'}
+        for mt in MASK_TYPES:
+            ga = all_results.get(f'{mt}_confidence', {}).get('guess_accuracy', {})
+            cats = [c for c in GUESS_CATS if c in ga]
+            if cats:
+                vals = [ga[c] for c in cats]; x = range(len(cats))
+                ax.plot(x, vals, '-o', label=mt, color=mt_colors.get(mt, '#333'),
+                        ms=8, lw=2, alpha=0.8)
+                ax.set_xticks(list(x)); ax.set_xticklabels(cats, fontsize=9)
+        ax.set_ylim(0, 1.05); ax.set_ylabel('Cell Accuracy')
+        ax.set_title('Accuracy by Guess Depth (confidence decode)')
+        ax.legend(fontsize=10); ax.grid(alpha=0.3)
+        fig.tight_layout(); figs['guess_depth_acc'] = fig
+
     # ── Fig 3: Rating correlation scatter ──
     if corr_data and 'features' in corr_data:
         fig, axes = plt.subplots(1, 3, figsize=(18, 5))
@@ -1413,7 +1547,7 @@ def make_figures(all_results, all_dyn, corr_data):
     hard_fracs = [0.3, 0.5, 0.7, 0.8, 0.9, 0.95, 1.0]
     sweep_data = {}
     for mt in MASK_TYPES:
-        for dp in ['confidence', 'oracle_depth']:
+        for dp in ['confidence', 'oracle_solver']:
             xs, ys = [], []
             for hf in hard_fracs:
                 r = all_results.get(f'{mt}_hardfrac_{hf:.2f}_{dp}', {})
@@ -1423,9 +1557,9 @@ def make_figures(all_results, all_dyn, corr_data):
     if sweep_data:
         fig, ax = plt.subplots(figsize=(10, 6))
         styles = {'puma_confidence': ('#8e44ad', 's', '-'),
-                  'puma_oracle_depth': ('#8e44ad', 's', '--'),
+                  'puma_oracle_solver': ('#8e44ad', 's', '--'),
                   'random_confidence': ('#3498db', 'o', '-'),
-                  'random_oracle_depth': ('#3498db', 'o', '--')}
+                  'random_oracle_solver': ('#3498db', 'o', '--')}
         for key, (xs, ys) in sweep_data.items():
             col, mk, ls = styles.get(key, ('#333', 'x', '-'))
             ax.plot(xs, ys, f'{ls}', color=col, marker=mk, label=key, ms=8, lw=2, alpha=0.8)
@@ -1503,7 +1637,11 @@ def run(tag=''):
             ca = r.get('category_accuracy', {})
             if ca:
                 parts = [f"{c}={v:.3f}" for c, v in ca.items()]
-                print(f"    Cat: {' '.join(parts)}")
+                print(f"    Depth: {' '.join(parts)}")
+            ga = r.get('guess_accuracy', {})
+            if ga:
+                parts = [f"{c}={v:.3f}" for c, v in ga.items()]
+                print(f"    Guess: {' '.join(parts)}")
             ra = r.get('rating_accuracy', {})
             for tn, info in ra.items():
                 print(f"    {tn}: exact={info['exact']:.4f} cell={info['cell']:.4f} (n={info['n']})")
@@ -1525,7 +1663,7 @@ def run(tag=''):
                 print(f"    hard_frac>={hf:.0%}: {len(subset)} puzzles (skipped)")
                 continue
             subset_eval = subset[:min(200, len(subset))]
-            for dp in ['confidence', 'oracle_depth']:
+            for dp in ['confidence', 'oracle_solver']:
                 r = evaluate(model, tok, subset_eval, decode_policy=dp, batch_size=16, device=DEVICE)
                 key = f'{mt}_hardfrac_{hf:.2f}_{dp}'
                 all_results[key] = r
@@ -1598,7 +1736,7 @@ def run(tag=''):
                     for mt in MASK_TYPES for hf in hard_fracs)
     if has_sweep:
         print(f"\n{'='*70}\n  Hard Fraction Sweep (cell acc)\n{'='*70}")
-        for dp in ['confidence', 'oracle_depth']:
+        for dp in ['confidence', 'oracle_solver']:
             print(f"\n  decode={dp}:")
             print(f"  {'hard_frac':<12}", end='')
             for mt in MASK_TYPES: print(f" {mt:>10s}", end='')
@@ -1634,6 +1772,23 @@ def run(tag=''):
                     d = accs[0] - accs[1] if MASK_TYPES[0] == 'puma' else accs[1] - accs[0]
                     print(f"  Δ(P-R)={d:+.3f}", end='')
                 print()
+
+    # ── Guess Depth Accuracy (cell acc by guess_depth category) ──
+    print(f"\n{'='*70}\n  Guess Depth Accuracy (confidence decode)\n{'='*70}")
+    print(f"  {'Condition':<20}", end='')
+    for gc in GUESS_CATS: print(f" {gc:>12}", end='')
+    print()
+    print(f"  {'─'*70}")
+    for mt in MASK_TYPES:
+        key = f'{mt}_confidence'
+        r = all_results.get(key, {})
+        ga = r.get('guess_accuracy', {})
+        if ga:
+            row = f"  {mt:<20}"
+            for gc in GUESS_CATS:
+                v = ga.get(gc)
+                row += f" {v:>12.4f}" if v is not None else f" {'N/A':>12}"
+            print(row)
 
     # ── Save ──
     sd = {'config': {k: globals()[k] for k in ['TRAIN_DIST',

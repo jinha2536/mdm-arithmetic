@@ -44,6 +44,17 @@ PUMA_TAU = 0.9; PUMA_K_START = 3; PUMA_K_END = ANS_LEN
 SEED = 42; RUN_AR = False
 DATA_MODE = 'natural'  # 'balanced' or 'natural'
 
+# Curriculum: list of (label, schedule) where schedule = [(frac, mask_type), ...]
+# frac = fraction of total epochs at which to switch TO this mask_type
+# Example: [('puma2rand_50', [(0.0,'puma'),(0.5,'random')])]
+CURRICULUM_MODES = [
+    ('puma2rand_20', [(0.0, 'puma'), (0.20, 'random')]),
+    ('puma2rand_50', [(0.0, 'puma'), (0.50, 'random')]),
+    ('puma2rand_70', [(0.0, 'puma'), (0.70, 'random')]),
+    ('interleaved',  'interleaved'),   # alternate every batch
+]
+RUN_CURRICULUM = True
+
 
 def parse_args():
     import argparse
@@ -60,6 +71,8 @@ def parse_args():
     p.add_argument('--decode', nargs='+'); p.add_argument('--no-ar', action='store_true')
     p.add_argument('--ar', action='store_true')
     p.add_argument('--data-mode', choices=['balanced', 'natural'])
+    p.add_argument('--curriculum', nargs='+', help='Curriculum switchover fracs, e.g. 20 50')
+    p.add_argument('--no-curriculum', action='store_true')
     p.add_argument('--tag', type=str, default=''); p.add_argument('--seed', type=int)
     p.add_argument('--seeds', nargs='+', type=int)
     # Colab/IPython safe parsing
@@ -85,6 +98,13 @@ def parse_args():
     if args.no_ar: g['RUN_AR'] = False
     if args.ar: g['RUN_AR'] = True
     if args.data_mode: g['DATA_MODE'] = args.data_mode
+    if args.no_curriculum: g['RUN_CURRICULUM'] = False
+    if args.curriculum:
+        modes = []
+        for pct in args.curriculum:
+            p_int = int(pct); frac = p_int / 100.0
+            modes.append((f'puma2rand_{p_int}', [(0.0, 'puma'), (frac, 'random')]))
+        g['CURRICULUM_MODES'] = modes
     return args
 
 
@@ -610,12 +630,99 @@ def simulate_puma_coverage(model, tokenizer, test_samples, fmt, max_len,
     return {'per_position': per_pos, 'corr': corr}
 
 
+def analyse_error_localization(per_sample, fmt):
+    """Where in the chain do errors occur? Maps errors to chain structure.
+    Returns: {overflow_errors, chain_top_errors, chain_mid_errors,
+              chain_bottom_errors, gk_errors} as fractions of total errors.
+    """
+    cats = defaultdict(int); total_errs = 0
+    for r in per_sample:
+        if r['correct']: continue
+        gkp = r['gkp_at_pos']; cs = r['chain_stats']; dep = r['dep_ctx']
+        for j in r['error_positions']:
+            if j >= len(gkp): continue
+            total_errs += 1
+            if gkp[j] == 'carry_out': cats['overflow'] += 1
+            elif gkp[j] in ('g', 'k'): cats['gk_position'] += 1
+            elif dep[j] == 'p_bottom': cats['p_chain_bottom'] += 1
+            elif dep[j] == 'p_above_g': cats['p_above_g'] += 1
+            elif dep[j] == 'p_above_k': cats['p_above_k'] += 1
+            elif dep[j] == 'p_above_p': cats['p_chain_interior'] += 1
+    if total_errs == 0: return {'total_errors': 0}
+    return {'total_errors': total_errs,
+            **{k: v/total_errs for k, v in sorted(cats.items())}}
+
+
+@torch.no_grad()
+def analyse_confidence_calibration(model, tokenizer, test_samples, fmt, max_len,
+                                   decode_policy='confidence', device=None):
+    """When the model is wrong, is it confident or uncertain?
+    Returns per-chain-length: mean confidence for correct/incorrect predictions.
+    """
+    if device is None: device = DEVICE
+    model.eval(); mask_id = tokenizer.special_ids['mask']
+    pad_id = tokenizer.special_ids['pad']
+    by_cl = defaultdict(lambda: {'conf_correct': [], 'conf_wrong': []})
+
+    for st in range(0, len(test_samples), 128):
+        batch = test_samples[st:min(st+128, len(test_samples))]; B = len(batch)
+        penc = [tokenizer.encode(s.split('=')[0]+'=') for s in batch]
+        pm = max(len(p) for p in penc)
+        pids = torch.full((B, pm), pad_id, dtype=torch.long)
+        for i, e in enumerate(penc): pids[i, :len(e)] = torch.tensor(e)
+
+        # Single forward pass with all answer positions masked
+        full_enc = [tokenizer.encode(s) for s in batch]
+        ml = max(len(e) for e in full_enc)
+        ids = torch.full((B, ml), pad_id, dtype=torch.long, device=device)
+        for i, e in enumerate(full_enc):
+            ids[i, :len(e)] = torch.tensor(e, device=device)
+        ans_starts = torch.tensor([s.index('=')+1 for s in batch], device=device)
+        _ar = torch.arange(ANS_LEN, device=device)
+        ap = (ans_starts.unsqueeze(1) + _ar).clamp(max=ml-1)
+        bi = torch.arange(B, device=device).unsqueeze(1).expand_as(ap)
+        xm = ids.clone(); xm[bi, ap] = mask_id
+        logits = model(xm); al = logits[bi, ap]
+        cl = al.clone(); cl[:, :, mask_id] = -float('inf')
+        probs = F.softmax(cl, dim=-1)
+        confs = probs.max(dim=-1).values; preds = cl.argmax(dim=-1)
+        tgt = ids[bi, ap]; correct = (preds == tgt)
+
+        for i in range(B):
+            a, b = _parse_operands(batch[i])
+            cs = _chain_stats(a, b)
+            mcl = cs['max_chain_len']
+            cl_bin = 0 if mcl == 0 else (2 if mcl <= 2 else (4 if mcl <= 4 else
+                     (8 if mcl <= 8 else (16 if mcl <= 16 else 32))))
+            for j in range(ANS_LEN):
+                c = confs[i, j].item()
+                if correct[i, j]: by_cl[cl_bin]['conf_correct'].append(c)
+                else: by_cl[cl_bin]['conf_wrong'].append(c)
+
+    result = {}
+    for cl_bin in sorted(by_cl):
+        cc = by_cl[cl_bin]['conf_correct']
+        cw = by_cl[cl_bin]['conf_wrong']
+        result[f'cl<={cl_bin}'] = {
+            'mean_conf_correct': sum(cc)/len(cc) if cc else None,
+            'mean_conf_wrong': sum(cw)/len(cw) if cw else None,
+            'n_correct': len(cc), 'n_wrong': len(cw),
+            'overconfident_wrong': sum(1 for c in cw if c > 0.8)/max(len(cw),1) if cw else None,
+        }
+    return result
+
+
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Training
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 def train_model(objective, tokenizer, train_samples, test_samples, max_len,
-                fmt, mask_type='random', device=None):
+                fmt, mask_type='random', curriculum=None, device=None):
+    """Train with optional curriculum schedule.
+    curriculum: None → use mask_type throughout
+                list of (frac, type) → switch at epoch = frac * MAX_EPOCHS
+                'interleaved' → alternate puma/random every batch
+    """
     if device is None: device = DEVICE
     train_ids, train_ans = encode_samples(train_samples, tokenizer, max_len)
     train_ids, train_ans = train_ids.to(device), train_ans.to(device)
@@ -626,7 +733,9 @@ def train_model(objective, tokenizer, train_samples, test_samples, max_len,
     model = Transformer(vocab_size=len(tokenizer), block_size=max_len+8,
                         n_layer=N_LAYER, n_head=N_HEAD, n_embd=N_EMBD,
                         dropout=DROPOUT, is_causal=is_causal, pos_enc=POS_ENC).to(device)
-    tag = objective + (f"/{mask_type}" if objective == 'diffusion' else "")
+    label = mask_type if not curriculum else (curriculum if isinstance(curriculum, str)
+             else '+'.join(f"{t}@{int(f*100)}%" for f, t in curriculum))
+    tag = objective + (f"/{label}" if objective == 'diffusion' else "")
     print(f"  [{tag}] params={model.n_params:,}, {bpe} batches/epoch, {MAX_EPOCHS} epochs")
     optimizer = torch.optim.AdamW(model.parameters(), lr=LR, betas=(0.9, 0.99), weight_decay=0.1)
     warmup_iters = WARMUP_EPOCHS * bpe
@@ -639,54 +748,54 @@ def train_model(objective, tokenizer, train_samples, test_samples, max_len,
     best_loss, best_state = float('inf'), None; it = 0; tg = 0; t0 = time.time()
     _arange = torch.arange(ANS_LEN, device=device)
 
-    # PUMA streaming buffer
-    uses_streaming = mask_type in ('puma', 'oracle_lsb')
-    if uses_streaming:
-        puma_x0 = torch.zeros(BATCH_SIZE, T, dtype=torch.long, device=device)
-        puma_z = torch.zeros(BATCH_SIZE, T, dtype=torch.long, device=device)
-        puma_ans = torch.zeros(BATCH_SIZE, dtype=torch.long, device=device)
-        puma_stage = torch.zeros(BATCH_SIZE, dtype=torch.long, device=device)
-        pool = torch.randperm(N); pool_ptr = 0
+    def _get_active_mask(epoch, batch_in_epoch=0):
+        """Determine which mask type to use right now."""
+        if curriculum is None: return mask_type
+        if curriculum == 'interleaved':
+            return 'puma' if batch_in_epoch % 2 == 0 else 'random'
+        # Schedule: list of (frac, type)
+        active = curriculum[0][1]
+        for frac, mt in curriculum:
+            if epoch >= frac * MAX_EPOCHS: active = mt
+        return active
 
-        def _refresh(indices):
-            nonlocal pool_ptr, pool
-            idx_t = torch.tensor(indices, device=device); n = len(indices)
-            if pool_ptr + n > len(pool): pool = torch.randperm(N); pool_ptr = 0
-            si = pool[pool_ptr:pool_ptr+n].to(device); pool_ptr += n
-            puma_x0[idx_t] = train_ids[si]; puma_z[idx_t] = train_ids[si].clone()
-            puma_ans[idx_t] = train_ans[si]; puma_stage[idx_t] = 0
-            ap = (puma_ans[idx_t].unsqueeze(1) + _arange).clamp(max=T-1)
-            bii = idx_t.unsqueeze(1).expand_as(ap)
-            puma_z[bii, ap] = mask_id
+    # PUMA streaming buffer (always allocate; only used when active_mask is puma)
+    puma_x0 = torch.zeros(BATCH_SIZE, T, dtype=torch.long, device=device)
+    puma_z = torch.zeros(BATCH_SIZE, T, dtype=torch.long, device=device)
+    puma_ans = torch.zeros(BATCH_SIZE, dtype=torch.long, device=device)
+    puma_stage = torch.zeros(BATCH_SIZE, dtype=torch.long, device=device)
+    pool = torch.randperm(N); pool_ptr = 0
+    puma_initialized = False
 
-        def _advance(logits, K_cur):
-            nonlocal puma_stage
-            B = BATCH_SIZE; ap = (puma_ans.unsqueeze(1) + _arange).clamp(max=T-1)
-            bi = torch.arange(B, device=device).unsqueeze(1).expand_as(ap)
-            is_m = (puma_z[bi, ap] == mask_id)
-            if not is_m.any(): _refresh(list(range(B))); return
-            nm = is_m.sum(dim=1).float()
-            K_rem = (K_cur - puma_stage).clamp(min=1)
-            nr = (nm / K_rem.float()).ceil().long().clamp(min=1)
-            if mask_type == 'puma':
-                lp = logits[bi, ap].clone(); lp[:, :, mask_id] = -float('inf')
-                confs = F.softmax(lp, dim=-1).max(dim=-1).values; confs[~is_m] = -float('inf')
-                ranked = confs.argsort(dim=1, descending=True)
-                rop = torch.zeros_like(ranked); rop.scatter_(1, ranked, _arange.expand(B, -1))
-                reveal = ((rop < nr.unsqueeze(1)) | (confs > PUMA_TAU)) & is_m
-            else:  # oracle_lsb
-                if fmt == 'plain': priority = torch.arange(ANS_LEN, device=device).expand(B, -1).float()
-                else: priority = -torch.arange(ANS_LEN, device=device).expand(B, -1).float()
-                priority[~is_m] = -float('inf')
-                ranked = priority.argsort(dim=1, descending=True)
-                rop = torch.zeros_like(ranked); rop.scatter_(1, ranked, _arange.expand(B, -1))
-                reveal = (rop < nr.unsqueeze(1)) & is_m
-            puma_z[bi[reveal], ap[reveal]] = puma_x0[bi[reveal], ap[reveal]]
-            puma_stage += 1
-            done = (~(puma_z[bi, ap] == mask_id).any(dim=1)) | (puma_stage >= K_cur)
-            if done.any(): _refresh(done.nonzero(as_tuple=True)[0].tolist())
+    def _refresh(indices):
+        nonlocal pool_ptr, pool
+        idx_t = torch.tensor(indices, device=device); n = len(indices)
+        if pool_ptr + n > len(pool): pool = torch.randperm(N); pool_ptr = 0
+        si = pool[pool_ptr:pool_ptr+n].to(device); pool_ptr += n
+        puma_x0[idx_t] = train_ids[si]; puma_z[idx_t] = train_ids[si].clone()
+        puma_ans[idx_t] = train_ans[si]; puma_stage[idx_t] = 0
+        ap = (puma_ans[idx_t].unsqueeze(1) + _arange).clamp(max=T-1)
+        bii = idx_t.unsqueeze(1).expand_as(ap)
+        puma_z[bii, ap] = mask_id
 
-        _refresh(list(range(BATCH_SIZE)))
+    def _advance(logits, K_cur):
+        nonlocal puma_stage
+        B = BATCH_SIZE; ap = (puma_ans.unsqueeze(1) + _arange).clamp(max=T-1)
+        bi = torch.arange(B, device=device).unsqueeze(1).expand_as(ap)
+        is_m = (puma_z[bi, ap] == mask_id)
+        if not is_m.any(): _refresh(list(range(B))); return
+        nm = is_m.sum(dim=1).float()
+        K_rem = (K_cur - puma_stage).clamp(min=1)
+        nr = (nm / K_rem.float()).ceil().long().clamp(min=1)
+        lp = logits[bi, ap].clone(); lp[:, :, mask_id] = -float('inf')
+        confs = F.softmax(lp, dim=-1).max(dim=-1).values; confs[~is_m] = -float('inf')
+        ranked = confs.argsort(dim=1, descending=True)
+        rop = torch.zeros_like(ranked); rop.scatter_(1, ranked, _arange.expand(B, -1))
+        reveal = ((rop < nr.unsqueeze(1)) | (confs > PUMA_TAU)) & is_m
+        puma_z[bi[reveal], ap[reveal]] = puma_x0[bi[reveal], ap[reveal]]
+        puma_stage += 1
+        done = (~(puma_z[bi, ap] == mask_id).any(dim=1)) | (puma_stage >= K_cur)
+        if done.any(): _refresh(done.nonzero(as_tuple=True)[0].tolist())
 
     def _do_eval(epoch):
         nonlocal best_loss, best_state
@@ -711,14 +820,30 @@ def train_model(objective, tokenizer, train_samples, test_samples, max_len,
             print(f"      [gen] {dp}={r['accuracy']:.3f}")
 
     model.eval(); _do_eval(0); model.train()
+    prev_active = None
 
     for epoch in range(1, MAX_EPOCHS + 1):
         epoch_loss = torch.tensor(0.0, device=device); epoch_tg = 0; epoch_n = 0
-        K_cur = PUMA_K_START + int((PUMA_K_END - PUMA_K_START) * epoch / MAX_EPOCHS) if uses_streaming else 0
+        K_cur = PUMA_K_START + int((PUMA_K_END - PUMA_K_START) * epoch / MAX_EPOCHS)
 
-        if uses_streaming:
-            for _ in range(bpe):
-                for pg in optimizer.param_groups: pg['lr'] = get_lr(it)
+        perm = torch.randperm(N, device=device)
+        for bi_idx in range(bpe):
+            active = _get_active_mask(epoch, bi_idx)
+
+            # Initialize PUMA buffer on first use or re-entry
+            if active == 'puma' and not puma_initialized:
+                _refresh(list(range(BATCH_SIZE))); puma_initialized = True
+            if active != prev_active and prev_active is not None:
+                phase_str = f"[→{active}]" if active != prev_active else ""
+                if phase_str:
+                    print(f"    ep {epoch}: switching to {active}")
+                if active == 'puma' and not puma_initialized:
+                    _refresh(list(range(BATCH_SIZE))); puma_initialized = True
+            prev_active = active
+
+            for pg in optimizer.param_groups: pg['lr'] = get_lr(it)
+
+            if active == 'puma':
                 m = (puma_z == mask_id)
                 if m.sum() == 0: _refresh(list(range(BATCH_SIZE))); m = (puma_z == mask_id)
                 logits = model(puma_z); loss = F.cross_entropy(logits[m], puma_x0[m])
@@ -726,38 +851,37 @@ def train_model(objective, tokenizer, train_samples, test_samples, max_len,
                 optimizer.zero_grad(set_to_none=True); loss.backward()
                 nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP); optimizer.step()
                 _advance(logits.detach(), K_cur)
-                epoch_loss += loss.detach(); epoch_n += 1; it += 1
-        else:
-            perm = torch.randperm(N, device=device)
-            for bi in range(bpe):
-                for pg in optimizer.param_groups: pg['lr'] = get_lr(it)
-                idx = perm[bi*BATCH_SIZE:min((bi+1)*BATCH_SIZE, N)]
+            elif objective == 'ar':
+                idx = perm[bi_idx*BATCH_SIZE:min((bi_idx+1)*BATCH_SIZE, N)]
                 ids = train_ids[idx]; ans_s = train_ans[idx]; B_b = ids.shape[0]
-                if objective == 'ar':
-                    logits = model(ids[:, :-1]); targets = ids[:, 1:]
-                    pos = torch.arange(T-1, device=device).unsqueeze(0)
-                    lm = (pos >= (ans_s.unsqueeze(1) - 1)) & (targets != pad_id)
-                    if lm.sum() == 0: it += 1; continue
-                    loss = F.cross_entropy(logits[lm], targets[lm]); epoch_tg += lm.sum().item()
-                else:
-                    ap = (ans_s.unsqueeze(1) + _arange).clamp(max=T-1)
-                    bii = torch.arange(B_b, device=device).unsqueeze(1).expand_as(ap)
-                    ans_mask = torch.zeros(B_b, T, dtype=torch.bool, device=device)
-                    for j in range(ANS_LEN): ans_mask[range(B_b), ap[:, j]] = True
-                    t_r = torch.rand(B_b, device=device)
-                    m_probs = t_r.unsqueeze(1) * ans_mask.float()
-                    m = torch.bernoulli(m_probs).bool()
-                    no_m = ~m.any(dim=1)
-                    if no_m.any():
-                        rj = torch.randint(ANS_LEN, (no_m.sum(),), device=device)
-                        fp = ap[no_m].gather(1, rj.unsqueeze(1)).squeeze(1)
-                        m[no_m.nonzero(as_tuple=True)[0], fp] = True
-                    xm = ids.clone(); xm[m] = mask_id; logits = model(xm)
-                    if m.sum() == 0: it += 1; continue
-                    loss = F.cross_entropy(logits[m], ids[m]); epoch_tg += m.sum().item()
+                logits = model(ids[:, :-1]); targets = ids[:, 1:]
+                pos = torch.arange(T-1, device=device).unsqueeze(0)
+                lm = (pos >= (ans_s.unsqueeze(1) - 1)) & (targets != pad_id)
+                if lm.sum() == 0: it += 1; continue
+                loss = F.cross_entropy(logits[lm], targets[lm]); epoch_tg += lm.sum().item()
                 optimizer.zero_grad(set_to_none=True); loss.backward()
                 nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP); optimizer.step()
-                epoch_loss += loss.detach(); epoch_n += 1; it += 1
+            else:  # random masking
+                idx = perm[bi_idx*BATCH_SIZE:min((bi_idx+1)*BATCH_SIZE, N)]
+                ids = train_ids[idx]; ans_s = train_ans[idx]; B_b = ids.shape[0]
+                ap = (ans_s.unsqueeze(1) + _arange).clamp(max=T-1)
+                bii = torch.arange(B_b, device=device).unsqueeze(1).expand_as(ap)
+                ans_mask = torch.zeros(B_b, T, dtype=torch.bool, device=device)
+                for j in range(ANS_LEN): ans_mask[range(B_b), ap[:, j]] = True
+                t_r = torch.rand(B_b, device=device)
+                m_probs = t_r.unsqueeze(1) * ans_mask.float()
+                m = torch.bernoulli(m_probs).bool()
+                no_m = ~m.any(dim=1)
+                if no_m.any():
+                    rj = torch.randint(ANS_LEN, (no_m.sum(),), device=device)
+                    fp = ap[no_m].gather(1, rj.unsqueeze(1)).squeeze(1)
+                    m[no_m.nonzero(as_tuple=True)[0], fp] = True
+                xm = ids.clone(); xm[m] = mask_id; logits = model(xm)
+                if m.sum() == 0: it += 1; continue
+                loss = F.cross_entropy(logits[m], ids[m]); epoch_tg += m.sum().item()
+                optimizer.zero_grad(set_to_none=True); loss.backward()
+                nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP); optimizer.step()
+            epoch_loss += loss.detach(); epoch_n += 1; it += 1
 
         tg += epoch_tg
         if epoch % LOG_EVERY == 0:
@@ -1058,6 +1182,33 @@ def run(tag=''):
             print(f"    CF: flip={cfr['prediction_flip_rate']:.3f} acc(c=0)={cfr['acc_carry_in_0']:.3f} "
                   f"acc(c=1)={cfr['acc_carry_in_1']:.3f}")
 
+            # ── Error localization on chain sweep failures ──
+            print(f"  Error localization...")
+            for min_cl in [4, 8, 12, 16, 20, 24]:
+                if min_cl > ND: continue
+                cc = gen_min_chain_test(500, fmt, seed=6500+min_cl, min_chain=min_cl)
+                if not cc: continue
+                ps = gen_eval_with_stats(m, tok, cc, fmt, max_len, decode_policy='confidence', device=DEVICE)
+                el = analyse_error_localization(ps, fmt)
+                key = _fk('diffusion', fmt, mt, f'error_loc_{min_cl}')
+                all_final[key] = el
+                if el['total_errors'] > 0:
+                    parts = [f"{k}={v:.2f}" for k, v in el.items() if k != 'total_errors' and isinstance(v, float)]
+                    print(f"    chain>={min_cl}: {el['total_errors']} errors — {' '.join(parts)}")
+
+            # ── Confidence calibration ──
+            print(f"  Confidence calibration...")
+            # Use heavy + chain sweep samples for enough wrong predictions
+            cal_samples = gen_carry_heavy_test(N_TEST, fmt, seed=7000, min_max_chain=3)
+            cal = analyse_confidence_calibration(m, tok, cal_samples, fmt, max_len, device=DEVICE)
+            all_final[_fk('diffusion', fmt, mt, 'calibration')] = cal
+            for cl_bin, info in cal.items():
+                mc = info['mean_conf_correct']; mw = info['mean_conf_wrong']
+                oc = info.get('overconfident_wrong')
+                if mw is not None:
+                    print(f"    {cl_bin}: conf_ok={mc:.3f} conf_err={mw:.3f} "
+                          f"overconf={oc:.1%} (n_err={info['n_wrong']})")
+
             # Carry rarity
             ps_conf = gen_eval_with_stats(m, tok, test_data, fmt, max_len, decode_policy='confidence', device=DEVICE)
             rarity = analyse_carry_rarity(ps_conf, test_data, fmt)
@@ -1079,6 +1230,41 @@ def run(tag=''):
 
             del m; torch.cuda.empty_cache() if torch.cuda.is_available() else None
 
+        # ── Curriculum training (PUMA→Random switchover sweep) ──
+        if RUN_CURRICULUM:
+            print(f"\n{'━'*60}\n  Curriculum Training\n{'━'*60}")
+            for cur_label, cur_schedule in CURRICULUM_MODES:
+                kb = _fk('diffusion', fmt, cur_label, 'confidence')
+                print(f"\n▶ curriculum: {cur_label}")
+                m, d = train_model('diffusion', tok, train_data, test_data, max_len,
+                                   fmt, mask_type='puma', curriculum=cur_schedule, device=DEVICE)
+                all_dyn[kb] = d
+                # Eval: standard + corner + chain sweep
+                for dp in DECODE_POLICIES:
+                    for name, data in [('standard', test_data)]:
+                        ps = gen_eval_with_stats(m, tok, data, fmt, max_len, decode_policy=dp, device=DEVICE)
+                        acc = sum(r['correct'] for r in ps) / len(ps)
+                        key = _fk('diffusion', fmt, cur_label, f'{name}_{dp}')
+                        all_final[key] = {'accuracy': acc, 'n': len(ps)}
+                        print(f"    {name} {dp}: {acc:.4f}")
+                for cat in ['msb_chain', 'full_propagate']:
+                    cc = gen_corner_case_test(N_TEST, fmt, seed=6000, category=cat)
+                    if not cc: continue
+                    for dp in DECODE_POLICIES:
+                        ps = gen_eval_with_stats(m, tok, cc, fmt, max_len, decode_policy=dp, device=DEVICE)
+                        acc = sum(r['correct'] for r in ps) / len(ps)
+                        all_final[_fk('diffusion', fmt, cur_label, f'corner_{cat}_{dp}')] = {'accuracy': acc, 'n': len(cc)}
+                        print(f"    corner/{cat} {dp}: {acc:.4f}")
+                for min_cl in sweep_lengths:
+                    cc = gen_min_chain_test(sweep_n, fmt, seed=6500+min_cl, min_chain=min_cl)
+                    if not cc: continue
+                    ps = gen_eval_with_stats(m, tok, cc, fmt, max_len, decode_policy='confidence', device=DEVICE)
+                    acc = sum(r['correct'] for r in ps) / len(ps)
+                    all_final[_fk('diffusion', fmt, cur_label, f'chain_sweep_{min_cl}_confidence')] = {
+                        'accuracy': acc, 'n': len(cc), 'min_chain': min_cl}
+                    print(f"    chain>={min_cl:2d}: {acc:.4f}")
+                del m; torch.cuda.empty_cache() if torch.cuda.is_available() else None
+
         # Figures
         figs = make_figures(all_dyn, all_final, fmt)
 
@@ -1094,28 +1280,40 @@ def run(tag=''):
     # Summary
     print(f"\n{'='*70}\n  SUMMARY\n{'='*70}")
     for fmt in FORMATS:
+        all_conditions = list(MASK_TYPES)
+        if RUN_CURRICULUM:
+            all_conditions += [c[0] for c in CURRICULUM_MODES]
         print(f"\n  ── {fmt} ──")
         print(f"  {'Test':<35s}", end='')
-        for mt in MASK_TYPES: print(f" {mt:>10s}", end='')
+        for mt in all_conditions: print(f" {mt:>12s}", end='')
         print()
         for dp in DECODE_POLICIES:
             for tt in ['standard', 'heavy', 'corner_msb_chain', 'corner_full_propagate']:
-                key_parts = [_fk('diffusion', fmt, mt, f'{tt}_{dp}') for mt in MASK_TYPES]
+                key_parts = [_fk('diffusion', fmt, mt, f'{tt}_{dp}') for mt in all_conditions]
                 accs = [all_final.get(k, {}).get('accuracy') for k in key_parts]
                 if any(a is not None for a in accs):
                     print(f"  {tt+'_'+dp:<35s}", end='')
-                    for a in accs: print(f" {a:>10.4f}" if a is not None else f" {'N/A':>10s}", end='')
+                    for a in accs: print(f" {a:>12.4f}" if a is not None else f" {'N/A':>12s}", end='')
                     print()
             # Chain sweep
             for min_cl in [2, 3, 4, 6, 8, 12, 16, 20, 24, 28]:
-                key_parts = [_fk('diffusion', fmt, mt, f'chain_sweep_{min_cl}_{dp}') for mt in MASK_TYPES]
+                key_parts = [_fk('diffusion', fmt, mt, f'chain_sweep_{min_cl}_{dp}') for mt in all_conditions]
                 accs = [all_final.get(k, {}).get('accuracy') for k in key_parts]
                 if any(a is not None for a in accs):
                     print(f"  {'chain>='+str(min_cl)+'_'+dp:<35s}", end='')
-                    for a in accs: print(f" {a:>10.4f}" if a is not None else f" {'N/A':>10s}", end='')
-                    d = (accs[0] or 0) - (accs[1] or 0) if len(accs) >= 2 and all(a is not None for a in accs) else None
-                    if d is not None: print(f"  Δ={d:+.4f}", end='')
+                    for a in accs: print(f" {a:>12.4f}" if a is not None else f" {'N/A':>12s}", end='')
                     print()
+
+        # Error localization summary
+        print(f"\n  ── Error Localization ──")
+        for mt in MASK_TYPES:
+            print(f"  {mt}:")
+            for min_cl in [4, 8, 12, 16, 20, 24]:
+                el = all_final.get(_fk('diffusion', fmt, mt, f'error_loc_{min_cl}'))
+                if el and el.get('total_errors', 0) > 0:
+                    parts = [f"{k}={v:.2f}" for k, v in el.items() if k != 'total_errors' and isinstance(v, float)]
+                    print(f"    cl>={min_cl}: n={el['total_errors']} {' '.join(parts)}")
+
     return all_dyn, all_final
 
 
