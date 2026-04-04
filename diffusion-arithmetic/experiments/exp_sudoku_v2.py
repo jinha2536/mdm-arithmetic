@@ -36,7 +36,7 @@ EXP_NAME = 'exp_sudoku_v2'
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 ANS_LEN = 81
 
-# Data — 4-tier curriculum (like a math problem set)
+# Data — training distribution
 TRAIN_DIST = {
     'easy':    500000,   # rating = 0, CP-solvable (bulk)
     'medium':  500000,   # rating 1-9, light search
@@ -44,6 +44,7 @@ TRAIN_DIST = {
     'extreme':  50000,   # rating 100-999, deep search
     'nightmare': 5000,   # rating 1000+, very deep (rare, ~0.4%)
 }
+TRAIN_MODE = 'balanced'  # 'balanced' (use TRAIN_DIST as-is) or 'natural' (easy/medium only)
 N_TEST_PER_TIER = 500
 DATA_SOURCE = 'hf'      # 'hf', 'csv', 'generate'
 CSV_PATH = ''
@@ -81,6 +82,8 @@ def parse_args():
     p.add_argument('--n-medium', type=int, default=None)
     p.add_argument('--n-hard', type=int, default=None)
     p.add_argument('--n-extreme', type=int, default=None)
+    p.add_argument('--n-nightmare', type=int, default=None)
+    p.add_argument('--train-mode', choices=['balanced', 'natural'], default=None)
     p.add_argument('--n-test', type=int, default=None)
     p.add_argument('--max-iters', type=int, default=None)
     p.add_argument('--batch-size', type=int, default=None)
@@ -113,6 +116,16 @@ def parse_args():
     if args.n_medium is not None: g['TRAIN_DIST']['medium'] = args.n_medium
     if args.n_hard is not None: g['TRAIN_DIST']['hard'] = args.n_hard
     if args.n_extreme is not None: g['TRAIN_DIST']['extreme'] = args.n_extreme
+    if args.n_nightmare is not None: g['TRAIN_DIST']['nightmare'] = args.n_nightmare
+    if args.train_mode:
+        g['TRAIN_MODE'] = args.train_mode
+        if args.train_mode == 'natural':
+            # Override: only easy + medium for training (OOD test on hard+)
+            g['TRAIN_DIST'] = {
+                'easy': g['TRAIN_DIST'].get('easy', 800000),
+                'medium': g['TRAIN_DIST'].get('medium', 200000),
+                'hard': 0, 'extreme': 0, 'nightmare': 0,
+            }
     if args.masks: g['MASK_TYPES'] = args.masks
     if args.decode: g['DECODE_POLICIES'] = args.decode
     return args
@@ -436,7 +449,19 @@ def load_hf_data(train_dist, n_test, seed=42, cache_dir='.sudoku_cache'):
     for tier_name, (lo, hi) in RATING_TIERS.items():
         samples = _sample_by_rating(test_raw, lo, hi, n_test, rng2)
         if not samples:
+            print(f"    → fallback to train set for {tier_name}")
             samples = _sample_by_rating(train_raw, lo, hi, n_test, rng2)
+        if not samples and tier_name == 'nightmare':
+            # Last resort: take highest-rated puzzles from any available data
+            print(f"    → nightmare fallback: taking top-rated from all data")
+            all_ratings = train_raw['rating']
+            top_idx = sorted(range(len(all_ratings)), key=lambda i: all_ratings[i], reverse=True)[:n_test]
+            if top_idx:
+                rows = train_raw.select(top_idx)
+                samples = [(rows[i]['question'], rows[i]['answer'], rows[i]['rating'],
+                           rows[i].get('source', '')) for i in range(len(rows))]
+                min_r = min(s[2] for s in samples) if samples else 0
+                print(f"    → got {len(samples)} puzzles, min_rating={min_r}")
         test_tiers[tier_name] = samples
 
     total = sum(tier_counts.values())
@@ -1049,11 +1074,26 @@ def evaluate(model, tokenizer, test_data, decode_policy='confidence',
                                if not r['meta'][j]['is_given'])
                            for r in tier_r) / max(sum(r['n_blanks'] for r in tier_r), 1),
                 'n': len(tier_r),
+                'mean_blanks': sum(r['n_blanks'] for r in tier_r) / len(tier_r),
+            }
+
+    # Per n_blanks bin
+    blanks_acc = {}
+    blank_bins = [(20, 35), (36, 45), (46, 55), (56, 65)]
+    for lo_b, hi_b in blank_bins:
+        bin_r = [r for r in results if lo_b <= r['n_blanks'] <= hi_b]
+        if bin_r:
+            blanks_acc[f'{lo_b}-{hi_b}'] = {
+                'exact': sum(r['correct'] for r in bin_r) / len(bin_r),
+                'cell': sum(sum(r['pos_correct'][j] for j in range(81)
+                               if not r['meta'][j]['is_given'])
+                           for r in bin_r) / max(sum(r['n_blanks'] for r in bin_r), 1),
+                'n': len(bin_r),
             }
 
     return {'accuracy': acc, 'blank_cell_acc': bl_acc, 'n': n,
             'category_accuracy': cat_acc, 'guess_accuracy': guess_acc,
-            'rating_accuracy': rating_acc}
+            'rating_accuracy': rating_acc, 'blanks_accuracy': blanks_acc}
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -1582,7 +1622,7 @@ def run(tag=''):
     print(f"  {exp_name}")
     dist_str = ' '.join(f"{k}={v}" for k, v in TRAIN_DIST.items())
     print(f"  Model: {N_LAYER}L/{N_EMBD}D/{N_HEAD}H  Train: {dist_str} (total={sum(TRAIN_DIST.values())})")
-    print(f"  Training: {MAX_ITERS} iters, batch={BATCH_SIZE}")
+    print(f"  Training mode: {TRAIN_MODE}  Iters: {MAX_ITERS}, batch={BATCH_SIZE}")
     print(f"  Masks: {MASK_TYPES}  Decode: {DECODE_POLICIES}")
     print(f"  PUMA: K={PUMA_K}, tau={PUMA_TAU}")
     print(f"{'='*70}")
@@ -1644,7 +1684,12 @@ def run(tag=''):
                 print(f"    Guess: {' '.join(parts)}")
             ra = r.get('rating_accuracy', {})
             for tn, info in ra.items():
-                print(f"    {tn}: exact={info['exact']:.4f} cell={info['cell']:.4f} (n={info['n']})")
+                print(f"    {tn}: exact={info['exact']:.4f} cell={info['cell']:.4f} "
+                      f"(n={info['n']}, blanks={info.get('mean_blanks', '?'):.1f})")
+            ba = r.get('blanks_accuracy', {})
+            if ba:
+                parts = [f"bl{k}={v['cell']:.3f}(n={v['n']})" for k, v in ba.items()]
+                print(f"    Blanks: {' '.join(parts)}")
 
         # ── Selective masking ──
         print(f"  Selective masking probe...")
@@ -1704,31 +1749,57 @@ def run(tag=''):
             for cn, info in cov.items():
                 print(f"    {cn}: coverage={info['coverage']:.3f} (n={info['n']})")
 
+        # ── Probe vs Generation gap ──
+        print(f"  Probe vs Generation gap...")
+        last_probe = dyn['checkpoints'][-1] if dyn['checkpoints'] else {}
+        gen_conf = all_results.get(f'{mt}_confidence', {})
+        probe_dc = last_probe.get('depth_context', {})
+        gen_ca = gen_conf.get('category_accuracy', {})
+        if probe_dc and gen_ca:
+            print(f"    {'Category':<18s} {'probe_acc':>10s} {'gen_cell':>10s} {'gap':>10s}")
+            for cat in DEPTH_CATS:
+                if cat == 'given': continue
+                p_acc = probe_dc.get(cat, {}).get('mean_acc')
+                g_acc = gen_ca.get(cat)
+                if p_acc is not None and g_acc is not None:
+                    gap = p_acc - g_acc
+                    print(f"    {cat:<18s} {p_acc:>10.4f} {g_acc:>10.4f} {gap:>+10.4f}")
+            all_results[f'{mt}_probe_vs_gen'] = {
+                cat: {'probe': probe_dc.get(cat, {}).get('mean_acc'),
+                      'gen': gen_ca.get(cat)}
+                for cat in DEPTH_CATS if cat != 'given'
+            }
+
         del model; torch.cuda.empty_cache() if torch.cuda.is_available() else None
 
     # ── Figures ──
     print(f"\n{'='*70}\n  Generating figures...\n{'='*70}")
     figs = make_figures(all_results, all_dyn, corr)
 
-    # ── Summary table ──
-    print(f"\n{'='*70}\n  SUMMARY — Rating-Stratified Accuracy (exact match)\n{'='*70}")
-    header = f"  {'Condition':<25}"
-    for tn in RATING_TIERS:
-        has = any(tn in all_results.get(f'{mt}_{dp}', {}).get('rating_accuracy', {})
-                  for mt in MASK_TYPES for dp in DECODE_POLICIES)
-        if has: header += f" {tn:>10}"
-    print(header)
-    print(f"  {'─'*70}")
-    for mt in MASK_TYPES:
-        for dp in DECODE_POLICIES:
-            key = f'{mt}_{dp}'
-            r = all_results.get(key)
-            if not r: continue
-            row = f"  {key:<25}"
-            for tn in RATING_TIERS:
-                ra = r.get('rating_accuracy', {}).get(tn)
-                if ra: row += f" {ra['exact']:>10.4f}"
-            print(row)
+    # ── Summary table (exact match + cell accuracy) ──
+    print(f"\n{'='*70}\n  SUMMARY — Rating-Stratified (mode={TRAIN_MODE})\n{'='*70}")
+    for dp in ['confidence']:
+        print(f"\n  decode={dp}:")
+        print(f"  {'Tier':<12} {'n_blanks':>8}", end='')
+        for mt in MASK_TYPES: print(f"  {mt+'_exact':>12} {mt+'_cell':>12}", end='')
+        print()
+        print(f"  {'─'*80}")
+        for tn in RATING_TIERS:
+            has_data = False
+            row_parts = []
+            mean_bl = '?'
+            for mt in MASK_TYPES:
+                ra = all_results.get(f'{mt}_{dp}', {}).get('rating_accuracy', {}).get(tn)
+                if ra:
+                    has_data = True
+                    mean_bl = f"{ra.get('mean_blanks', 0):.0f}"
+                    row_parts.append(f"  {ra['exact']:>12.4f} {ra['cell']:>12.4f}")
+                else:
+                    row_parts.append(f"  {'N/A':>12} {'N/A':>12}")
+            if has_data:
+                print(f"  {tn:<12} {mean_bl:>8}", end='')
+                for p in row_parts: print(p, end='')
+                print()
 
     # ── Hard fraction sweep (generalization boundary) ──
     hard_fracs = [0.3, 0.5, 0.7, 0.8, 0.9, 0.95, 1.0]
@@ -1790,8 +1861,30 @@ def run(tag=''):
                 row += f" {v:>12.4f}" if v is not None else f" {'N/A':>12}"
             print(row)
 
+    # ── Probe vs Generation Gap ──
+    has_pvg = any(f'{mt}_probe_vs_gen' in all_results for mt in MASK_TYPES)
+    if has_pvg:
+        print(f"\n{'='*70}\n  Probe vs Generation Gap (what model knows vs what it outputs)\n{'='*70}")
+        cats_show = [c for c in DEPTH_CATS if c != 'given']
+        print(f"  {'Category':<18s}", end='')
+        for mt in MASK_TYPES:
+            print(f"  {mt+'_probe':>12} {mt+'_gen':>12} {mt+'_gap':>10}", end='')
+        print()
+        print(f"  {'─'*90}")
+        for cat in cats_show:
+            print(f"  {cat:<18s}", end='')
+            for mt in MASK_TYPES:
+                pvg = all_results.get(f'{mt}_probe_vs_gen', {}).get(cat, {})
+                p = pvg.get('probe')
+                g = pvg.get('gen')
+                if p is not None and g is not None:
+                    print(f"  {p:>12.4f} {g:>12.4f} {p-g:>+10.4f}", end='')
+                else:
+                    print(f"  {'N/A':>12} {'N/A':>12} {'':>10}", end='')
+            print()
+
     # ── Save ──
-    sd = {'config': {k: globals()[k] for k in ['TRAIN_DIST',
+    sd = {'config': {k: globals()[k] for k in ['TRAIN_DIST', 'TRAIN_MODE',
            'N_LAYER', 'N_EMBD', 'N_HEAD', 'MAX_ITERS', 'BATCH_SIZE',
            'MASK_TYPES', 'DECODE_POLICIES', 'PUMA_K', 'PUMA_TAU']}}
     for k, v in all_results.items(): sd[f'result_{k}'] = v
