@@ -37,14 +37,10 @@ EXP_NAME = 'exp_sudoku_v2'
 ANS_LEN = 81
 
 # Data — training distribution
-TRAIN_DIST = {
-    'easy':    500000,   # rating = 0, CP-solvable (bulk)
-    'medium':  500000,   # rating 1-9, light search
-    'hard':    300000,   # rating 10-99, moderate search
-    'extreme':  50000,   # rating 100-999, deep search
-    'nightmare': 5000,   # rating 1000+, very deep (rare, ~0.4%)
-}
-TRAIN_MODE = 'balanced'  # 'balanced' (use TRAIN_DIST as-is) or 'natural' (easy/medium only)
+# DIFFICULTY_DECAY controls the rarity gradient:
+#   None → use all available data per tier (balanced, like carry-balanced addition)
+#   0.1  → easy,medium at 100%, then hard×0.1, very_hard×0.01, ... (like natural addition)
+DIFFICULTY_DECAY = None
 N_TEST_PER_TIER = 500
 DATA_SOURCE = 'hf'      # 'hf', 'csv', 'generate'
 CSV_PATH = ''
@@ -65,10 +61,11 @@ DECODE_POLICIES = ['confidence', 'oracle_solver', 'random']
 PUMA_TAU = 0.9; PUMA_K = 8
 SEED = 42
 
-# Rating tiers for analysis (matches TRAIN_DIST keys + nightmare)
+# Rating tiers — auto-determined from data via _compute_rating_tiers()
+# Fallback fixed tiers (overridden by actual data distribution)
 RATING_TIERS = {
-    'easy': (0, 0), 'medium': (1, 9), 'hard': (10, 99),
-    'extreme': (100, 999), 'nightmare': (1000, 99999),
+    'easy': (0, 0), 'medium': (1, 9), 'hard': (10, 49),
+    'very_hard': (50, 149), 'extreme': (150, 99999),
 }
 
 
@@ -77,13 +74,8 @@ def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument('--data-source', default=None, choices=['hf', 'csv', 'generate'])
     p.add_argument('--csv-path', default=None)
-    # 4-tier training distribution
-    p.add_argument('--n-easy', type=int, default=None)
-    p.add_argument('--n-medium', type=int, default=None)
-    p.add_argument('--n-hard', type=int, default=None)
-    p.add_argument('--n-extreme', type=int, default=None)
-    p.add_argument('--n-nightmare', type=int, default=None)
-    p.add_argument('--train-mode', choices=['balanced', 'natural'], default=None)
+    p.add_argument('--difficulty-decay', type=float, default=None,
+                   help='Exponential decay for hard tiers. None=balanced, 0.1=natural')
     p.add_argument('--n-test', type=int, default=None)
     p.add_argument('--max-iters', type=int, default=None)
     p.add_argument('--batch-size', type=int, default=None)
@@ -108,24 +100,10 @@ def parse_args():
                    'n_test': 'N_TEST_PER_TIER', 'max_iters': 'MAX_ITERS',
                    'batch_size': 'BATCH_SIZE', 'n_layer': 'N_LAYER', 'n_head': 'N_HEAD',
                    'n_embd': 'N_EMBD', 'dropout': 'DROPOUT', 'lr': 'LR',
-                   'puma_k': 'PUMA_K', 'puma_tau': 'PUMA_TAU', 'seed': 'SEED'}.items():
+                   'puma_k': 'PUMA_K', 'puma_tau': 'PUMA_TAU', 'seed': 'SEED',
+                   'difficulty_decay': 'DIFFICULTY_DECAY'}.items():
         v = getattr(args, a, None)
         if v is not None: g[gl] = v
-    # Update TRAIN_DIST per-tier
-    if args.n_easy is not None: g['TRAIN_DIST']['easy'] = args.n_easy
-    if args.n_medium is not None: g['TRAIN_DIST']['medium'] = args.n_medium
-    if args.n_hard is not None: g['TRAIN_DIST']['hard'] = args.n_hard
-    if args.n_extreme is not None: g['TRAIN_DIST']['extreme'] = args.n_extreme
-    if args.n_nightmare is not None: g['TRAIN_DIST']['nightmare'] = args.n_nightmare
-    if args.train_mode:
-        g['TRAIN_MODE'] = args.train_mode
-        if args.train_mode == 'natural':
-            # Override: only easy + medium for training (OOD test on hard+)
-            g['TRAIN_DIST'] = {
-                'easy': g['TRAIN_DIST'].get('easy', 800000),
-                'medium': g['TRAIN_DIST'].get('medium', 200000),
-                'hard': 0, 'extreme': 0, 'nightmare': 0,
-            }
     if args.masks: g['MASK_TYPES'] = args.masks
     if args.decode: g['DECODE_POLICIES'] = args.decode
     return args
@@ -395,9 +373,10 @@ def _compute_meta_worker(args):
     return d
 
 
-def load_hf_data(train_dist, n_test, seed=42, cache_dir='.sudoku_cache'):
-    """Load from HuggingFace sapientinc/sudoku-extreme with 4-tier curriculum.
-    train_dist: dict like {'easy': 200000, 'medium': 200000, 'hard': 100000, 'extreme': 5000}
+def load_hf_data(n_test, decay=None, seed=42, cache_dir='.sudoku_cache'):
+    """Load from HuggingFace sapientinc/sudoku-extreme.
+    decay: None → use all available per tier (balanced)
+           0.1  → easy,medium at 100%, hard×0.1, very_hard×0.01, ... (natural)
     """
     print("  Loading HuggingFace sudoku-extreme dataset...")
     from datasets import load_dataset
@@ -407,14 +386,50 @@ def load_hf_data(train_dist, n_test, seed=42, cache_dir='.sudoku_cache'):
     train_raw = ds['train']
     test_raw = ds['test']
 
-    # Log source distribution (first 100K for speed)
-    print("  Source distribution (train, sampled):")
-    src_counts = defaultdict(int)
-    sample_size = min(len(train_raw), 100000)
-    for i in range(sample_size):
-        src_counts[train_raw[i]['source']] += 1
-    for src, cnt in sorted(src_counts.items(), key=lambda x: -x[1]):
-        print(f"    {src}: ~{cnt * len(train_raw) // sample_size:,}")
+    # ── Profile actual rating distribution ──
+    print("  Profiling rating distribution...")
+    all_ratings = train_raw['rating']
+    n_total = len(all_ratings)
+    sorted_r = sorted(all_ratings)
+    r_max = sorted_r[-1]
+    print(f"    Total: {n_total:,} | min={sorted_r[0]} max={r_max}")
+    # Histogram
+    bins = [0, 1, 5, 10, 20, 50, 100, 200, 500, r_max+1]
+    for i in range(len(bins)-1):
+        lo, hi = bins[i], bins[i+1]
+        cnt = sum(1 for r in all_ratings if lo <= r < hi)
+        if cnt > 0:
+            label = f"[{lo},{hi})" if hi <= r_max else f"[{lo},{r_max}]"
+            print(f"      rating {label:<12s}: {cnt:>10,} ({cnt/n_total:.1%})")
+    for p in [50, 75, 90, 95, 99, 99.9]:
+        idx = min(int(p/100 * n_total), n_total-1)
+        print(f"    p{p}: {sorted_r[idx]}")
+
+    # Auto-determine tier boundaries based on actual data
+    # Keep easy=0, then split non-zero into meaningful groups
+    global RATING_TIERS
+    nonzero = [r for r in all_ratings if r > 0]
+    if nonzero:
+        nonzero_sorted = sorted(nonzero)
+        nn = len(nonzero_sorted)
+        p50 = nonzero_sorted[nn//2]
+        p75 = nonzero_sorted[int(nn*0.75)]
+        p90 = nonzero_sorted[int(nn*0.90)]
+        p99 = nonzero_sorted[min(int(nn*0.99), nn-1)]
+        RATING_TIERS = {
+            'easy': (0, 0),
+            'medium': (1, max(p50, 1)),
+            'hard': (max(p50, 1)+1, p75),
+            'very_hard': (p75+1, p90),
+            'extreme': (p90+1, p99),
+            'top1pct': (p99+1, r_max),
+        }
+        # Remove empty tiers
+        RATING_TIERS = {k: v for k, v in RATING_TIERS.items() if v[0] <= v[1]}
+        print(f"    Auto-determined tiers:")
+        for tn, (lo, hi) in RATING_TIERS.items():
+            cnt = sum(1 for r in all_ratings if lo <= r <= hi)
+            print(f"      {tn}: [{lo}, {hi}] → {cnt:,} train samples")
 
     # Efficient sampling: batch-read ratings first, then filter
     def _sample_by_rating(data, lo, hi, n, rng_inst):
@@ -430,13 +445,34 @@ def load_hf_data(train_dist, n_test, seed=42, cache_dir='.sudoku_cache'):
                  rows[i].get('source', ''))
                 for i in range(len(rows))]
 
-    # Train: 4-tier curriculum
-    print(f"  Sampling train data (4-tier curriculum)...")
+    # Train sampling with difficulty decay
+    print(f"  Sampling train data (decay={decay})...")
     train_tuples = []
     tier_counts = {}
-    for tier_name, (lo, hi) in RATING_TIERS.items():
-        n_tier = train_dist.get(tier_name, 0)
-        if n_tier <= 0: continue
+    tier_names = list(RATING_TIERS.keys())
+    # Find index where decay starts (after easy and medium)
+    base_tiers = {'easy', 'medium'}
+    decay_idx = 0
+    for i, tn in enumerate(tier_names):
+        if tn not in base_tiers:
+            decay_idx = i; break
+
+    for i, (tier_name, (lo, hi)) in enumerate(RATING_TIERS.items()):
+        # Count available in this tier
+        available = sum(1 for r in all_ratings if lo <= r <= hi)
+        if available == 0: continue
+
+        if decay is None:
+            # Balanced: use all available
+            n_tier = available
+        elif tier_name in base_tiers:
+            # Base tiers: use all available
+            n_tier = available
+        else:
+            # Apply exponential decay: λ^(tier_position - decay_start + 1)
+            exp = i - decay_idx + 1
+            n_tier = max(1, int(available * (decay ** exp)))
+
         samples = _sample_by_rating(train_raw, lo, hi, n_tier, rng)
         train_tuples.extend(samples)
         tier_counts[tier_name] = len(samples)
@@ -451,17 +487,6 @@ def load_hf_data(train_dist, n_test, seed=42, cache_dir='.sudoku_cache'):
         if not samples:
             print(f"    → fallback to train set for {tier_name}")
             samples = _sample_by_rating(train_raw, lo, hi, n_test, rng2)
-        if not samples and tier_name == 'nightmare':
-            # Last resort: take highest-rated puzzles from any available data
-            print(f"    → nightmare fallback: taking top-rated from all data")
-            all_ratings = train_raw['rating']
-            top_idx = sorted(range(len(all_ratings)), key=lambda i: all_ratings[i], reverse=True)[:n_test]
-            if top_idx:
-                rows = train_raw.select(top_idx)
-                samples = [(rows[i]['question'], rows[i]['answer'], rows[i]['rating'],
-                           rows[i].get('source', '')) for i in range(len(rows))]
-                min_r = min(s[2] for s in samples) if samples else 0
-                print(f"    → got {len(samples)} puzzles, min_rating={min_r}")
         test_tiers[tier_name] = samples
 
     total = sum(tier_counts.values())
@@ -569,12 +594,12 @@ def prepare_datasets(source=None, seed=42):
     """Load data. Train = lightweight (no meta), Test = full metadata."""
     source = source or DATA_SOURCE
     if source == 'hf':
-        train_tuples, test_tiers = load_hf_data(TRAIN_DIST, N_TEST_PER_TIER, seed)
+        train_tuples, test_tiers = load_hf_data(N_TEST_PER_TIER, decay=DIFFICULTY_DECAY, seed=seed)
     elif source == 'csv':
         train_tuples, test_tiers = load_csv_data(
-            CSV_PATH, sum(TRAIN_DIST.values()), N_TEST_PER_TIER, seed)
+            CSV_PATH, 500000, N_TEST_PER_TIER, seed)
     else:
-        raw = gen_fallback_data(sum(TRAIN_DIST.values()), seed)
+        raw = gen_fallback_data(100000, seed)
         train_tuples = raw
         test_raw = gen_fallback_data(N_TEST_PER_TIER * 2, seed + 5000)
         test_tiers = {'all': test_raw}
@@ -1620,9 +1645,9 @@ def run(tag=''):
     exp_name = f"{EXP_NAME}_{tag}" if tag else EXP_NAME
     print(f"\n{'='*70}")
     print(f"  {exp_name}")
-    dist_str = ' '.join(f"{k}={v}" for k, v in TRAIN_DIST.items())
-    print(f"  Model: {N_LAYER}L/{N_EMBD}D/{N_HEAD}H  Train: {dist_str} (total={sum(TRAIN_DIST.values())})")
-    print(f"  Training mode: {TRAIN_MODE}  Iters: {MAX_ITERS}, batch={BATCH_SIZE}")
+    decay_str = f"decay={DIFFICULTY_DECAY}" if DIFFICULTY_DECAY else "balanced (all data)"
+    print(f"  Model: {N_LAYER}L/{N_EMBD}D/{N_HEAD}H  Data: {decay_str}")
+    print(f"  Training: {MAX_ITERS} iters, batch={BATCH_SIZE}")
     print(f"  Masks: {MASK_TYPES}  Decode: {DECODE_POLICIES}")
     print(f"  PUMA: K={PUMA_K}, tau={PUMA_TAU}")
     print(f"{'='*70}")
@@ -1777,7 +1802,7 @@ def run(tag=''):
     figs = make_figures(all_results, all_dyn, corr)
 
     # ── Summary table (exact match + cell accuracy) ──
-    print(f"\n{'='*70}\n  SUMMARY — Rating-Stratified (mode={TRAIN_MODE})\n{'='*70}")
+    print(f"\n{'='*70}\n  SUMMARY — decay={DIFFICULTY_DECAY}\n{'='*70}")
     for dp in ['confidence']:
         print(f"\n  decode={dp}:")
         print(f"  {'Tier':<12} {'n_blanks':>8}", end='')
@@ -1884,9 +1909,10 @@ def run(tag=''):
             print()
 
     # ── Save ──
-    sd = {'config': {k: globals()[k] for k in ['TRAIN_DIST', 'TRAIN_MODE',
+    sd = {'config': {k: globals()[k] for k in ['DIFFICULTY_DECAY',
            'N_LAYER', 'N_EMBD', 'N_HEAD', 'MAX_ITERS', 'BATCH_SIZE',
-           'MASK_TYPES', 'DECODE_POLICIES', 'PUMA_K', 'PUMA_TAU']}}
+           'MASK_TYPES', 'DECODE_POLICIES', 'PUMA_K', 'PUMA_TAU']},
+          'rating_tiers': RATING_TIERS}
     for k, v in all_results.items(): sd[f'result_{k}'] = v
     for k, v in all_dyn.items():
         sd[f'dyn_{k}'] = {'checkpoints': v['checkpoints'], 'train_loss': v['train_loss']}
