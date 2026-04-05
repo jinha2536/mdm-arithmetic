@@ -14,6 +14,7 @@
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 """
 import sys, os, time, math, json, random, copy
+from itertools import combinations
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -57,7 +58,7 @@ EMA_DECAY = 0.9999
 EVAL_EVERY = 8000; LOG_EVERY = 2000; GEN_EVAL_EVERY = 20000; GEN_EVAL_N = 100
 
 MASK_TYPES = ['random', 'puma']
-DECODE_POLICIES = ['confidence', 'oracle_solver', 'random']
+DECODE_POLICIES = ['confidence', 'oracle_solver', 'oracle_technique', 'random']
 PUMA_TAU = 0.9; PUMA_K = 8
 SEED = 42
 
@@ -137,6 +138,25 @@ BIT_VAL = {1 << i: i + 1 for i in range(9)}
 POPCOUNT = [bin(i).count('1') for i in range(512)]
 LOWEST_BIT = [0] * 512
 for _i in range(1, 512): LOWEST_BIT[_i] = _i & (-_i)
+
+# Flat unit lookups for technique solver
+ROW_OF = [i // 9 for i in range(81)]
+COL_OF = [i % 9 for i in range(81)]
+BOX_OF = [(i // 9 // 3) * 3 + (i % 9 // 3) for i in range(81)]
+ROW_CELLS = [[r * 9 + c for c in range(9)] for r in range(9)]
+COL_CELLS = [[r * 9 + c for r in range(9)] for c in range(9)]
+BOX_CELLS = [[(br + dr) * 9 + (bc + dc) for dr in range(3) for dc in range(3)]
+             for br in range(0, 9, 3) for bc in range(0, 9, 3)]
+ALL_UNITS = ROW_CELLS + COL_CELLS + BOX_CELLS  # 27 units, flat indices
+
+# For each cell, which box does it belong to, and which row/col cells are in that box
+BOX_ROW_INTER = {}   # (box, row) → list of cells in intersection
+BOX_COL_INTER = {}
+for b in range(9):
+    for cell in BOX_CELLS[b]:
+        r, c = ROW_OF[cell], COL_OF[cell]
+        BOX_ROW_INTER.setdefault((b, r), []).append(cell)
+        BOX_COL_INTER.setdefault((b, c), []).append(cell)
 
 def _bm_init(grid):
     cands = [ALL_9] * 81
@@ -229,6 +249,379 @@ def compute_n_cands_after_cp(puzzle_flat):
     if cands is None: return {}
     return {i: POPCOUNT[cands[i]] for i in range(81)
             if puzzle_flat[i] == 0 and POPCOUNT[cands[i]] > 1}
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Technique-Level Solver
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Level 0: Naked singles + Hidden singles
+# Level 1: Naked/Hidden Pairs & Triples, Pointing Pairs, Box-Line Reduction
+# Level 2: X-Wing, Swordfish, XY-Wing
+# Level 3: Simple Forcing Chains (depth-1 hypothesis → contradiction)
+# Level 4: Remaining (requires bifurcation/search — no stepping stone)
+
+def _elim(cands, i, val):
+    """Eliminate val from cands[i]. Returns False if contradiction."""
+    bit = VAL_BIT[val]
+    if not (cands[i] & bit): return True
+    cands[i] &= ~bit
+    return cands[i] != 0
+
+def _singles_propagate(cands):
+    """Apply naked + hidden singles with full cascade (uses _bm_assign).
+    Returns (changed, valid) — changed=set of cells newly determined, valid=bool."""
+    changed = set()
+    seen = set(i for i in range(81) if POPCOUNT[cands[i]] == 1)
+    progress = True
+    while progress:
+        progress = False
+        # Naked singles: cells with exactly one candidate
+        for i in range(81):
+            if POPCOUNT[cands[i]] == 1 and i not in seen:
+                seen.add(i); changed.add(i); progress = True
+        # Hidden singles: value appears in only one cell in a unit
+        for unit in ALL_UNITS:
+            for v in range(1, 10):
+                bit = VAL_BIT[v]
+                places = [c for c in unit if cands[c] & bit]
+                if len(places) == 0: return changed, False
+                if len(places) == 1 and POPCOUNT[cands[places[0]]] > 1:
+                    c = places[0]
+                    if not _bm_assign(cands, c, v): return changed, False
+                    changed.add(c); seen.add(c); progress = True
+    return changed, True
+
+def _apply_naked_subsets(cands, unit, size):
+    """Find naked pairs (size=2) or triples (size=3) in a unit. Returns True if any elimination."""
+    unsolved = [c for c in unit if POPCOUNT[cands[c]] > 1]
+    if len(unsolved) < size: return False
+    elim_any = False
+    # Find subsets of `size` cells whose union of candidates has exactly `size` values
+    # For efficiency, only check cells with <= size candidates
+    eligible = [c for c in unsolved if POPCOUNT[cands[c]] <= size]
+    if len(eligible) < size: return False
+    for combo in combinations(eligible, size):
+        union = 0
+        for c in combo: union |= cands[c]
+        if POPCOUNT[union] == size:
+            # Found naked subset — eliminate these values from other cells in unit
+            for c in unsolved:
+                if c not in combo and (cands[c] & union):
+                    cands[c] &= ~union
+                    if cands[c] == 0: return True  # contradiction handled upstream
+                    elim_any = True
+    return elim_any
+
+def _apply_hidden_subsets(cands, unit, size):
+    """Find hidden pairs/triples in a unit. Returns True if any elimination."""
+    unsolved = [c for c in unit if POPCOUNT[cands[c]] > 1]
+    if len(unsolved) <= size: return False
+    elim_any = False
+    # For each subset of `size` values, check if they appear in exactly `size` cells
+    vals_in_unit = set()
+    for c in unsolved:
+        m = cands[c]
+        while m:
+            vals_in_unit.add(BIT_VAL[LOWEST_BIT[m]]); m &= m - 1
+    if len(vals_in_unit) < size: return False
+    for val_combo in combinations(vals_in_unit, size):
+        val_mask = 0
+        for v in val_combo: val_mask |= VAL_BIT[v]
+        # Which cells contain any of these values?
+        cells_with = [c for c in unsolved if cands[c] & val_mask]
+        if len(cells_with) == size:
+            # Hidden subset — remove all OTHER candidates from these cells
+            for c in cells_with:
+                if cands[c] & ~val_mask:
+                    cands[c] &= val_mask
+                    elim_any = True
+    return elim_any
+
+def _apply_pointing(cands):
+    """Pointing pairs/triples: value confined to one row/col within a box."""
+    elim_any = False
+    for b in range(9):
+        for v in range(1, 10):
+            bit = VAL_BIT[v]
+            cells = [c for c in BOX_CELLS[b] if cands[c] & bit]
+            if len(cells) < 2: continue
+            rows = set(ROW_OF[c] for c in cells)
+            cols = set(COL_OF[c] for c in cells)
+            if len(rows) == 1:
+                # All in one row — eliminate from rest of row outside box
+                r = rows.pop()
+                for c in ROW_CELLS[r]:
+                    if BOX_OF[c] != b and (cands[c] & bit):
+                        cands[c] &= ~bit; elim_any = True
+                        if cands[c] == 0: return True
+            if len(cols) == 1:
+                c_col = cols.pop()
+                for c in COL_CELLS[c_col]:
+                    if BOX_OF[c] != b and (cands[c] & bit):
+                        cands[c] &= ~bit; elim_any = True
+                        if cands[c] == 0: return True
+    return elim_any
+
+def _apply_box_line(cands):
+    """Box-line reduction: value in a row/col confined to one box."""
+    elim_any = False
+    for v in range(1, 10):
+        bit = VAL_BIT[v]
+        # Check rows
+        for r in range(9):
+            cells = [c for c in ROW_CELLS[r] if cands[c] & bit]
+            if len(cells) < 2: continue
+            boxes = set(BOX_OF[c] for c in cells)
+            if len(boxes) == 1:
+                b = boxes.pop()
+                for c in BOX_CELLS[b]:
+                    if ROW_OF[c] != r and (cands[c] & bit):
+                        cands[c] &= ~bit; elim_any = True
+                        if cands[c] == 0: return True
+        # Check cols
+        for co in range(9):
+            cells = [c for c in COL_CELLS[co] if cands[c] & bit]
+            if len(cells) < 2: continue
+            boxes = set(BOX_OF[c] for c in cells)
+            if len(boxes) == 1:
+                b = boxes.pop()
+                for c in BOX_CELLS[b]:
+                    if COL_OF[c] != co and (cands[c] & bit):
+                        cands[c] &= ~bit; elim_any = True
+                        if cands[c] == 0: return True
+    return elim_any
+
+def _apply_xwing(cands):
+    """X-Wing: value in exactly 2 cols in 2 rows → eliminate from those cols."""
+    elim_any = False
+    for v in range(1, 10):
+        bit = VAL_BIT[v]
+        # Row-based X-Wing
+        row_cols = {}  # row → frozenset of cols where v appears
+        for r in range(9):
+            cols = frozenset(COL_OF[c] for c in ROW_CELLS[r] if cands[c] & bit)
+            if len(cols) == 2: row_cols[r] = cols
+        rows_list = list(row_cols.keys())
+        for i in range(len(rows_list)):
+            for j in range(i + 1, len(rows_list)):
+                r1, r2 = rows_list[i], rows_list[j]
+                if row_cols[r1] == row_cols[r2]:
+                    for co in row_cols[r1]:
+                        for c in COL_CELLS[co]:
+                            if ROW_OF[c] != r1 and ROW_OF[c] != r2 and (cands[c] & bit):
+                                cands[c] &= ~bit; elim_any = True
+                                if cands[c] == 0: return True
+        # Col-based X-Wing
+        col_rows = {}
+        for co in range(9):
+            rows = frozenset(ROW_OF[c] for c in COL_CELLS[co] if cands[c] & bit)
+            if len(rows) == 2: col_rows[co] = rows
+        cols_list = list(col_rows.keys())
+        for i in range(len(cols_list)):
+            for j in range(i + 1, len(cols_list)):
+                c1, c2 = cols_list[i], cols_list[j]
+                if col_rows[c1] == col_rows[c2]:
+                    for r in col_rows[c1]:
+                        for c in ROW_CELLS[r]:
+                            if COL_OF[c] != c1 and COL_OF[c] != c2 and (cands[c] & bit):
+                                cands[c] &= ~bit; elim_any = True
+                                if cands[c] == 0: return True
+    return elim_any
+
+def _apply_swordfish(cands):
+    """Swordfish: value in ≤3 cols across 3 rows (and vice versa)."""
+    elim_any = False
+    for v in range(1, 10):
+        bit = VAL_BIT[v]
+        # Row-based
+        row_cols = {}
+        for r in range(9):
+            cols = frozenset(COL_OF[c] for c in ROW_CELLS[r] if cands[c] & bit)
+            if 2 <= len(cols) <= 3: row_cols[r] = cols
+        for combo in combinations(row_cols.keys(), 3):
+            union = row_cols[combo[0]] | row_cols[combo[1]] | row_cols[combo[2]]
+            if len(union) <= 3:
+                for co in union:
+                    for c in COL_CELLS[co]:
+                        if ROW_OF[c] not in combo and (cands[c] & bit):
+                            cands[c] &= ~bit; elim_any = True
+                            if cands[c] == 0: return True
+        # Col-based
+        col_rows = {}
+        for co in range(9):
+            rows = frozenset(ROW_OF[c] for c in COL_CELLS[co] if cands[c] & bit)
+            if 2 <= len(rows) <= 3: col_rows[co] = rows
+        for combo in combinations(col_rows.keys(), 3):
+            union = col_rows[combo[0]] | col_rows[combo[1]] | col_rows[combo[2]]
+            if len(union) <= 3:
+                for r in union:
+                    for c in ROW_CELLS[r]:
+                        if COL_OF[c] not in combo and (cands[c] & bit):
+                            cands[c] &= ~bit; elim_any = True
+                            if cands[c] == 0: return True
+    return elim_any
+
+def _apply_xy_wing(cands):
+    """XY-Wing: pivot {x,y} + pincer1 {x,z} + pincer2 {y,z} → eliminate z."""
+    elim_any = False
+    bivalue = [i for i in range(81) if POPCOUNT[cands[i]] == 2]
+    peers_set = [set(PEERS_FLAT[i]) for i in range(81)]
+    for pivot in bivalue:
+        pv = cands[pivot]  # {x, y}
+        pivot_peers = [p for p in bivalue if p in peers_set[pivot] and p != pivot]
+        for pi in range(len(pivot_peers)):
+            p1 = pivot_peers[pi]
+            c1 = cands[p1]
+            shared1 = pv & c1
+            if POPCOUNT[shared1] != 1: continue  # must share exactly one value
+            z1 = c1 & ~shared1  # the non-shared value from p1
+            for pj in range(pi + 1, len(pivot_peers)):
+                p2 = pivot_peers[pj]
+                if p2 in peers_set[p1]: continue  # pincers must NOT see each other
+                c2 = cands[p2]
+                shared2 = pv & c2
+                if POPCOUNT[shared2] != 1: continue
+                if shared1 == shared2: continue  # must share DIFFERENT values with pivot
+                z2 = c2 & ~shared2
+                if z1 != z2: continue  # pincers must share the same non-pivot value z
+                z_bit = z1
+                # Eliminate z from cells that see BOTH pincers
+                for c in range(81):
+                    if c != p1 and c != p2 and c != pivot:
+                        if c in peers_set[p1] and c in peers_set[p2]:
+                            if cands[c] & z_bit:
+                                cands[c] &= ~z_bit; elim_any = True
+                                if cands[c] == 0: return True
+    return elim_any
+
+def _apply_forcing_chains(cands):
+    """Simple forcing chains (depth-1): if assigning value v to cell i leads to
+    contradiction via singles propagation → eliminate v.
+    Only tests bivalue/trivalue cells for efficiency (captures most real patterns).
+    """
+    elim_any = False
+    for i in range(81):
+        pc = POPCOUNT[cands[i]]
+        if pc < 2 or pc > 3: continue  # only bi/trivalue cells
+        c = cands[i]
+        while c:
+            bit = LOWEST_BIT[c]; c &= c - 1
+            val = BIT_VAL[bit]
+            # Hypothesize: assign val to cell i
+            hyp = list(cands)
+            if not _bm_assign(hyp, i, val):
+                # Contradiction → eliminate this candidate
+                cands[i] &= ~bit; elim_any = True
+                if cands[i] == 0: return True
+                break  # restart this cell since cands changed
+    return elim_any
+
+
+TECHNIQUE_LEVELS = ['tl_0_singles', 'tl_1_subsets', 'tl_2_fish_wing',
+                     'tl_3_chains', 'tl_4_search']
+TECHNIQUE_LEVEL_TO_ID = {n: i for i, n in enumerate(TECHNIQUE_LEVELS)}
+
+def _tl_to_cat(meta):
+    tl = meta.get('technique_level', -1)
+    if meta['is_given']: return 'given'
+    if tl == 0: return 'tl_0_singles'
+    if tl == 1: return 'tl_1_subsets'
+    if tl == 2: return 'tl_2_fish_wing'
+    if tl == 3: return 'tl_3_chains'
+    return 'tl_4_search'
+
+
+def compute_technique_level(puzzle_flat):
+    """Per-cell technique level via hierarchical solver.
+    Returns dict: cell → level (0-4), and solve_order dict.
+
+    Level 0: Naked/Hidden singles
+    Level 1: Naked/Hidden pairs/triples, Pointing, Box-line reduction
+    Level 2: X-Wing, Swordfish, XY-Wing
+    Level 3: Forcing chains (depth-1 hypothesis → contradiction)
+    Level 4: Remaining (requires search/bifurcation — TRUE no stepping stone)
+    """
+    blanks_set = set(i for i in range(81) if puzzle_flat[i] == 0)
+    cands = _bm_init(puzzle_flat)
+    if cands is None:
+        return {i: 4 for i in blanks_set}, {i: idx for idx, i in enumerate(blanks_set)}
+
+    cell_level = {}
+    solve_order = {}
+    oc = [0]
+
+    def _record(level):
+        for c in range(81):
+            if c in blanks_set and c not in cell_level and POPCOUNT[cands[c]] == 1:
+                cell_level[c] = level
+                solve_order[c] = oc[0]; oc[0] += 1
+
+    # ── Level 0: _bm_init already did full singles propagation ──
+    _record(0)
+    if len(cell_level) == len(blanks_set):
+        return cell_level, solve_order
+
+    # ── Level 1: Subsets + Intersection ──
+    for _ in range(30):  # cap iterations
+        prog = False
+        for unit in ALL_UNITS:
+            prog |= _apply_naked_subsets(cands, unit, 2)
+            prog |= _apply_naked_subsets(cands, unit, 3)
+            prog |= _apply_hidden_subsets(cands, unit, 2)
+            prog |= _apply_hidden_subsets(cands, unit, 3)
+        prog |= _apply_pointing(cands)
+        prog |= _apply_box_line(cands)
+        det, valid = _singles_propagate(cands)
+        if not valid: break
+        if det: prog = True
+        _record(1)
+        if not prog or len(cell_level) == len(blanks_set): break
+
+    if len(cell_level) == len(blanks_set):
+        return cell_level, solve_order
+
+    # ── Level 2: Fish + Wings ──
+    for _ in range(20):
+        prog = False
+        prog |= _apply_xwing(cands)
+        prog |= _apply_swordfish(cands)
+        prog |= _apply_xy_wing(cands)
+        # Cascade lower techniques
+        for unit in ALL_UNITS:
+            prog |= _apply_naked_subsets(cands, unit, 2)
+            prog |= _apply_naked_subsets(cands, unit, 3)
+        prog |= _apply_pointing(cands)
+        prog |= _apply_box_line(cands)
+        det, valid = _singles_propagate(cands)
+        if not valid: break
+        if det: prog = True
+        _record(2)
+        if not prog or len(cell_level) == len(blanks_set): break
+
+    if len(cell_level) == len(blanks_set):
+        return cell_level, solve_order
+
+    # ── Level 3: Forcing chains ──
+    for _ in range(15):
+        prog = _apply_forcing_chains(cands)
+        # Cascade all lower
+        for unit in ALL_UNITS:
+            prog |= _apply_naked_subsets(cands, unit, 2)
+        prog |= _apply_pointing(cands)
+        prog |= _apply_xwing(cands)
+        det, valid = _singles_propagate(cands)
+        if not valid: break
+        if det: prog = True
+        _record(3)
+        if not prog or len(cell_level) == len(blanks_set): break
+
+    # ── Level 4: Remaining ──
+    for i in blanks_set:
+        if i not in cell_level:
+            cell_level[i] = 4
+            solve_order[i] = oc[0]; oc[0] += 1
+
+    return cell_level, solve_order
 
 
 def compute_guess_depth(puzzle_flat):
@@ -346,6 +739,8 @@ def _compute_puzzle_meta(puzzle_str, sol_str):
     n_cands_cp = compute_n_cands_after_cp(puzzle_flat)
     # Per-cell guess depth via backtracking
     guess_depths, solve_order, total_guesses = compute_guess_depth(puzzle_flat)
+    # Per-cell technique level via hierarchical solver
+    tech_levels, tech_order = compute_technique_level(puzzle_flat)
     meta = {}
     for i in range(81):
         is_given = puzzle_flat[i] != 0
@@ -356,6 +751,8 @@ def _compute_puzzle_meta(puzzle_str, sol_str):
             'n_cands_after_cp': 0 if is_given else n_cands_cp.get(i, 0),
             'guess_depth': 0 if is_given else guess_depths.get(i, -1),
             'solve_order': -1 if is_given else solve_order.get(i, 999),
+            'technique_level': 0 if is_given else tech_levels.get(i, 4),
+            'technique_order': -1 if is_given else tech_order.get(i, 999),
         }
     # Normalize puzzle string to use '0' for blanks
     pstr = ''.join(str(v) for v in puzzle_flat)
@@ -471,8 +868,13 @@ def load_hf_data(n_test, decay=None, seed=42, cache_dir='.sudoku_cache'):
         else:
             # Apply exponential decay: λ^(tier_position - decay_start + 1)
             exp = i - decay_idx + 1
-            n_tier = max(1, int(available * (decay ** exp)))
+            if decay <= 0:
+                n_tier = 0
+            else:
+                n_tier = max(1, int(available * (decay ** exp)))
 
+        if n_tier <= 0:
+            tier_counts[tier_name] = 0; continue
         samples = _sample_by_rating(train_raw, lo, hi, n_tier, rng)
         train_tuples.extend(samples)
         tier_counts[tier_name] = len(samples)
@@ -966,7 +1368,8 @@ def generate_blanks(model, tokenizer, test_data, decode_policy='confidence',
 
         # Precompute static decode order for static policies
         static_order = None
-        if decode_policy in ('oracle_solver', 'oracle_depth', 'n_cands', 'n_cands_cp', 'random'):
+        if decode_policy in ('oracle_solver', 'oracle_depth', 'oracle_technique',
+                             'n_cands', 'n_cands_cp', 'random'):
             static_order = torch.full((B, ANS_LEN), 9999, dtype=torch.long, device=device)
             for i in range(B):
                 meta = batch[i]['meta']
@@ -977,6 +1380,12 @@ def generate_blanks(model, tokenizer, test_data, decode_policy='confidence',
                 elif decode_policy == 'oracle_solver':
                     # TRUE oracle: solver's actual determination order
                     blank_js.sort(key=lambda j: meta[j].get('solve_order', 999))
+                    for rank, j in enumerate(blank_js): static_order[i, j] = rank
+                elif decode_policy == 'oracle_technique':
+                    # Technique-level oracle: level 0 first, then 1, 2, 3, 4
+                    # Within same level, by technique_order
+                    blank_js.sort(key=lambda j: (meta[j].get('technique_level', 4),
+                                                  meta[j].get('technique_order', 999)))
                     for rank, j in enumerate(blank_js): static_order[i, j] = rank
                 elif decode_policy == 'oracle_depth':
                     def _depth_key(j):
@@ -1116,8 +1525,18 @@ def evaluate(model, tokenizer, test_data, decode_policy='confidence',
                 'n': len(bin_r),
             }
 
+    # Per technique level
+    tech_acc = defaultdict(list)
+    for r in results:
+        for j in range(81):
+            if not r['meta'][j]['is_given']:
+                tl_cat = _tl_to_cat(r['meta'][j])
+                tech_acc[tl_cat].append(r['pos_correct'][j])
+    tech_acc = {c: sum(v)/len(v) for c, v in tech_acc.items() if v}
+
     return {'accuracy': acc, 'blank_cell_acc': bl_acc, 'n': n,
             'category_accuracy': cat_acc, 'guess_accuracy': guess_acc,
+            'technique_accuracy': tech_acc,
             'rating_accuracy': rating_acc, 'blanks_accuracy': blanks_acc}
 
 
@@ -1367,6 +1786,7 @@ def analyse_decode_strategy(model, tokenizer, test_data, max_len,
             all_feats['col_occupancy'].append(col_occ)
             all_feats['min_unit_vacancy'].append(min_vac)
             all_feats['guess_depth'].append(meta[j].get('guess_depth', 0))
+            all_feats['technique_level'].append(meta[j].get('technique_level', 4))
 
     if len(all_ranks) < 20: return {}
 
@@ -1707,6 +2127,10 @@ def run(tag=''):
             if ga:
                 parts = [f"{c}={v:.3f}" for c, v in ga.items()]
                 print(f"    Guess: {' '.join(parts)}")
+            ta = r.get('technique_accuracy', {})
+            if ta:
+                parts = [f"{c}={v:.3f}" for c, v in sorted(ta.items())]
+                print(f"    Tech:  {' '.join(parts)}")
             ra = r.get('rating_accuracy', {})
             for tn, info in ra.items():
                 print(f"    {tn}: exact={info['exact']:.4f} cell={info['cell']:.4f} "
@@ -1885,6 +2309,50 @@ def run(tag=''):
                 v = ga.get(gc)
                 row += f" {v:>12.4f}" if v is not None else f" {'N/A':>12}"
             print(row)
+
+    # ── Technique Level Accuracy ──
+    print(f"\n{'='*70}\n  Technique Level Accuracy (confidence decode)\n{'='*70}")
+    print(f"  {'Condition':<16}", end='')
+    for tl in TECHNIQUE_LEVELS: print(f" {tl:>16}", end='')
+    print(f" {'Δ_search(R-P)':>14}")
+    print(f"  {'─'*100}")
+    for mt in MASK_TYPES:
+        key = f'{mt}_confidence'
+        r = all_results.get(key, {})
+        ta = r.get('technique_accuracy', {})
+        if ta:
+            row = f"  {mt:<16}"
+            for tl in TECHNIQUE_LEVELS:
+                v = ta.get(tl)
+                row += f" {v:>16.4f}" if v is not None else f" {'N/A':>16}"
+            print(row)
+    # Print delta for tl_4_search (the key comparison)
+    r_ta = all_results.get(f'{MASK_TYPES[0]}_confidence', {}).get('technique_accuracy', {})
+    p_ta = all_results.get(f'{MASK_TYPES[-1]}_confidence', {}).get('technique_accuracy', {}) if len(MASK_TYPES) > 1 else {}
+    r_s = r_ta.get('tl_4_search')
+    p_s = p_ta.get('tl_4_search')
+    if r_s is not None and p_s is not None:
+        delta = r_s - p_s
+        print(f"\n  tl_4_search (no stepping stone): random={r_s:.4f} puma={p_s:.4f} Δ(R-P)={delta:+.4f}")
+        if delta > 0:
+            print(f"  → Random WINS on search-required cells (addition crossover analog)")
+        else:
+            print(f"  → PUMA still ahead on search-required cells")
+
+    # ── Technique Level Distribution (test data) ──
+    all_test_flat = [d for ds in test_data.values() for d in ds]
+    tl_dist = defaultdict(int)
+    tl_total = 0
+    for d in all_test_flat:
+        for j in range(81):
+            if not d['meta'][j]['is_given']:
+                tl_cat = _tl_to_cat(d['meta'][j])
+                tl_dist[tl_cat] += 1; tl_total += 1
+    if tl_total > 0:
+        print(f"\n  Test data technique distribution:")
+        for tl in TECHNIQUE_LEVELS:
+            n = tl_dist.get(tl, 0)
+            print(f"    {tl:<20s}: {n:>8,} ({n/tl_total:.1%})")
 
     # ── Probe vs Generation Gap ──
     has_pvg = any(f'{mt}_probe_vs_gen' in all_results for mt in MASK_TYPES)
