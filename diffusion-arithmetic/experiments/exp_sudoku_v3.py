@@ -848,7 +848,7 @@ def load_hf_data(n_test, decay=None, seed=42, cache_dir='.sudoku_cache'):
     tier_counts = {}
     tier_names = list(RATING_TIERS.keys())
     # Find index where decay starts (after easy and medium)
-    base_tiers = {'easy', 'medium'}
+    base_tiers = {'easy'}
     decay_idx = 0
     for i, tn in enumerate(tier_names):
         if tn not in base_tiers:
