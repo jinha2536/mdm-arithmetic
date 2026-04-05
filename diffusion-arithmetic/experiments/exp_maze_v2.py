@@ -55,7 +55,11 @@ N_LAYER = 4; N_HEAD = 4; N_EMBD = 128; DROPOUT = 0.1; POS_ENC = 'absolute'
 LR = 3e-4; MIN_LR = 1e-5; WARMUP_ITERS = 2000; GRAD_CLIP = 1.0
 WEIGHT_DECAY = 0.01; EMA_DECAY = 0.9999
 
-PUMA_TAU = 0.9; PUMA_K = 12
+PUMA_TAU = 0.9
+# PUMA K schedule (following PUMA paper §4.1: TinyGSM uses K=12→42, +3 every 30k)
+# K_END=None → auto: target ~7 cells/step at final K (matching paper's TinyGSM granularity)
+# K_EVERY=None → auto: ramp over first 1/3 of training (matching paper)
+PUMA_K_START = 12; PUMA_K_END = None; PUMA_K_STEP = 3; PUMA_K_EVERY = None
 SEED = 42
 STRAIGHTNESS_BIAS = 0.0  # 0.0=normal DFS, higher=longer corridors in training
 
@@ -73,7 +77,9 @@ def parse_args():
     p.add_argument('--n-layer', type=int); p.add_argument('--n-head', type=int)
     p.add_argument('--n-embd', type=int); p.add_argument('--dropout', type=float)
     p.add_argument('--lr', type=float)
-    p.add_argument('--puma-tau', type=float); p.add_argument('--puma-k', type=int)
+    p.add_argument('--puma-tau', type=float)
+    p.add_argument('--puma-k-start', type=int); p.add_argument('--puma-k-end', type=int)
+    p.add_argument('--puma-k-step', type=int); p.add_argument('--puma-k-every', type=int)
     p.add_argument('--masks', nargs='+'); p.add_argument('--decode', nargs='+')
     p.add_argument('--straightness-bias', type=float)
     p.add_argument('--tag', type=str, default=''); p.add_argument('--seed', type=int)
@@ -87,7 +93,9 @@ def parse_args():
                    'batch_size': 'BATCH_SIZE', 'eval_every': 'EVAL_EVERY',
                    'gen_eval_every': 'GEN_EVAL_EVERY', 'n_layer': 'N_LAYER',
                    'n_head': 'N_HEAD', 'n_embd': 'N_EMBD', 'dropout': 'DROPOUT',
-                   'lr': 'LR', 'puma_tau': 'PUMA_TAU', 'puma_k': 'PUMA_K',
+                   'lr': 'LR', 'puma_tau': 'PUMA_TAU',
+                   'puma_k_start': 'PUMA_K_START', 'puma_k_end': 'PUMA_K_END',
+                   'puma_k_step': 'PUMA_K_STEP', 'puma_k_every': 'PUMA_K_EVERY',
                    'seed': 'SEED', 'straightness_bias': 'STRAIGHTNESS_BIAS'}.items():
         v = getattr(args, a, None)
         if v is not None: g[gl] = v
@@ -391,6 +399,8 @@ def _make_entry(grid, start, end, compute_meta=False):
         bfs_depths = compute_bfs_depth(grid, start, H, W)
         dep_ctx = compute_dependency_context(grid, path, path_set, roles, bfs_depths,
                                               start, end, H, W)
+        # Pre-built path index lookup (avoids O(path_len) per call)
+        path_idx = {ci: pi for pi, ci in enumerate(path)}
         meta = {}
         for i in range(H * W):
             meta[i] = {
@@ -402,7 +412,7 @@ def _make_entry(grid, start, end, compute_meta=False):
                 'bfs_depth': bfs_depths.get(i, -1),
                 'path_role': roles.get(i, 'wall'),
                 'dep_context': dep_ctx.get(i, 'wall'),
-                'path_index': path.index(i) if i in path_set else -1,
+                'path_index': path_idx.get(i, -1),
             }
         entry['meta'] = meta
         # BFS oracle order: path cells sorted by BFS depth
@@ -522,30 +532,24 @@ def probe_per_cell(model, tokenizer, test_data, max_len, device=None):
     if device is None: device = DEVICE
     model.eval()
     mask_id = tokenizer.special_ids['mask']
-    dot_id = tokenizer.encode('.')[0]
 
     strings = [d['string'] for d in test_data]
     ids_all, ans_all = encode_samples(strings, tokenizer, max_len)
     ids_all, ans_all = ids_all.to(device), ans_all.to(device)
     N = len(test_data)
 
-    # Blank masks: open cells only (puzzle[i] == '.')
+    # Blank masks: vectorized via token comparison
+    dot_id = tokenizer.encode('.')[0]
     _arange = torch.arange(ANS_LEN, device=device)
-    blank_masks = torch.zeros(N, ANS_LEN, dtype=torch.bool, device=device)
-    for si, d in enumerate(test_data):
-        ps = d['string'].split('=')[0]
-        for j in range(min(ANS_LEN, len(ps))):
-            if ps[j] == '.':
-                blank_masks[si, j] = True
+    blank_masks = (ids_all[:, :ANS_LEN] == dot_id).to(device)
 
     # Dependency context IDs (if metadata available)
     has_meta = 'meta' in test_data[0]
     ctx_ids = torch.zeros(N, ANS_LEN, dtype=torch.long, device=device)
     if has_meta:
-        for si, d in enumerate(test_data):
-            for j in range(ANS_LEN):
-                ctx_name = d['meta'][j]['dep_context']
-                ctx_ids[si, j] = DEP_CTX_TO_ID.get(ctx_name, 0)
+        ctx_lists = [[DEP_CTX_TO_ID.get(d['meta'][j]['dep_context'], 0)
+                       for j in range(ANS_LEN)] for d in test_data]
+        ctx_ids = torch.tensor(ctx_lists, dtype=torch.long, device=device)
 
     n_ctx = len(DEP_CONTEXTS)
     ctx_conf = torch.zeros(n_ctx, device=device)
@@ -612,13 +616,17 @@ def probe_per_cell(model, tokenizer, test_data, max_len, device=None):
 
 @torch.no_grad()
 def generate_blanks(model, tokenizer, test_data, decode_policy='confidence',
-                    batch_size=32, device=None):
-    """Iterative unmasking of open cells with configurable policy."""
+                    n_decode_steps=None, batch_size=32, device=None):
+    """Iterative unmasking with BATCHED multi-reveal per step.
+    Reveals ceil(n_remaining / K_remaining) cells per forward pass.
+    For ANS_LEN=225 with ~100 blanks, this reduces ~100 forward passes to ~12."""
     if device is None: device = DEVICE
+    if n_decode_steps is None: n_decode_steps = globals().get('_PUMA_K_FINAL', PUMA_K_END or 24)
     mask_id = tokenizer.special_ids['mask']
     pad_id = tokenizer.special_ids['pad']
-    model.eval()
-    results = []
+    dot_id = tokenizer.encode('.')[0]
+    model.eval(); results = []
+    _ar = torch.arange(ANS_LEN, device=device)
 
     for st in range(0, len(test_data), batch_size):
         batch = test_data[st:st + batch_size]; B = len(batch)
@@ -628,81 +636,66 @@ def generate_blanks(model, tokenizer, test_data, decode_policy='confidence',
         for i, e in enumerate(full_enc):
             ids[i, :len(e)] = torch.tensor(e, device=device)
 
-        # Find answer start positions (after '=')
+        # Vectorized '=' search
         eq_id = tokenizer.encode('=')[0]
-        ans_starts = torch.zeros(B, dtype=torch.long, device=device)
-        for i in range(B):
-            for t in range(ml):
-                if ids[i, t].item() == eq_id:
-                    ans_starts[i] = t + 1; break
-        _ar = torch.arange(ANS_LEN, device=device)
+        ans_starts = (ids == eq_id).long().argmax(dim=1) + 1
         ap = (ans_starts.unsqueeze(1) + _ar).clamp(max=ml - 1)
         bi = torch.arange(B, device=device).unsqueeze(1).expand_as(ap)
 
-        # Mask open cells (puzzle[j] == '.')
+        # Vectorized blank mask
+        blank_m = (ids[:, :ANS_LEN] == dot_id)
         x = ids.clone()
-        blank_m = torch.zeros(B, ANS_LEN, dtype=torch.bool, device=device)
-        for i in range(B):
-            ps = batch[i]['string'].split('=')[0]
-            for j in range(ANS_LEN):
-                if j < len(ps) and ps[j] == '.':
-                    x[i, ans_starts[i] + j] = mask_id
-                    blank_m[i, j] = True
-        n_blanks = blank_m.sum(dim=1)
-        max_steps = n_blanks.max().item()
+        x[bi[blank_m], ap[blank_m]] = mask_id
 
-        # Static decode order (for oracle/random)
+        # Static decode order
         static_order = None
         if decode_policy in ('bfs_oracle', 'random'):
             static_order = torch.full((B, ANS_LEN), 9999, dtype=torch.long, device=device)
             for i in range(B):
-                blank_js = [j for j in range(ANS_LEN) if blank_m[i, j]]
+                blank_js = blank_m[i].nonzero(as_tuple=True)[0].tolist()
                 if decode_policy == 'random':
                     random.shuffle(blank_js)
-                    for rank, j in enumerate(blank_js):
-                        static_order[i, j] = rank
-                elif decode_policy == 'bfs_oracle' and 'bfs_oracle_order' in batch[i]:
+                    for rank, j in enumerate(blank_js): static_order[i, j] = rank
+                elif 'bfs_oracle_order' in batch[i]:
                     oracle = batch[i]['bfs_oracle_order']
-                    for j in blank_js:
-                        static_order[i, j] = oracle.get(j, 9999)
+                    for j in blank_js: static_order[i, j] = oracle.get(j, 9999)
 
-        # Iterative decode
-        for step in range(max_steps):
-            is_m = (blank_m & (x[bi, ap] == mask_id))
+        # Multi-reveal iterative decode
+        for step in range(n_decode_steps):
+            is_m = blank_m & (x[bi, ap] == mask_id)
             if not is_m.any(): break
             logits = model(x)
-            al = logits[bi, ap].clone()
-            al[:, :, mask_id] = -float('inf')
-            confs = F.softmax(al, dim=-1).max(dim=-1).values
+            al = logits[bi, ap].clone(); al[:, :, mask_id] = -float('inf')
+            probs = F.softmax(al, dim=-1)
+            confs = probs.max(dim=-1).values; preds = probs.argmax(dim=-1)
             confs[~is_m] = -float('inf')
 
+            nm = is_m.sum(dim=1).float()
+            K_rem = max(n_decode_steps - step, 1)
+            nr = (nm / K_rem).ceil().long().clamp(min=1)
+
             if decode_policy == 'confidence':
-                # Reveal most confident
-                best_j = confs.argmax(dim=1)
+                ranked = confs.argsort(dim=1, descending=True)
             else:
-                # Static order: reveal the one with lowest rank among still-masked
-                rank_vals = torch.where(is_m, static_order, torch.tensor(9999, device=device))
-                best_j = rank_vals.argmin(dim=1)
+                rank_vals = torch.where(is_m, static_order,
+                                        torch.tensor(9999, dtype=torch.long, device=device))
+                ranked = rank_vals.argsort(dim=1)
+            rop = torch.zeros_like(ranked)
+            rop.scatter_(1, ranked, _ar.expand(B, -1))
+            reveal = (rop < nr.unsqueeze(1)) & is_m
+            x[bi[reveal], ap[reveal]] = preds[reveal]
 
-            preds = F.softmax(al, dim=-1).argmax(dim=-1)
-            for i in range(B):
-                j = best_j[i].item()
-                if is_m[i, j]:
-                    x[i, ans_starts[i] + j] = preds[i, j]
+        # Vectorized result collection
+        pred_at_ans = x[bi, ap]; gold_at_ans = ids[bi, ap]
+        pos_correct = (pred_at_ans == gold_at_ans)
+        open_correct = pos_correct | ~blank_m
+        sample_correct = open_correct.all(dim=1)
 
-        # Collect results
         for i in range(B):
-            pred_ids = x[i, ans_starts[i]:ans_starts[i] + ANS_LEN]
-            pred_str = tokenizer.decode(pred_ids.cpu().tolist())
-            gold_str = batch[i]['string'].split('=')[1]
-            ps = batch[i]['string'].split('=')[0]
-            pc = [pred_str[j] == gold_str[j] if j < len(pred_str) and j < len(gold_str) else False
-                  for j in range(ANS_LEN)]
-            errs = [j for j in range(ANS_LEN) if j < len(pred_str) and j < len(gold_str)
-                    and pred_str[j] != gold_str[j] and ps[j] == '.']
+            errs = ((~pos_correct[i]) & blank_m[i]).nonzero(as_tuple=True)[0].tolist()
             results.append({
-                'correct': pred_str == gold_str,
-                'pos_correct': pc,
+                'correct': sample_correct[i].item(),
+                'pos_correct': pos_correct[i].tolist(),
                 'error_positions': errs,
                 'corridor_stats': batch[i].get('corridor_stats', {}),
             })
@@ -794,83 +787,69 @@ def analyse_corridor_rarity(per_sample, test_data):
 
 @torch.no_grad()
 def simulate_puma_coverage(model, tokenizer, test_data, max_len,
-                           K=None, tau=None, n_samples=200, device=None):
-    """Measure PUMA chain coverage per depth/context category
-    (= simulate_puma_coverage in addition)."""
+                           K=None, tau=None, n_samples=200, batch_size=16, device=None):
+    """PUMA coverage simulation — BATCHED (was per-sample)."""
     if device is None: device = DEVICE
-    if K is None: K = PUMA_K
+    if K is None: K = globals().get('_PUMA_K_FINAL', PUMA_K_END or 24)
     if tau is None: tau = PUMA_TAU
-    model.eval()
-    mask_id = tokenizer.special_ids['mask']
+    model.eval(); mask_id = tokenizer.special_ids['mask']; pad_id = tokenizer.special_ids['pad']
+    dot_id = tokenizer.encode('.')[0]; eq_id = tokenizer.encode('=')[0]
 
     N = min(len(test_data), n_samples)
     n_ctx = len(DEP_CONTEXTS)
-    cov_sum = torch.zeros(n_ctx)
-    cov_count = torch.zeros(n_ctx, dtype=torch.long)
+    cov_sum = torch.zeros(n_ctx); cov_count = torch.zeros(n_ctx, dtype=torch.long)
+    _ar = torch.arange(ANS_LEN, device=device)
 
-    for si in range(N):
-        d = test_data[si]
-        ps = d['string'].split('=')[0]
-        sol = d['string'].split('=')[1]
-        meta = d.get('meta', {})
+    for st in range(0, N, batch_size):
+        en = min(st + batch_size, N); batch = test_data[st:en]; B = len(batch)
+        full_enc = [tokenizer.encode(d['string']) for d in batch]
+        ml = max(len(e) for e in full_enc)
+        ids = torch.full((B, ml), pad_id, dtype=torch.long, device=device)
+        for i, e in enumerate(full_enc):
+            ids[i, :len(e)] = torch.tensor(e, device=device)
 
-        prefix_enc = tokenizer.encode(ps + '=')
-        sol_enc = tokenizer.encode(sol[:ANS_LEN])
-        T_pre = len(prefix_enc)
-        x = torch.tensor(prefix_enc + [mask_id] * ANS_LEN, dtype=torch.long, device=device).unsqueeze(0)
-        x0 = torch.tensor(sol_enc, dtype=torch.long, device=device)
+        ans_starts = (ids == eq_id).long().argmax(dim=1) + 1
+        ap = (ans_starts.unsqueeze(1) + _ar).clamp(max=ml - 1)
+        bi = torch.arange(B, device=device).unsqueeze(1).expand_as(ap)
 
-        blank_js = [j for j in range(ANS_LEN) if j < len(ps) and ps[j] == '.']
-        is_m = torch.zeros(ANS_LEN, dtype=torch.bool, device=device)
-        for j in blank_js:
-            is_m[j] = True
-            x[0, T_pre + j] = mask_id
+        blank_m = (ids[:, :ANS_LEN] == dot_id)
+        x = ids.clone(); x0_at_ans = ids[bi, ap].clone()
+        x[bi[blank_m], ap[blank_m]] = mask_id
 
-        # For non-open cells, fill in ground truth
-        for j in range(ANS_LEN):
-            if not is_m[j] and j < len(x0):
-                x[0, T_pre + j] = x0[j]
+        # Context IDs
+        ctx_batch = torch.zeros(B, ANS_LEN, dtype=torch.long, device=device)
+        for i in range(B):
+            meta = batch[i].get('meta', {})
+            ctx_list = [DEP_CTX_TO_ID.get(meta.get(j, {}).get('dep_context', 'off_path'), 1)
+                        for j in range(ANS_LEN)]
+            ctx_batch[i] = torch.tensor(ctx_list, dtype=torch.long, device=device)
 
-        steps_m = torch.zeros(ANS_LEN)
-        total = 0
+        is_m = blank_m.clone(); steps_m = torch.zeros(B, ANS_LEN); total_steps = 0
         for step in range(K):
             if not is_m.any(): break
-            total += 1
-            steps_m += is_m.cpu().float()
-            logits = model(x)
-            nm = is_m.sum().item()
-            nr = max(1, int(math.ceil(nm / max(K - step, 1))))
-            confs = torch.full((ANS_LEN,), -float('inf'), device=device)
-            for j in range(ANS_LEN):
-                if is_m[j]:
-                    cl = logits[0, T_pre + j].clone()
-                    cl[mask_id] = -float('inf')
-                    confs[j] = F.softmax(cl, dim=-1).max()
-            ranked = confs.argsort(descending=True)
-            reveal = torch.zeros(ANS_LEN, dtype=torch.bool, device=device)
-            for ri in range(ANS_LEN):
-                j = ranked[ri].item()
-                if not is_m[j]: continue
-                if reveal.sum() < nr or confs[j] > tau:
-                    reveal[j] = True
-            for j in range(ANS_LEN):
-                if reveal[j] and j < len(x0):
-                    x[0, T_pre + j] = x0[j]
-                    is_m[j] = False
+            total_steps += 1; steps_m += is_m.cpu().float()
+            logits = model(x); al = logits[bi, ap].clone(); al[:, :, mask_id] = -float('inf')
+            confs = F.softmax(al, dim=-1).max(dim=-1).values; confs[~is_m] = -float('inf')
+            nm = is_m.sum(dim=1).float(); K_rem = max(K - step, 1)
+            nr = (nm / K_rem).ceil().long().clamp(min=1)
+            ranked = confs.argsort(dim=1, descending=True)
+            rop = torch.zeros_like(ranked); rop.scatter_(1, ranked, _ar.expand(B, -1))
+            reveal = ((rop < nr.unsqueeze(1)) | (confs > tau)) & is_m
+            x[bi[reveal], ap[reveal]] = x0_at_ans[reveal]; is_m = is_m & ~reveal
 
-        if total == 0: continue
-        frac = steps_m / total
-        for j in blank_js:
-            ctx_name = meta.get(j, {}).get('dep_context', 'off_path')
-            ctx_id = DEP_CTX_TO_ID.get(ctx_name, 1)
-            cov_sum[ctx_id] += frac[j].item()
-            cov_count[ctx_id] += 1
+        if total_steps == 0: continue
+        frac = steps_m / total_steps
+        # Accumulate per-context — vectorized scatter
+        for i in range(B):
+            bj = blank_m[i].nonzero(as_tuple=True)[0]
+            for j in bj.tolist():
+                ctx_id = ctx_batch[i, j].item()
+                cov_sum[ctx_id] += frac[i, j].item(); cov_count[ctx_id] += 1
 
     per_ctx = {}
     for ci, cn in enumerate(DEP_CONTEXTS):
         nc = cov_count[ci].item()
-        if nc > 0:
-            per_ctx[cn] = {'mean_coverage': cov_sum[ci].item() / nc, 'n': nc}
+        if nc > 0: per_ctx[cn] = {'mean_coverage': cov_sum[ci].item() / nc, 'n': nc}
     return per_ctx
 
 
@@ -909,13 +888,9 @@ def train(mask_type, tokenizer, train_data, test_data, max_len, device=None):
     mask_id = tokenizer.special_ids['mask']
     pad_id = tokenizer.special_ids['pad']
 
-    # Blank masks [N, ANS_LEN] — open cells only
-    blank_masks = torch.zeros(N, ANS_LEN, dtype=torch.bool, device=device)
-    for si, d in enumerate(train_data):
-        ps = d['string'].split('=')[0]
-        for j in range(min(ANS_LEN, len(ps))):
-            if ps[j] == '.':
-                blank_masks[si, j] = True
+    # Blank masks [N, ANS_LEN] — vectorized: puzzle is first ANS_LEN tokens
+    dot_id = tokenizer.encode('.')[0]
+    blank_masks = (train_ids[:, :ANS_LEN] == dot_id).to(device)
 
     _arange = torch.arange(ANS_LEN, device=device)
     model = Transformer(vocab_size=len(tokenizer), block_size=max_len + 8,
@@ -936,8 +911,39 @@ def train(mask_type, tokenizer, train_data, test_data, max_len, device=None):
     best_loss, best_ema = float('inf'), None
     t0 = time.time(); tg = 0
 
-    # ── PUMA streaming buffer ──
+    # ── PUMA K schedule (paper §4.1: step function, +K_STEP every K_EVERY iters) ──
     uses_streaming = (mask_type == 'puma')
+    avg_blanks = blank_masks.sum(dim=1).float().mean().item()
+
+    # Auto-compute K_END: target ~7 cells/step (matching TinyGSM: 300 blanks / 42 steps ≈ 7)
+    if PUMA_K_END is not None:
+        puma_k_end = PUMA_K_END
+    else:
+        k_raw = avg_blanks / 7.0
+        puma_k_end = max(PUMA_K_START, int(round(k_raw / PUMA_K_STEP) * PUMA_K_STEP))
+        puma_k_end = min(puma_k_end, int(avg_blanks) // 3)  # cap: don't make K > blanks/3
+
+    # Auto-compute K_EVERY: ramp over first 1/3 of training (matching paper: 300k/900k)
+    n_increments = max(1, (puma_k_end - PUMA_K_START) // PUMA_K_STEP)
+    if PUMA_K_EVERY is not None:
+        puma_k_every = PUMA_K_EVERY
+    else:
+        ramp_iters = MAX_ITERS // 3
+        puma_k_every = max(1000, ramp_iters // n_increments)
+
+    def get_puma_k(it_num):
+        """Step-function K schedule: K_START, then +K_STEP every K_EVERY iters, capped at K_END."""
+        n_steps = it_num // puma_k_every
+        return min(PUMA_K_START + n_steps * PUMA_K_STEP, puma_k_end)
+
+    if uses_streaming:
+        final_k = get_puma_k(MAX_ITERS)
+        print(f"  PUMA K: {PUMA_K_START} → {final_k} (+{PUMA_K_STEP} every {puma_k_every//1000}k, "
+              f"cap={puma_k_end}, avg blanks={avg_blanks:.0f}, cells/step: "
+              f"{avg_blanks/PUMA_K_START:.0f}→{avg_blanks/max(final_k,1):.0f})")
+        # Store for eval functions
+        globals()['_PUMA_K_FINAL'] = final_k
+
     if uses_streaming:
         buf_z = torch.zeros(BATCH_SIZE, T, dtype=torch.long, device=device)
         buf_x0 = torch.zeros(BATCH_SIZE, T, dtype=torch.long, device=device)
@@ -955,13 +961,12 @@ def train(mask_type, tokenizer, train_data, test_data, max_len, device=None):
             buf_z[idx_t] = train_ids[si].clone()
             buf_ans[idx_t] = train_ans[si]
             buf_stage[idx_t] = 0
-            # Mask blank positions
             ap = (buf_ans[idx_t].unsqueeze(1) + _arange).clamp(max=T - 1)
             bii = idx_t.unsqueeze(1).expand_as(ap)
             bl = blank_masks[si]
             buf_z[bii[bl], ap[bl]] = mask_id
 
-        def _advance(logits):
+        def _advance(logits, K_cur):
             nonlocal buf_stage
             B_buf = BATCH_SIZE
             ap = (buf_ans.unsqueeze(1) + _arange).clamp(max=T - 1)
@@ -974,7 +979,7 @@ def train(mask_type, tokenizer, train_data, test_data, max_len, device=None):
             confs = F.softmax(lp, dim=-1).max(dim=-1).values
             confs[~is_m] = -float('inf')
             nm = is_m.sum(dim=1).float()
-            K_rem = (PUMA_K - buf_stage).clamp(min=1).float()
+            K_rem = (K_cur - buf_stage).clamp(min=1).float()
             nr = (nm / K_rem).ceil().long().clamp(min=1)
             ranked = confs.argsort(dim=1, descending=True)
             rop = torch.zeros_like(ranked)
@@ -982,7 +987,7 @@ def train(mask_type, tokenizer, train_data, test_data, max_len, device=None):
             reveal = ((rop < nr.unsqueeze(1)) | (confs > PUMA_TAU)) & is_m
             buf_z[bi[reveal], ap[reveal]] = buf_x0[bi[reveal], ap[reveal]]
             buf_stage += 1
-            done = (~(buf_z[bi, ap] == mask_id).any(dim=1)) | (buf_stage >= PUMA_K)
+            done = (~(buf_z[bi, ap] == mask_id).any(dim=1)) | (buf_stage >= K_cur)
             if done.any():
                 _refresh(done.nonzero(as_tuple=True)[0].tolist())
 
@@ -1019,6 +1024,9 @@ def train(mask_type, tokenizer, train_data, test_data, max_len, device=None):
 
     for it in range(1, MAX_ITERS + 1):
         for pg in optimizer.param_groups: pg['lr'] = get_lr(it)
+
+        # K schedule: step function (PUMA paper §4.1)
+        K_cur = get_puma_k(it) if uses_streaming else 0
 
         if uses_streaming:
             m = (buf_z == mask_id)
@@ -1062,7 +1070,7 @@ def train(mask_type, tokenizer, train_data, test_data, max_len, device=None):
                 ema_state[k].lerp_(v, 1 - EMA_DECAY)
 
         if uses_streaming:
-            _advance(logits.detach())
+            _advance(logits.detach(), K_cur)
 
         if it % LOG_EVERY == 0:
             dynamics['train_loss'].append((it, loss.item()))
@@ -1279,7 +1287,7 @@ def run(tag=''):
     sd = {'config': {k: globals()[k] for k in [
         'GRID_N', 'GRID_H', 'GRID_W', 'CELL_N', 'N_TRAIN', 'N_TEST', 'MAX_ITERS',
         'BATCH_SIZE', 'N_LAYER', 'N_HEAD', 'N_EMBD', 'MASK_TYPES', 'DECODE_POLICIES',
-        'PUMA_K', 'PUMA_TAU', 'STRAIGHTNESS_BIAS']}}
+        'PUMA_K_START', 'PUMA_K_END', 'PUMA_K_STEP', 'PUMA_K_EVERY', 'PUMA_TAU', 'STRAIGHTNESS_BIAS']}}
     for k, v in all_dyn.items():
         sd[k] = {'checkpoints': v['checkpoints'], 'train_loss': v['train_loss']}
     for k, v in all_final.items():
