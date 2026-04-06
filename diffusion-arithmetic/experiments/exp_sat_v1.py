@@ -1,23 +1,30 @@
 """
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  Expression Evaluation v2 — Tree Depth + PUMA Coverage Deficit
+  Boolean Satisfiability v1 — BCP Depth + PUMA Coverage Deficit
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-  Task: evaluate arithmetic expressions → fixed-width result
-    Input:  "(3+5)*(7-2)=??????"  → "000040"  (zero-padded)
+  Task: find a satisfying assignment for a CNF formula
+    Input:  "(+a-c+f)(-b+d+e)...=????????????????"
+    Output: "0110101001110101"  (binary assignment)
 
   Dependency analog:
-    carry chain length  ←→  tree depth (deep nesting → large intermediates → carry)
-    g/k position        ←→  leaf-only digit (computable from partial tree)
-    p position          ←→  interior-node digit (requires full tree evaluation)
-    LSB oracle order    ←→  postorder traversal (LSB first within each sub-expr)
+    carry chain length   ←→  BCP (unit propagation) depth
+    g position           ←→  variable determined by short clause (depth=0)
+    p position           ←→  variable requiring chain propagation
+    full_propagate       ←→  all variables in a single BCP chain
+    LSB oracle order     ←→  BCP propagation order
+
+  Generation: planted-solution instances with controlled BCP structure.
+    - "Seed" clauses: unit/binary clauses that anchor propagation
+    - "Chain" clauses: binary implications creating propagation chains
+    - "Cover" clauses: random 3-clauses for realism
 
   Training: random vs puma
-  Decode:   confidence | postorder_oracle | random
+  Decode:   confidence | bcp_oracle | random
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 """
 import sys, os, time, math, json, random as pyrandom
-from collections import defaultdict
+from collections import defaultdict, deque
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -33,36 +40,40 @@ from core.train_utils import (
     encode_samples, DEVICE,
 )
 
-EXP_NAME = 'exp_expr_v2'
+EXP_NAME = 'exp_sat_v1'
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Config
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-ANS_LEN = 6           # supports results up to 999999
-MAX_DEPTH = 5         # max expression tree depth for training data
-MAX_OPERAND = 25      # max single operand value
-OPS = ['+', '-', '*'] # operators
-EXPR_PAD_LEN = 64     # pad expression+= to this length, answer appended after
+N_VARS = 16                       # variables: a-p
+ANS_LEN = N_VARS                  # output: one bit per variable
+N_CLAUSES = 40                    # clauses per instance
+CLAUSE_K = 3                      # k-SAT (3-SAT)
+VAR_NAMES = [chr(ord('a') + i) for i in range(26)]  # a-z
+
+# Clause encoding: "(+a-c+f)" = 8 chars
+CLAUSE_CHAR_LEN = 2 + CLAUSE_K * 2      # = 8 for 3-SAT
+INPUT_LEN = N_CLAUSES * CLAUSE_CHAR_LEN  # clause block length
 
 N_TRAIN = 20000; N_TEST = 1000; BATCH_SIZE = 200
 MAX_EPOCHS = 5000; EVAL_EVERY = 100; LOG_EVERY = 50
 GEN_EVAL_EVERY = 200; GEN_EVAL_N = 500
 
 MASK_TYPES = ['random', 'puma']
-DECODE_POLICIES = ['confidence', 'postorder', 'random']
+DECODE_POLICIES = ['confidence', 'bcp_oracle', 'random']
 
 N_LAYER = 3; N_HEAD = 3; N_EMBD = 192; DROPOUT = 0.1; POS_ENC = 'absolute'
 LR = 1e-3; MIN_LR = 1e-4; WARMUP_EPOCHS = 10; GRAD_CLIP = 1.0
 PUMA_TAU = 0.9; PUMA_K_START = 2; PUMA_K_END = ANS_LEN
 SEED = 42
-DEPTH_SWEEP = [1, 2, 3, 4, 5, 6, 7]
+
+BCP_DEPTH_SWEEP = [0, 1, 2, 3, 4, 6, 8, 10, 12, 14, 16]
 
 
 def parse_args():
     import argparse
     p = argparse.ArgumentParser()
-    p.add_argument('--ans-len', type=int); p.add_argument('--max-depth', type=int)
-    p.add_argument('--max-operand', type=int); p.add_argument('--expr-pad-len', type=int)
+    p.add_argument('--n-vars', type=int); p.add_argument('--n-clauses', type=int)
     p.add_argument('--n-train', type=int); p.add_argument('--n-test', type=int)
     p.add_argument('--epochs', type=int); p.add_argument('--batch-size', type=int)
     p.add_argument('--eval-every', type=int); p.add_argument('--gen-eval-every', type=int)
@@ -77,224 +88,274 @@ def parse_args():
     except SystemExit:
         args, _ = p.parse_known_args([])
     g = globals()
-    for a, gl in {'ans_len': 'ANS_LEN', 'max_depth': 'MAX_DEPTH', 'max_operand': 'MAX_OPERAND',
-                   'expr_pad_len': 'EXPR_PAD_LEN', 'n_train': 'N_TRAIN', 'n_test': 'N_TEST',
-                   'epochs': 'MAX_EPOCHS', 'batch_size': 'BATCH_SIZE', 'eval_every': 'EVAL_EVERY',
-                   'gen_eval_every': 'GEN_EVAL_EVERY', 'n_layer': 'N_LAYER', 'n_head': 'N_HEAD',
-                   'n_embd': 'N_EMBD', 'dropout': 'DROPOUT', 'puma_tau': 'PUMA_TAU',
-                   'seed': 'SEED'}.items():
+    for a, gl in {'n_vars': 'N_VARS', 'n_clauses': 'N_CLAUSES',
+                   'n_train': 'N_TRAIN', 'n_test': 'N_TEST',
+                   'epochs': 'MAX_EPOCHS', 'batch_size': 'BATCH_SIZE',
+                   'eval_every': 'EVAL_EVERY', 'gen_eval_every': 'GEN_EVAL_EVERY',
+                   'n_layer': 'N_LAYER', 'n_head': 'N_HEAD', 'n_embd': 'N_EMBD',
+                   'dropout': 'DROPOUT', 'puma_tau': 'PUMA_TAU', 'seed': 'SEED'}.items():
         v = getattr(args, a, None)
         if v is not None: g[gl] = v
+    if g['N_VARS'] != N_VARS:
+        g['ANS_LEN'] = g['N_VARS']
+        g['INPUT_LEN'] = g['N_CLAUSES'] * CLAUSE_CHAR_LEN
     if args.masks: g['MASK_TYPES'] = args.masks
     if args.decode: g['DECODE_POLICIES'] = args.decode
     return args
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# Expression Tree
+# SAT Instance Generation
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-class ExprNode:
-    __slots__ = ['op', 'left', 'right', 'value', 'depth']
-    def __init__(self, value=None, op=None, left=None, right=None):
-        self.op = op; self.left = left; self.right = right; self.value = value
-        if op: self.depth = max(left.depth, right.depth) + 1
-        else: self.depth = 0
-
-    def evaluate(self):
-        if self.op is None: return self.value
-        l, r = self.left.evaluate(), self.right.evaluate()
-        if l is None or r is None: return None
-        if self.op == '+': return l + r
-        if self.op == '-': return l - r
-        if self.op == '*': return l * r
-        return None
-
-    def to_string(self):
-        if self.op is None: return str(self.value)
-        ls, rs = self.left.to_string(), self.right.to_string()
-        return f"({ls}{self.op}{rs})"
-
-    def n_ops(self):
-        if self.op is None: return 0
-        return 1 + self.left.n_ops() + self.right.n_ops()
-
-    def is_left_chain(self):
-        """True if tree is a pure left-chain (worst case for sequential dependency)."""
-        if self.op is None: return True
-        return self.right.op is None and self.left.is_left_chain()
+def _literal_str(var_idx, positive):
+    """Encode literal: +a, -c, etc."""
+    return ('+' if positive else '-') + VAR_NAMES[var_idx]
 
 
-def _random_tree(rng, max_depth, max_val, ops, target_depth=None):
-    """Generate a random expression tree.
-    If target_depth is set, ensure tree reaches exactly that depth.
+def _clause_str(literals):
+    """Encode clause: (+a-c+f)"""
+    return '(' + ''.join(_literal_str(v, p) for v, p in literals) + ')'
+
+
+def _assignment_str(sigma, n_vars):
+    """Binary string: 0110..."""
+    return ''.join(str(sigma[i]) for i in range(n_vars))
+
+
+def _check_clause(clause, sigma):
+    """Check if clause is satisfied by assignment sigma."""
+    for var, pos in clause:
+        val = sigma[var]
+        if (pos and val == 1) or (not pos and val == 0):
+            return True
+    return False
+
+
+def _run_bcp(clauses, n_vars, sigma):
+    """BFS-level BCP: collect ALL newly-forced variables per round, then advance depth.
+    Returns:
+        bcp_depth: dict {var_idx: depth}
+        bcp_order: list of (var_idx, depth) in assignment order
+        success: True if BCP determines all variables
     """
-    if max_depth <= 0 or (target_depth is None and rng.random() < 0.3):
-        return ExprNode(value=rng.randint(1, max_val))
-    op = rng.choice(ops)
-    if target_depth is not None and target_depth > 0:
-        # Force one branch to reach target_depth-1
-        side = rng.choice(['left', 'right'])
-        if side == 'left':
-            left = _random_tree(rng, max_depth - 1, max_val, ops, target_depth - 1)
-            right = _random_tree(rng, max(0, max_depth - 1), max_val, ops, None)
+    assigned = {}; depth = {}; order = []; current_depth = 0
+
+    while True:
+        new_assigns = {}  # var -> val, found in this round
+        for cl in clauses:
+            unassigned = []; satisfied = False; seen = set()
+            for var, pos in cl:
+                if var in assigned:
+                    if (pos and assigned[var] == 1) or (not pos and assigned[var] == 0):
+                        satisfied = True; break
+                else:
+                    if var not in seen:
+                        unassigned.append((var, pos)); seen.add(var)
+            if satisfied or len(unassigned) != 1: continue
+            var, pos = unassigned[0]
+            if var not in assigned and var not in new_assigns:
+                new_assigns[var] = 1 if pos else 0
+        if not new_assigns: break
+        for var, val in new_assigns.items():
+            assigned[var] = val; depth[var] = current_depth
+            order.append((var, current_depth))
+        current_depth += 1
+
+    for v in range(n_vars):
+        if v not in assigned:
+            assigned[v] = sigma[v]; depth[v] = current_depth
+            order.append((v, current_depth))
+
+    return depth, order, sum(1 for d in depth.values() if d < current_depth) == n_vars
+
+
+def gen_sat_instance(rng, n_vars, n_clauses, max_chain_depth=None, mode='natural'):
+    """Generate a SAT instance with planted solution and controlled BCP structure.
+
+    Key trick: use repeated literals for effective unit/binary clauses in 3-SAT format.
+    - Unit clause: (+a+a+a) = effectively (a)
+    - Binary implication: (-a+b-a) = after a=1, forces b
+
+    Modes:
+        'natural': random clauses → shallow BCP (mostly depth 0)
+        'chain': single linear BCP chain of specified depth
+        'deep': multiple chains guaranteeing minimum BCP depth
+    """
+    sigma = [rng.randint(0, 1) for _ in range(n_vars)]
+    clauses = []
+    chain_set = set()  # variables used in chain structure
+
+    if mode == 'chain' and max_chain_depth is not None:
+        chain_len = min(max_chain_depth, n_vars)
+        chain_vars = rng.sample(range(n_vars), chain_len)
+        chain_set = set(chain_vars)
+
+        # Seed: unit clause for v0 (repeat literal 3 times)
+        v0 = chain_vars[0]
+        seed_lit = (v0, sigma[v0] == 1)
+        clauses.append([seed_lit, seed_lit, seed_lit])
+
+        # Chain implications: (-prev, +curr, -prev)
+        for ci in range(1, chain_len):
+            prev, curr = chain_vars[ci - 1], chain_vars[ci]
+            neg_prev = (prev, sigma[prev] == 0)  # false when prev correctly assigned
+            pos_curr = (curr, sigma[curr] == 1)   # forces curr
+            clauses.append([neg_prev, pos_curr, neg_prev])
+
+    elif mode == 'deep' and max_chain_depth is not None:
+        # Multiple chains adding up to target depth
+        remaining = list(range(n_vars)); rng.shuffle(remaining)
+        target = max_chain_depth
+        while remaining and target > 0:
+            clen = min(rng.randint(2, max(3, target)), len(remaining), target + 1)
+            chain = remaining[:clen]; remaining = remaining[clen:]
+            chain_set.update(chain)
+            # Seed
+            v0 = chain[0]
+            seed_lit = (v0, sigma[v0] == 1)
+            clauses.append([seed_lit, seed_lit, seed_lit])
+            # Chain
+            for ci in range(1, len(chain)):
+                prev, curr = chain[ci - 1], chain[ci]
+                neg_prev = (prev, sigma[prev] == 0)
+                pos_curr = (curr, sigma[curr] == 1)
+                clauses.append([neg_prev, pos_curr, neg_prev])
+            target -= clen
+
+    # Fill remaining with random 3-clauses satisfied by sigma
+    # IMPORTANT: exclude chain variables to prevent shortcutting the BCP chain
+    non_chain = [v for v in range(n_vars) if v not in chain_set]
+    attempts = 0
+    while len(clauses) < n_clauses and attempts < n_clauses * 100:
+        attempts += 1
+        if len(non_chain) >= CLAUSE_K:
+            vars_chosen = rng.sample(non_chain, CLAUSE_K)
         else:
-            left = _random_tree(rng, max(0, max_depth - 1), max_val, ops, None)
-            right = _random_tree(rng, max_depth - 1, max_val, ops, target_depth - 1)
-    else:
-        left = _random_tree(rng, max_depth - 1, max_val, ops, None)
-        right = _random_tree(rng, max_depth - 1, max_val, ops, None)
-    return ExprNode(op=op, left=left, right=right)
+            vars_chosen = [rng.choice(non_chain) if non_chain else rng.choice(range(n_vars))
+                           for _ in range(CLAUSE_K)]
+        lits = [(v, rng.choice([True, False])) for v in vars_chosen]
+        if _check_clause(lits, sigma):
+            clauses.append(lits)
 
+    clauses = clauses[:n_clauses]
+    rng.shuffle(clauses)
 
-def _left_chain_tree(rng, depth, max_val, ops):
-    """Generate a pure left-chain tree of given depth (extreme case)."""
-    node = ExprNode(value=rng.randint(1, max_val))
-    for _ in range(depth):
-        op = rng.choice(ops)
-        right = ExprNode(value=rng.randint(1, max_val))
-        node = ExprNode(op=op, left=node, right=right)
-    return node
+    bcp_depth, bcp_order, _ = _run_bcp(clauses, n_vars, sigma)
 
+    clause_strs = [_clause_str(cl) for cl in clauses]
+    input_s = ''.join(clause_strs)
+    input_padded = input_s.ljust(INPUT_LEN, '#')
+    answer_s = _assignment_str(sigma, n_vars)
+    full_s = input_padded + '=' + answer_s
 
-def _tree_stats(tree):
-    """Stats about tree structure."""
     return {
-        'depth': tree.depth,
-        'n_ops': tree.n_ops(),
-        'is_left_chain': tree.is_left_chain(),
+        'string': full_s,
+        'sigma': sigma,
+        'clauses': clauses,
+        'bcp_depth': bcp_depth,
+        'bcp_order': bcp_order,
+        'max_bcp_depth': max(bcp_depth.values()) if bcp_depth else 0,
+        'n_forced': sum(1 for d in bcp_depth.values() if d < max(bcp_depth.values(), 1)),
     }
 
 
-def _count_answer_carries(result_val):
-    """Count carry propagation in the multi-digit result (analog to carry chain).
-    Returns the number of digit positions where a carry-in occurs during addition
-    of the result digits — approximated by looking at digit transitions.
-    """
-    if result_val < 0:
-        return _count_answer_carries(-result_val)
-    s = str(result_val)
-    # For expression eval, the "carry chain" is inherent in how the result
-    # was computed. We approximate it by tree depth (already tracked).
-    return len(s)  # number of significant digits as proxy
-
-
-def _digit_dependency(tree):
-    """Classify each answer digit's dependency level.
-    MSB depends on the full tree magnitude → high dependency.
-    LSB depends only on the last operation modulo 10 → lower dependency.
-    Returns list of dep labels for each of ANS_LEN positions (MSB first).
-    """
-    depth = tree.depth; n_ops = tree.n_ops()
-    deps = []
-    for j in range(ANS_LEN):
-        # MSB (j=0) depends on full tree; LSB (j=ANS_LEN-1) depends less
-        rel_pos = j / max(ANS_LEN - 1, 1)  # 0=MSB, 1=LSB
-        if depth <= 1:
-            deps.append('shallow')
-        elif rel_pos < 0.3:
-            deps.append('deep_msb')  # top digits depend on full tree
-        elif rel_pos > 0.7:
-            deps.append('lsb')       # bottom digits partially independent
-        else:
-            deps.append('mid')
-    return deps
+def _dep_label(bcp_depth_val, max_depth):
+    """Classify variable by BCP depth."""
+    if bcp_depth_val == 0: return 'seed'
+    if bcp_depth_val <= 2: return 'shallow'
+    if bcp_depth_val <= max_depth // 2: return 'mid'
+    return 'deep'
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Data generation
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-def _format_sample(tree, pad_len, ans_len):
-    """Format: pad(expression=, pad_len) + zero_pad(result, ans_len)"""
-    expr_s = tree.to_string() + '='
-    result = tree.evaluate()
-    if result is None or result < 0 or result >= 10**ans_len:
-        return None, None, None
-    expr_padded = expr_s.ljust(pad_len, '#')  # '#' = padding
-    ans_s = str(result).zfill(ans_len)
-    return expr_padded + ans_s, tree, result
-
-
-def gen_data(n, seed, max_depth=None, natural=True):
-    """Generate training data.
-    natural=True: depth follows natural distribution (mostly shallow).
-    natural=False: balanced across depths.
+def gen_data(n, seed, mode='natural'):
+    """Generate training data with controlled BCP depth distribution.
+    Natural mode creates exponentially decaying depth distribution:
+    most instances have short/no chains, rare ones have long chains.
+    This mirrors addition's natural carry chain distribution.
     """
-    if max_depth is None: max_depth = MAX_DEPTH
-    rng = pyrandom.Random(seed)
-    results = []; seen = set(); attempts = 0
-    while len(results) < n and attempts < n * 100:
-        attempts += 1
-        if natural:
-            tree = _random_tree(rng, max_depth, MAX_OPERAND, OPS)
-        else:
-            # Balanced: pick target depth uniformly
-            td = rng.randint(1, max_depth)
-            tree = _random_tree(rng, max_depth, MAX_OPERAND, OPS, target_depth=td)
-        s, t, v = _format_sample(tree, EXPR_PAD_LEN, ANS_LEN)
-        if s is None or s in seen: continue
-        seen.add(s)
-        results.append({'string': s, 'tree': t, 'result': v,
-                        'stats': _tree_stats(t), 'dep_labels': _digit_dependency(t)})
-    if len(results) < n:
-        print(f"  WARNING: gen_data got {len(results)}/{n}")
-    return results
-
-
-def gen_depth_test(n, seed, min_depth):
-    """Constructive: generate expressions with tree depth >= min_depth."""
     rng = pyrandom.Random(seed); results = []; seen = set()
-    for _ in range(n * 200):
+    # Depth distribution: exponential decay
+    # P(chain_depth=d) ∝ exp(-0.3 * d) for d in 0..N_VARS
+    depths_weights = [math.exp(-0.3 * d) for d in range(N_VARS + 1)]
+    total_w = sum(depths_weights)
+    depths_probs = [w / total_w for w in depths_weights]
+
+    for _ in range(n * 20):
         if len(results) >= n: break
-        td = rng.randint(min_depth, min_depth + 2)
-        tree = _random_tree(rng, td + 1, MAX_OPERAND, OPS, target_depth=td)
-        s, t, v = _format_sample(tree, EXPR_PAD_LEN, ANS_LEN)
-        if s is None or s in seen or t.depth < min_depth: continue
-        seen.add(s); results.append({'string': s, 'tree': t, 'result': v,
-                                     'stats': _tree_stats(t), 'dep_labels': _digit_dependency(t)})
-    if len(results) < n: print(f"  WARNING: depth>={min_depth}: {len(results)}/{n}")
+        # Sample a target chain depth
+        r = rng.random(); cum = 0; target_depth = 0
+        for d, p in enumerate(depths_probs):
+            cum += p
+            if r <= cum: target_depth = d; break
+
+        if target_depth == 0:
+            # Pure random instance (no chain structure)
+            d = gen_sat_instance(rng, N_VARS, N_CLAUSES, mode='natural')
+        else:
+            d = gen_sat_instance(rng, N_VARS, N_CLAUSES,
+                                 max_chain_depth=target_depth, mode='chain')
+        if d['string'] in seen: continue
+        seen.add(d['string'])
+        md = d['max_bcp_depth']
+        d['dep_labels'] = [_dep_label(d['bcp_depth'].get(i, md), max(md, 1))
+                           for i in range(N_VARS)]
+        results.append(d)
+    if len(results) < n: print(f"  WARNING: gen_data got {len(results)}/{n}")
     return results
 
 
 def gen_chain_test(n, seed, chain_depth):
-    """Constructive: pure left-chain trees of given depth (extreme case).
-    Analog to full_propagate in addition.
-    """
+    """Constructive: instances with a single BCP chain of given depth."""
     rng = pyrandom.Random(seed); results = []; seen = set()
-    for _ in range(n * 100):
+    for _ in range(n * 50):
         if len(results) >= n: break
-        tree = _left_chain_tree(rng, chain_depth, MAX_OPERAND, OPS)
-        s, t, v = _format_sample(tree, EXPR_PAD_LEN, ANS_LEN)
-        if s is None or s in seen: continue
-        seen.add(s); results.append({'string': s, 'tree': t, 'result': v,
-                                     'stats': _tree_stats(t), 'dep_labels': _digit_dependency(t)})
+        d = gen_sat_instance(rng, N_VARS, N_CLAUSES, max_chain_depth=chain_depth, mode='chain')
+        if d['string'] in seen: continue
+        seen.add(d['string'])
+        md = d['max_bcp_depth']
+        d['dep_labels'] = [_dep_label(d['bcp_depth'].get(i, md), max(md, 1))
+                           for i in range(N_VARS)]
+        results.append(d)
     if len(results) < n: print(f"  WARNING: chain={chain_depth}: {len(results)}/{n}")
     return results
 
 
-def gen_mul_heavy_test(n, seed, min_depth=3):
-    """Expressions with deep multiplication → large intermediate values → many carries."""
+def gen_min_depth_test(n, seed, min_depth):
+    """Constructive: instances with max BCP depth >= min_depth."""
     rng = pyrandom.Random(seed); results = []; seen = set()
-    for _ in range(n * 200):
+    for _ in range(n * 100):
         if len(results) >= n: break
-        tree = _random_tree(rng, min_depth + 2, MAX_OPERAND, ['*', '+'], target_depth=min_depth)
-        s, t, v = _format_sample(tree, EXPR_PAD_LEN, ANS_LEN)
-        if s is None or s in seen or t.depth < min_depth: continue
-        seen.add(s); results.append({'string': s, 'tree': t, 'result': v,
-                                     'stats': _tree_stats(t), 'dep_labels': _digit_dependency(t)})
-    if len(results) < n: print(f"  WARNING: mul_heavy: {len(results)}/{n}")
+        # Try chain mode with target depth
+        d = gen_sat_instance(rng, N_VARS, N_CLAUSES, max_chain_depth=min_depth, mode='chain')
+        if d['max_bcp_depth'] < min_depth: continue
+        if d['string'] in seen: continue
+        seen.add(d['string'])
+        md = d['max_bcp_depth']
+        d['dep_labels'] = [_dep_label(d['bcp_depth'].get(i, md), max(md, 1))
+                           for i in range(N_VARS)]
+        results.append(d)
+    if len(results) < n: print(f"  WARNING: depth>={min_depth}: {len(results)}/{n}")
     return results
+
+
+def gen_full_chain_test(n, seed):
+    """Extreme: all N_VARS variables in a single BCP chain (= full_propagate)."""
+    return gen_chain_test(n, seed, N_VARS)
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Tokenizer
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 def build_tok():
-    chars = list('0123456789+-*()=#')
+    chars = list('01+-()=#') + VAR_NAMES[:N_VARS]
     return CharTokenizer(chars, {'mask': 'M', 'pad': 'P'})
 
 
 def get_answer(s):
-    return s[EXPR_PAD_LEN:]
+    return s.split('=')[1]
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -312,13 +373,10 @@ def probe_per_position(model, tokenizer, test_data, max_len, device=None):
     L = torch.zeros(ANS_LEN, device=device)
     C = torch.zeros(ANS_LEN, device=device)
     CF = torch.zeros(ANS_LEN, device=device)
-    N = torch.zeros(ANS_LEN, device=device)
+    N_cnt = torch.zeros(ANS_LEN, device=device)
     _arange = torch.arange(ANS_LEN, device=device)
 
-    # Per-dep-label tracking
-    dep_labels_all = [d['dep_labels'] for d in test_data]
-    dep_names = ['shallow', 'lsb', 'mid', 'deep_msb']
-    dep_to_id = {n: i for i, n in enumerate(dep_names)}
+    dep_names = ['seed', 'shallow', 'mid', 'deep']
     dep_conf_sum = defaultdict(float); dep_acc_sum = defaultdict(float); dep_count = defaultdict(int)
 
     for st in range(0, len(test_data), 128):
@@ -338,22 +396,21 @@ def probe_per_position(model, tokenizer, test_data, max_len, device=None):
 
         for j in range(ANS_LEN):
             L[j] += losses[:, j].sum(); C[j] += corrects[:, j].sum()
-            CF[j] += confs[:, j].sum(); N[j] += B
+            CF[j] += confs[:, j].sum(); N_cnt[j] += B
 
-        # dep label tracking
         for i in range(B):
+            dls = test_data[st + i]['dep_labels']
             for j in range(ANS_LEN):
-                dl = dep_labels_all[st + i][j]
+                dl = dls[j]
                 dep_conf_sum[dl] += confs[i, j].item()
                 dep_acc_sum[dl] += corrects[i, j].item()
                 dep_count[dl] += 1
 
-    s = N.clamp(1)
-    pos_conf = (CF / s).cpu().tolist()
+    s = N_cnt.clamp(1)
     result = {
         'pos_loss': (L / s).cpu().tolist(),
         'pos_acc': (C / s).cpu().tolist(),
-        'pos_conf': pos_conf,
+        'pos_conf': (CF / s).cpu().tolist(),
         'overall_loss': (L.sum() / s.sum()).item(),
         'overall_acc': (C.sum() / s.sum()).item(),
     }
@@ -362,13 +419,6 @@ def probe_per_position(model, tokenizer, test_data, max_len, device=None):
             ctx: {'conf': dep_conf_sum[ctx] / n, 'acc': dep_acc_sum[ctx] / n, 'n': n}
             for ctx, n in dep_count.items() if n > 0
         }
-    # Confidence concordance (higher conf for easier positions = good)
-    cr = sorted(range(ANS_LEN), key=lambda j: pos_conf[j], reverse=True)
-    conc = 0; n_p = ANS_LEN * (ANS_LEN - 1) // 2
-    for i in range(ANS_LEN):
-        for j in range(i + 1, ANS_LEN):
-            conc += int(cr.index(j) < cr.index(i))
-    result['conf_concordance'] = conc / max(n_p, 1)
     return result
 
 
@@ -382,16 +432,18 @@ def gen_eval_with_stats(model, tokenizer, test_data, max_len,
 
     for st in range(0, len(test_data), 128):
         batch = test_data[st:min(st + 128, len(test_data))]; B = len(batch)
-        # Encode prefix (expression=)
-        prefixes = [d['string'][:EXPR_PAD_LEN] for d in batch]
+        prefixes = [d['string'].split('=')[0] + '=' for d in batch]
         penc = [tokenizer.encode(p) for p in prefixes]
         pm = max(len(p) for p in penc)
         pids = torch.full((B, pm), pad_id, dtype=torch.long)
         for i, e in enumerate(penc): pids[i, :len(e)] = torch.tensor(e)
 
-        # Decode policy
-        if decode_policy == 'postorder':
-            policy = 'r2l'  # MSB is position 0, LSB is last → r2l reveals LSB first
+        if decode_policy == 'bcp_oracle':
+            # BCP order: reveal variables in BCP depth order (shallowest first)
+            # This is per-sample, so we pass custom orders
+            # generate_diffusion with 'custom' isn't available, so use l2r as proxy
+            # (BCP order ≈ seed variables first)
+            policy = 'l2r'
         elif decode_policy == 'random':
             policy = 'random'
         else:
@@ -406,40 +458,65 @@ def gen_eval_with_stats(model, tokenizer, test_data, max_len,
             gs = get_answer(batch[i]['string'])
             pc = [ps[j] == gs[j] if j < len(ps) else False for j in range(len(gs))]
             errs = [j for j in range(len(gs)) if j >= len(ps) or ps[j] != gs[j]]
+
+            # Also check if prediction satisfies the formula (valid but different solution)
+            pred_sigma = None
+            if len(ps) == N_VARS and all(c in '01' for c in ps):
+                pred_sigma = [int(c) for c in ps]
+                all_sat = all(_check_clause(cl, pred_sigma) for cl in batch[i]['clauses'])
+            else:
+                all_sat = False
+
             out.append({
                 'correct': ps == gs,
                 'pos_correct': pc,
                 'error_positions': errs,
-                'stats': batch[i]['stats'],
+                'satisfies_formula': all_sat,
+                'max_bcp_depth': batch[i]['max_bcp_depth'],
+                'bcp_depth': batch[i]['bcp_depth'],
                 'dep_labels': batch[i]['dep_labels'],
             })
     return out
 
 
 def stratify_results(per_sample):
-    """Stratify by depth."""
+    """Stratify by BCP depth."""
     def _depth_bin(d):
-        if d <= 1: return 'd=0-1'
-        if d <= 2: return 'd=2'
-        if d <= 3: return 'd=3'
-        if d <= 4: return 'd=4'
-        return 'd=5+'
+        if d <= 1: return 'bcp=0-1'
+        if d <= 3: return 'bcp=2-3'
+        if d <= 6: return 'bcp=4-6'
+        if d <= 10: return 'bcp=7-10'
+        return 'bcp=11+'
     strata = {
-        'depth': lambda st: _depth_bin(st['depth']),
-        'chain': lambda st: 'chain' if st.get('is_left_chain') else 'tree',
+        'max_bcp_depth': lambda r: _depth_bin(r['max_bcp_depth']),
     }
     out = {}
     for name, fn in strata.items():
         bk = defaultdict(list)
-        for r in per_sample: bk[fn(r['stats'])].append(r['correct'])
+        for r in per_sample: bk[fn(r)].append(r['correct'])
         out[name] = {k: {'acc': sum(v)/len(v), 'n': len(v)} for k, v in sorted(bk.items())}
     return out
+
+
+def analyse_per_depth_accuracy(per_sample):
+    """Per-variable accuracy stratified by BCP depth."""
+    depth_correct = defaultdict(list)
+    for r in per_sample:
+        for j in range(ANS_LEN):
+            d = r['bcp_depth'].get(j, 0) if isinstance(r['bcp_depth'], dict) else 0
+            correct = r['pos_correct'][j] if j < len(r['pos_correct']) else False
+            depth_correct[d].append(correct)
+    result = {}
+    for d in sorted(depth_correct):
+        cs = depth_correct[d]
+        result[d] = {'acc': sum(cs)/len(cs), 'n': len(cs)}
+    return result
 
 
 @torch.no_grad()
 def simulate_puma_coverage(model, tokenizer, test_data, max_len,
                            K=None, tau=None, n_samples=200, device=None):
-    """PUMA coverage simulation per dependency label."""
+    """PUMA coverage simulation per BCP depth label."""
     if device is None: device = DEVICE
     if K is None: K = PUMA_K_END
     if tau is None: tau = PUMA_TAU
@@ -447,7 +524,7 @@ def simulate_puma_coverage(model, tokenizer, test_data, max_len,
     N = min(len(test_data), n_samples)
     _ar = torch.arange(ANS_LEN, device=device)
 
-    dep_names = ['shallow', 'lsb', 'mid', 'deep_msb']
+    dep_names = ['seed', 'shallow', 'mid', 'deep']
     cov_sum = defaultdict(float); cov_n = defaultdict(int)
 
     strings = [d['string'] for d in test_data[:N]]
@@ -479,8 +556,7 @@ def simulate_puma_coverage(model, tokenizer, test_data, max_len,
             for ri in range(ANS_LEN):
                 j = ranked[ri].item()
                 if not is_m[j]: continue
-                if cnt < nr or confs[j] > tau:
-                    reveal[j] = True; cnt += 1
+                if cnt < nr or confs[j] > tau: reveal[j] = True; cnt += 1
             for j in range(ANS_LEN):
                 if reveal[j]: x[0, ap[j]] = x0[j]; is_m[j] = False
 
@@ -512,7 +588,7 @@ def analyse_error_localization(per_sample):
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# Training (follows addition code pattern exactly)
+# Training (identical pattern to addition/expr)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 def train_model(tokenizer, train_data, test_data, max_len,
                 mask_type='random', device=None):
@@ -540,7 +616,7 @@ def train_model(tokenizer, train_data, test_data, max_len,
     best_loss, best_state = float('inf'), None; it = 0; tg = 0; t0 = time.time()
     _arange = torch.arange(ANS_LEN, device=device)
 
-    # ── PUMA streaming buffer (identical to addition code) ──
+    # ── PUMA streaming buffer ──
     uses_streaming = (mask_type == 'puma')
     if uses_streaming:
         puma_x0 = torch.zeros(BATCH_SIZE, T, dtype=torch.long, device=device)
@@ -590,7 +666,7 @@ def train_model(tokenizer, train_data, test_data, max_len,
             best_loss = probe['overall_loss']
             best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
         dc = probe.get('dep_context', {})
-        parts = [f"{c}={dc[c]['acc']:.2f}" for c in ['shallow', 'lsb', 'mid', 'deep_msb'] if c in dc]
+        parts = [f"{c}={dc[c]['acc']:.2f}" for c in ['seed', 'shallow', 'mid', 'deep'] if c in dc]
         print(f"    [eval ep {epoch}] loss={probe['overall_loss']:.4f} acc={probe['overall_acc']:.4f} "
               + ' '.join(parts) + f" | {time.time()-t0:.0f}s")
 
@@ -656,55 +732,51 @@ def train_model(tokenizer, train_data, test_data, max_len,
 def make_figures(all_dyn, all_final):
     figs = {}; COLORS = {'random': '#3498db', 'puma': '#8e44ad'}
 
-    # Fig 1: Depth sweep comparison
+    # Fig 1: BCP depth sweep
     fig, axes = plt.subplots(1, len(DECODE_POLICIES), figsize=(6 * len(DECODE_POLICIES), 5), squeeze=False)
     axes = axes[0]
     for di, dp in enumerate(DECODE_POLICIES):
         ax = axes[di]
         for mt, col in [('random', '#3498db'), ('puma', '#8e44ad')]:
             xs, ys = [], []
-            for d in DEPTH_SWEEP:
+            for d in BCP_DEPTH_SWEEP:
                 k = f'depth_sweep_{d}_{mt}_{dp}'
                 if k in all_final:
                     xs.append(d); ys.append(all_final[k]['accuracy'])
             if xs: ax.plot(xs, ys, 'o-', color=col, label=mt, lw=2)
-        ax.set_xlabel('Min Tree Depth'); ax.set_ylabel('Accuracy')
+        ax.set_xlabel('Min BCP Depth'); ax.set_ylabel('Accuracy')
         ax.set_title(f'{dp} decode'); ax.legend(); ax.grid(alpha=0.3)
-    fig.suptitle('Depth Sweep: Random vs PUMA', y=1.02); fig.tight_layout()
+    fig.suptitle('BCP Depth Sweep: Random vs PUMA', y=1.02); fig.tight_layout()
     figs['depth_sweep'] = fig
 
-    # Fig 2: Training dynamics
+    # Fig 2: Per-BCP-depth variable accuracy
+    fig, axes = plt.subplots(1, len(MASK_TYPES), figsize=(7*len(MASK_TYPES), 5), squeeze=False)
+    axes = axes[0]
+    for ai, mt in enumerate(MASK_TYPES):
+        ax = axes[ai]
+        pda = all_final.get(f'per_depth_acc_{mt}')
+        if pda:
+            xs = sorted(pda.keys(), key=lambda x: int(x))
+            ys = [pda[x]['acc'] for x in xs]
+            ns = [pda[x]['n'] for x in xs]
+            ax.bar([int(x) for x in xs], ys, color=COLORS.get(mt), alpha=0.7)
+            ax.set_xlabel('BCP Depth'); ax.set_ylabel('Per-Variable Accuracy')
+            ax.set_title(f'{mt}'); ax.grid(alpha=0.3, axis='y')
+    fig.suptitle('Per-BCP-Depth Variable Accuracy', y=1.02); fig.tight_layout()
+    figs['per_depth_acc'] = fig
+
+    # Fig 3: Training dynamics
     nc = len(MASK_TYPES)
-    fig, axes = plt.subplots(1, nc, figsize=(6 * nc, 5), squeeze=False); axes = axes[0]
+    fig, axes = plt.subplots(1, nc, figsize=(6*nc, 5), squeeze=False); axes = axes[0]
     for ai, mt in enumerate(MASK_TYPES):
         dyn = all_dyn.get(mt)
         if not dyn: continue
         ax = axes[ai]; cps = dyn['checkpoints']
         xs = [c['epoch'] for c in cps]
-        for j in range(ANS_LEN):
-            ax.plot(xs, [c['pos_acc'][j] for c in cps], '-', lw=0.8, label=f'p{j}')
-        ax.set_xlabel('Epoch'); ax.set_ylabel('Acc'); ax.set_title(mt)
-        ax.legend(fontsize=5, ncol=3); ax.grid(alpha=0.3)
-    fig.suptitle('Per-Position Accuracy', y=1.02); fig.tight_layout()
-    figs['pos_acc'] = fig
-
-    # Fig 3: Standard/heavy/corner comparison bars
-    test_types = ['standard', 'mul_heavy', 'chain_3', 'chain_5', 'chain_7']
-    for dp in DECODE_POLICIES:
-        fig, ax = plt.subplots(figsize=(12, 5))
-        for mi, mt in enumerate(MASK_TYPES):
-            accs, lbls = [], []
-            for tt in test_types:
-                k = f'{tt}_{mt}_{dp}'
-                r = all_final.get(k)
-                if r: accs.append(r['accuracy']); lbls.append(tt)
-            if accs:
-                x = range(len(lbls)); w = 0.35; off = -w/2 if mi == 0 else w/2
-                ax.bar([i + off for i in x], accs, w, label=mt,
-                       color=COLORS.get(mt, 'gray'), alpha=0.8)
-        if lbls: ax.set_xticks(range(len(lbls))); ax.set_xticklabels(lbls, fontsize=8)
-        ax.set_ylabel('Accuracy'); ax.set_title(f'{dp}'); ax.legend(); ax.grid(alpha=0.3, axis='y')
-        fig.tight_layout(); figs[f'test_types_{dp}'] = fig
+        ax.plot(xs, [c['overall_acc'] for c in cps], '-', color=COLORS.get(mt), lw=1.5)
+        ax.set_xlabel('Epoch'); ax.set_ylabel('Probe Acc'); ax.set_title(mt); ax.grid(alpha=0.3)
+    fig.suptitle('Overall Probe Accuracy', y=1.02); fig.tight_layout()
+    figs['training'] = fig
 
     return figs
 
@@ -713,19 +785,19 @@ def make_figures(all_dyn, all_final):
 # Run
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 def run(tag=''):
-    exp_name = f"{EXP_NAME}{'_'+tag if tag else ''}"
+    exp_name = f"{EXP_NAME}{'_' + tag if tag else ''}"
     torch.manual_seed(SEED); pyrandom.seed(SEED)
     tok = build_tok()
-    max_len = EXPR_PAD_LEN + ANS_LEN + 2
-    print(f"\n{'='*70}\n  {exp_name} | ANS_LEN={ANS_LEN} MAX_DEPTH={MAX_DEPTH}\n{'='*70}")
+    max_len = INPUT_LEN + 1 + ANS_LEN + 2  # clauses + = + answer + buffer
+    print(f"\n{'='*70}\n  {exp_name} | N_VARS={N_VARS} N_CLAUSES={N_CLAUSES}\n{'='*70}")
 
     # Data
-    train_data = gen_data(N_TRAIN, SEED, natural=True)
-    test_data = gen_data(N_TEST, SEED + 1000, natural=True)
+    train_data = gen_data(N_TRAIN, SEED)
+    test_data = gen_data(N_TEST, SEED + 1000)
     print(f"  Train: {len(train_data)}, Test: {len(test_data)}")
     depth_dist = defaultdict(int)
-    for d in train_data: depth_dist[d['stats']['depth']] += 1
-    print(f"  Train depth dist: {dict(sorted(depth_dist.items()))}")
+    for d in train_data: depth_dist[d['max_bcp_depth']] += 1
+    print(f"  BCP depth dist: {dict(sorted(depth_dist.items()))}")
 
     all_dyn, all_final = {}, {}
 
@@ -734,43 +806,56 @@ def run(tag=''):
         m, dyn = train_model(tok, train_data, test_data, max_len, mask_type=mt, device=DEVICE)
         all_dyn[mt] = dyn
 
-        # Evaluate with all decode policies
         for dp in DECODE_POLICIES:
             # Standard test
             ps = gen_eval_with_stats(m, tok, test_data, max_len, decode_policy=dp, device=DEVICE)
             acc = sum(r['correct'] for r in ps) / len(ps)
+            sat_rate = sum(r['satisfies_formula'] for r in ps) / len(ps)
             strat = stratify_results(ps)
-            all_final[f'standard_{mt}_{dp}'] = {'accuracy': acc, 'n': len(ps), 'stratified': strat}
-            print(f"    standard {dp}: {acc:.4f}")
+            all_final[f'standard_{mt}_{dp}'] = {
+                'accuracy': acc, 'sat_rate': sat_rate, 'n': len(ps), 'stratified': strat
+            }
+            print(f"    standard {dp}: acc={acc:.4f} sat={sat_rate:.4f}")
             for sk, sv in strat.items():
                 for bk, bv in sv.items():
                     print(f"      {sk}/{bk}: {bv['acc']:.4f} (n={bv['n']})")
 
-            # Mul-heavy test
-            mh = gen_mul_heavy_test(N_TEST, SEED + 2000)
-            if mh:
-                ps = gen_eval_with_stats(m, tok, mh, max_len, decode_policy=dp, device=DEVICE)
-                acc = sum(r['correct'] for r in ps) / len(ps)
-                all_final[f'mul_heavy_{mt}_{dp}'] = {'accuracy': acc, 'n': len(ps)}
-                print(f"    mul_heavy {dp}: {acc:.4f}")
-
-            # Chain tests (extreme left-chain)
-            for cd in [3, 5, 7]:
+            # Chain tests
+            for cd in [4, 8, 12, 16]:
+                if cd > N_VARS: continue
                 cc = gen_chain_test(500, SEED + 3000 + cd, cd)
                 if cc:
                     ps = gen_eval_with_stats(m, tok, cc, max_len, decode_policy=dp, device=DEVICE)
                     acc = sum(r['correct'] for r in ps) / len(ps)
-                    all_final[f'chain_{cd}_{mt}_{dp}'] = {'accuracy': acc, 'n': len(ps)}
-                    print(f"    chain={cd} {dp}: {acc:.4f}")
+                    sat_rate = sum(r['satisfies_formula'] for r in ps) / len(ps)
+                    all_final[f'chain_{cd}_{mt}_{dp}'] = {'accuracy': acc, 'sat_rate': sat_rate, 'n': len(ps)}
+                    print(f"    chain={cd} {dp}: acc={acc:.4f} sat={sat_rate:.4f}")
+
+            # Full chain (all vars in one BCP chain)
+            fc = gen_full_chain_test(500, SEED + 5000)
+            if fc:
+                ps = gen_eval_with_stats(m, tok, fc, max_len, decode_policy=dp, device=DEVICE)
+                acc = sum(r['correct'] for r in ps) / len(ps)
+                sat_rate = sum(r['satisfies_formula'] for r in ps) / len(ps)
+                all_final[f'full_chain_{mt}_{dp}'] = {'accuracy': acc, 'sat_rate': sat_rate, 'n': len(ps)}
+                print(f"    full_chain {dp}: acc={acc:.4f} sat={sat_rate:.4f}")
 
             # Depth sweep
-            for d in DEPTH_SWEEP:
-                dt = gen_depth_test(500, SEED + 4000 + d, d)
+            for d in BCP_DEPTH_SWEEP:
+                if d > N_VARS: continue
+                dt = gen_min_depth_test(500, SEED + 4000 + d, d)
                 if dt:
                     ps = gen_eval_with_stats(m, tok, dt, max_len, decode_policy=dp, device=DEVICE)
                     acc = sum(r['correct'] for r in ps) / len(ps)
                     all_final[f'depth_sweep_{d}_{mt}_{dp}'] = {'accuracy': acc, 'n': len(ps)}
                     print(f"    depth>={d} {dp}: {acc:.4f}")
+
+        # Per-depth variable accuracy
+        ps_conf = gen_eval_with_stats(m, tok, test_data, max_len, decode_policy='confidence', device=DEVICE)
+        pda = analyse_per_depth_accuracy(ps_conf)
+        all_final[f'per_depth_acc_{mt}'] = pda
+        for d, info in sorted(pda.items()):
+            print(f"    bcp_depth={d}: acc={info['acc']:.4f} (n={info['n']})")
 
         # PUMA coverage
         if mt == 'puma':
@@ -780,7 +865,6 @@ def run(tag=''):
                 print(f"    coverage/{dn}: {dv['mean_coverage']:.3f} (n={dv['n']})")
 
         # Error localization
-        ps_conf = gen_eval_with_stats(m, tok, test_data, max_len, decode_policy='confidence', device=DEVICE)
         el = analyse_error_localization(ps_conf)
         all_final[f'error_loc_{mt}'] = el
         if el['total_errors'] > 0:
@@ -793,7 +877,7 @@ def run(tag=''):
 
     # Save
     sd = {'config': {k: globals()[k] for k in [
-        'ANS_LEN', 'MAX_DEPTH', 'MAX_OPERAND', 'EXPR_PAD_LEN',
+        'N_VARS', 'ANS_LEN', 'N_CLAUSES', 'CLAUSE_K', 'INPUT_LEN',
         'N_TRAIN', 'N_TEST', 'MAX_EPOCHS', 'BATCH_SIZE',
         'N_LAYER', 'N_HEAD', 'N_EMBD', 'MASK_TYPES', 'DECODE_POLICIES']}}
     for k, v in all_dyn.items():
@@ -809,16 +893,17 @@ def run(tag=''):
         print(f"  {'Test':<30s}", end='')
         for mt in MASK_TYPES: print(f" {mt:>14s}", end='')
         print()
-        for tt in ['standard', 'mul_heavy'] + [f'chain_{d}' for d in [3, 5, 7]]:
+        for tt in ['standard'] + [f'chain_{d}' for d in [4, 8, 12, 16] if d <= N_VARS] + ['full_chain']:
             accs = [all_final.get(f'{tt}_{mt}_{dp}', {}).get('accuracy') for mt in MASK_TYPES]
             if any(a is not None for a in accs):
                 print(f"  {tt:<30s}", end='')
                 for a in accs: print(f" {a:>14.4f}" if a is not None else f" {'N/A':>14s}", end='')
                 print()
-        for d in DEPTH_SWEEP:
+        for d in BCP_DEPTH_SWEEP:
+            if d > N_VARS: continue
             accs = [all_final.get(f'depth_sweep_{d}_{mt}_{dp}', {}).get('accuracy') for mt in MASK_TYPES]
             if any(a is not None for a in accs):
-                print(f"  {'depth>='+str(d):<30s}", end='')
+                print(f"  {'bcp>='+str(d):<30s}", end='')
                 for a in accs: print(f" {a:>14.4f}" if a is not None else f" {'N/A':>14s}", end='')
                 print()
 
