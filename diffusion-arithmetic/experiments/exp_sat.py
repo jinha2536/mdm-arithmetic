@@ -3,26 +3,19 @@
   Boolean Satisfiability — BCP Depth + PUMA Coverage Deficit
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-  Task: find a satisfying assignment for a CNF formula
-    Input:  "(+a-c+f)(-b+d+e)...=????????????????"
+  Task: find a satisfying assignment for a planted-solution 3-SAT
+    Input:  "+a-c+f-b+d+e...=????????????????"  (compact, no parens)
     Output: "0110101001110101"  (binary assignment)
 
-  Key design: planted-solution + controlled BCP structure.
-    - Repeated-literal trick for unit/binary clauses in 3-SAT format
-    - Cover clauses exclude chain variables to prevent BCP shortcuts
-    - Training data has exponentially decaying BCP depth distribution
+  Encoding: each literal = 2 chars (+a or -c), clause = 6 chars (3 lits)
+    Clauses concatenated directly; model learns 6-char periodicity.
+    Repeated-literal trick for unit/binary clauses:
+      Unit:   "+a+a+a"  (forces a)
+      Binary: "-a+b-a"  (a=1 → forces b)
 
-  Dependency analog:
-    carry chain length  ←→  BCP propagation depth
-    g position          ←→  seed variable (BCP depth 0)
-    p position          ←→  deep chain variable
-    full_propagate      ←→  all variables in single BCP chain
-    LSB oracle          ←→  BCP depth order (shallowest first)
-
+  Dependency: BCP depth ←→ carry chain length
   Training: random vs puma
-  Decode:   confidence | bcp_oracle | random
-
-  SAT-specific metric: satisfies_formula (valid-but-different solution check)
+  Decode: confidence | bcp_oracle | random
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 """
 import sys, os, time, math, json, random as pyrandom
@@ -45,30 +38,41 @@ from core.train_utils import (
 EXP_NAME = 'exp_sat'
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# Config
+# Config — compact encoding: 6 chars/clause (no parens)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-N_VARS = 16; CLAUSE_K = 3; N_CLAUSES = 40
+N_VARS = 16; CLAUSE_K = 3
+CLAUSE_RATIO = 2.5          # α = clauses/vars (< 4.27 phase transition)
+N_CLAUSES = int(N_VARS * CLAUSE_RATIO)
 ANS_LEN = N_VARS
 VAR_NAMES = [chr(ord('a') + i) for i in range(26)]
-CLAUSE_CHAR_LEN = 2 + CLAUSE_K * 2  # "(+a-c+f)" = 8
+CLAUSE_CHAR_LEN = CLAUSE_K * 2   # "+a-c+f" = 6 (no parentheses)
 INPUT_LEN = N_CLAUSES * CLAUSE_CHAR_LEN
 
-N_TRAIN = 20000; N_TEST = 1000; BATCH_SIZE = 200
+N_TRAIN = 20000; N_TEST = 1000; BATCH_SIZE = 128
 MAX_EPOCHS = 5000; EVAL_EVERY = 100; LOG_EVERY = 50
 
 MASK_TYPES = ['random', 'puma']
 DECODE_POLICIES = ['confidence', 'bcp_oracle', 'random']
 
-N_LAYER = 3; N_HEAD = 3; N_EMBD = 192; DROPOUT = 0.1; POS_ENC = 'absolute'
+N_LAYER = 3; N_HEAD = 4; N_EMBD = 256; DROPOUT = 0.1; POS_ENC = 'absolute'
 LR = 1e-3; MIN_LR = 1e-4; WARMUP_EPOCHS = 10; GRAD_CLIP = 1.0
 PUMA_TAU = 0.9; PUMA_K_START = 2; PUMA_K_END = ANS_LEN
 SEED = 42; BCP_DEPTH_SWEEP = [0, 1, 2, 3, 4, 6, 8, 10, 12, 14, 16]
+
+
+def _update_derived():
+    """Recompute derived constants after config changes."""
+    globals()['N_CLAUSES'] = int(N_VARS * CLAUSE_RATIO)
+    globals()['ANS_LEN'] = N_VARS
+    globals()['INPUT_LEN'] = globals()['N_CLAUSES'] * CLAUSE_CHAR_LEN
+    globals()['PUMA_K_END'] = N_VARS
 
 
 def parse_args():
     import argparse
     p = argparse.ArgumentParser()
     p.add_argument('--n-vars', type=int); p.add_argument('--n-clauses', type=int)
+    p.add_argument('--clause-ratio', type=float)
     p.add_argument('--n-train', type=int); p.add_argument('--n-test', type=int)
     p.add_argument('--epochs', type=int); p.add_argument('--batch-size', type=int)
     p.add_argument('--eval-every', type=int)
@@ -84,26 +88,26 @@ def parse_args():
     for a, gl in {'n_train':'N_TRAIN','n_test':'N_TEST','epochs':'MAX_EPOCHS',
                    'batch_size':'BATCH_SIZE','eval_every':'EVAL_EVERY',
                    'n_layer':'N_LAYER','n_head':'N_HEAD','n_embd':'N_EMBD',
-                   'dropout':'DROPOUT','puma_tau':'PUMA_TAU','seed':'SEED'}.items():
+                   'dropout':'DROPOUT','puma_tau':'PUMA_TAU','seed':'SEED',
+                   'clause_ratio':'CLAUSE_RATIO'}.items():
         v = getattr(args, a, None)
         if v is not None: g[gl] = v
-    # N_VARS / N_CLAUSES must update derived constants
-    if getattr(args, 'n_vars', None) is not None:
-        g['N_VARS'] = args.n_vars; g['ANS_LEN'] = args.n_vars
-        g['PUMA_K_END'] = args.n_vars
+    if getattr(args, 'n_vars', None) is not None: g['N_VARS'] = args.n_vars
+    if getattr(args, 'n_clauses', None) is not None: g['N_CLAUSES'] = args.n_clauses
+    _update_derived()
     if getattr(args, 'n_clauses', None) is not None:
-        g['N_CLAUSES'] = args.n_clauses
-    g['INPUT_LEN'] = g['N_CLAUSES'] * CLAUSE_CHAR_LEN
+        g['N_CLAUSES'] = args.n_clauses  # override ratio-derived value
+        g['INPUT_LEN'] = args.n_clauses * CLAUSE_CHAR_LEN
     if args.masks: g['MASK_TYPES'] = args.masks
     if args.decode: g['DECODE_POLICIES'] = args.decode
     return args
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# SAT Instance Generation
+# SAT Instance Generation (compact encoding, no parens)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 def _literal_str(v, p): return ('+' if p else '-') + VAR_NAMES[v]
-def _clause_str(lits): return '(' + ''.join(_literal_str(v, p) for v, p in lits) + ')'
+def _clause_str(lits): return ''.join(_literal_str(v, p) for v, p in lits)
 def _assignment_str(sigma, n): return ''.join(str(sigma[i]) for i in range(n))
 
 def _check_clause(clause, sigma):
@@ -136,25 +140,16 @@ def _run_bcp(clauses, n_vars, sigma):
 
 
 def gen_sat_instance(rng, n_vars, n_clauses, max_chain_depth=None, mode='natural'):
-    """Planted-solution SAT with controlled BCP chain structure.
-    Repeated-literal trick: (+a+a+a) = unit clause, (-a+b-a) = binary implication.
-    Cover clauses exclude chain vars to prevent BCP shortcuts.
-    """
     sigma = [rng.randint(0, 1) for _ in range(n_vars)]
     clauses = []; chain_set = set()
-
     if mode == 'chain' and max_chain_depth is not None:
         cl = min(max_chain_depth, n_vars)
         cv = rng.sample(range(n_vars), cl); chain_set = set(cv)
-        # Seed: unit clause
-        v0 = cv[0]; clauses.append([(v0, sigma[v0]==1)]*3)
-        # Chain: binary implications
+        clauses.append([(cv[0], sigma[cv[0]]==1)]*3)
         for ci in range(1, cl):
             prev, curr = cv[ci-1], cv[ci]
             clauses.append([(prev, sigma[prev]==0), (curr, sigma[curr]==1),
                             (prev, sigma[prev]==0)])
-
-    # Fill with random satisfied clauses EXCLUDING chain variables
     non_chain = [v for v in range(n_vars) if v not in chain_set]
     att = 0
     while len(clauses) < n_clauses and att < n_clauses * 100:
@@ -164,22 +159,17 @@ def gen_sat_instance(rng, n_vars, n_clauses, max_chain_depth=None, mode='natural
         elif non_chain:
             vs = [rng.choice(non_chain) for _ in range(CLAUSE_K)]
         else:
-            # All vars in chain — pad with tautological clauses
             v = rng.choice(range(n_vars))
-            clauses.append([(v, True), (v, False), (v, True)])
-            continue
+            clauses.append([(v, True), (v, False), (v, True)]); continue
         lits = [(v, rng.choice([True, False])) for v in vs]
         if _check_clause(lits, sigma): clauses.append(lits)
     clauses = clauses[:n_clauses]; rng.shuffle(clauses)
-
     bcp_depth, bcp_order = _run_bcp(clauses, n_vars, sigma)
-    input_s = ''.join(_clause_str(cl) for cl in clauses).ljust(INPUT_LEN, '#')
+    input_s = ''.join(_clause_str(cl) for cl in clauses)
     full_s = input_s + '=' + _assignment_str(sigma, n_vars)
-    return {
-        'string': full_s, 'sigma': sigma, 'clauses': clauses,
-        'bcp_depth': bcp_depth, 'bcp_order': bcp_order,
-        'max_bcp_depth': max(bcp_depth.values()) if bcp_depth else 0,
-    }
+    return {'string': full_s, 'sigma': sigma, 'clauses': clauses,
+            'bcp_depth': bcp_depth, 'bcp_order': bcp_order,
+            'max_bcp_depth': max(bcp_depth.values()) if bcp_depth else 0}
 
 
 def _dep_label(bcp_d, max_d):
@@ -193,9 +183,8 @@ def _dep_label(bcp_d, max_d):
 # Data generation
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 def gen_data(n, seed):
-    """Exponentially decaying BCP depth distribution (mirrors addition carry dist)."""
     rng = pyrandom.Random(seed); results = []; seen = set()
-    weights = [math.exp(-0.3 * d) for d in range(N_VARS + 1)]
+    weights = [math.exp(-0.3*d) for d in range(N_VARS+1)]
     tw = sum(weights); cdf = []; c = 0
     for w in weights: c += w/tw; cdf.append(c)
     for _ in range(n * 20):
@@ -207,67 +196,71 @@ def gen_data(n, seed):
         else: d = gen_sat_instance(rng, N_VARS, N_CLAUSES, max_chain_depth=td, mode='chain')
         if d['string'] in seen: continue
         seen.add(d['string']); md = d['max_bcp_depth']
-        d['dep_labels'] = [_dep_label(d['bcp_depth'].get(i, md), max(md, 1)) for i in range(N_VARS)]
+        d['dep_labels'] = [_dep_label(d['bcp_depth'].get(i, md), max(md,1)) for i in range(N_VARS)]
         results.append(d)
     if len(results) < n: print(f"  WARNING: gen_data got {len(results)}/{n}")
     return results
 
 def gen_chain_test(n, seed, chain_depth):
     rng = pyrandom.Random(seed); results = []; seen = set()
-    for _ in range(n * 50):
+    for _ in range(n*50):
         if len(results) >= n: break
         d = gen_sat_instance(rng, N_VARS, N_CLAUSES, max_chain_depth=chain_depth, mode='chain')
         if d['string'] in seen: continue
         seen.add(d['string']); md = d['max_bcp_depth']
-        d['dep_labels'] = [_dep_label(d['bcp_depth'].get(i, md), max(md, 1)) for i in range(N_VARS)]
+        d['dep_labels'] = [_dep_label(d['bcp_depth'].get(i, md), max(md,1)) for i in range(N_VARS)]
         results.append(d)
     if len(results) < n: print(f"  WARNING: chain={chain_depth}: {len(results)}/{n}")
     return results
 
 def gen_min_depth_test(n, seed, min_depth):
     rng = pyrandom.Random(seed); results = []; seen = set()
-    for _ in range(n * 100):
+    for _ in range(n*100):
         if len(results) >= n: break
         d = gen_sat_instance(rng, N_VARS, N_CLAUSES, max_chain_depth=min_depth, mode='chain')
         if d['max_bcp_depth'] < min_depth or d['string'] in seen: continue
         seen.add(d['string']); md = d['max_bcp_depth']
-        d['dep_labels'] = [_dep_label(d['bcp_depth'].get(i, md), max(md, 1)) for i in range(N_VARS)]
+        d['dep_labels'] = [_dep_label(d['bcp_depth'].get(i, md), max(md,1)) for i in range(N_VARS)]
         results.append(d)
     if len(results) < n: print(f"  WARNING: depth>={min_depth}: {len(results)}/{n}")
     return results
 
-def gen_full_chain_test(n, seed):
-    return gen_chain_test(n, seed, N_VARS)
+def gen_full_chain_test(n, seed): return gen_chain_test(n, seed, N_VARS)
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# Tokenizer
+# Tokenizer (no parens needed)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 def build_tok():
-    return CharTokenizer(list('01+-()=#') + VAR_NAMES[:N_VARS], {'mask': 'M', 'pad': 'P'})
+    return CharTokenizer(list('01+-=#') + VAR_NAMES[:N_VARS], {'mask': 'M', 'pad': 'P'})
 def get_answer(s): return s.split('=')[1]
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# BCP Oracle Decode (custom per-sample decode order)
+# BCP Oracle Decode (vectorized, O(max_depth) forward passes)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 @torch.no_grad()
 def _decode_bcp_oracle(model, prefix_ids, ans_len, mask_id, bcp_depths_batch, device):
-    """Decode by revealing all variables at BCP depth d before depth d+1.
-    O(max_depth) forward passes, batched across samples.
-    """
     B = prefix_ids.shape[0]; pm = prefix_ids.shape[1]
     full = torch.cat([prefix_ids.to(device),
                       torch.full((B, ans_len), mask_id, dtype=torch.long, device=device)], dim=1)
     max_depth = max(max(d.values()) for d in bcp_depths_batch) + 1
+    _ar = torch.arange(ans_len, device=device)
+    # Precompute BCP depth tensor (B, ans_len)
+    bcp_t = torch.tensor([[bcp_depths_batch[i].get(j, max_depth)
+                           for j in range(ans_len)] for i in range(B)],
+                          dtype=torch.long, device=device)
+    ap = torch.arange(pm, pm + ans_len, device=device).unsqueeze(0).expand(B, -1)
+    bi = torch.arange(B, device=device).unsqueeze(1).expand_as(ap)
+
     for depth in range(max_depth):
+        reveal = (bcp_t == depth)  # (B, ans_len)
+        if not reveal.any(): continue
         logits = model(full)
-        for i in range(B):
-            for j in range(ans_len):
-                if bcp_depths_batch[i].get(j, max_depth) == depth:
-                    pos = pm + j
-                    cl = logits[i, pos].clone(); cl[mask_id] = -float('inf')
-                    full[i, pos] = cl.argmax()
+        al = logits[bi, ap]  # (B, ans_len, V)
+        al[:, :, mask_id] = -float('inf')
+        preds = al.argmax(dim=-1)  # (B, ans_len)
+        full[bi[reveal], ap[reveal]] = preds[reveal]
     return full
 
 
@@ -284,36 +277,28 @@ def probe_per_position(model, tokenizer, test_data, max_len, device=None):
     L = torch.zeros(ANS_LEN, device=device); C = torch.zeros(ANS_LEN, device=device)
     CF = torch.zeros(ANS_LEN, device=device); N_cnt = torch.zeros(ANS_LEN, device=device)
     _arange = torch.arange(ANS_LEN, device=device)
-    dep_names = ['seed', 'shallow', 'mid', 'deep']
+    dep_names = ['seed','shallow','mid','deep']
     dci = {n: i for i, n in enumerate(dep_names)}; nc = len(dep_names)
-    # Per-position dep label tensor
-    dep_ids = torch.tensor([[dci.get(dl, 0) for dl in d['dep_labels']] for d in test_data],
+    dep_ids = torch.tensor([[dci.get(dl,0) for dl in d['dep_labels']] for d in test_data],
                             dtype=torch.long, device=device)
     cat_conf = torch.zeros(nc, device=device); cat_acc = torch.zeros(nc, device=device)
     cat_n = torch.zeros(nc, dtype=torch.long, device=device)
-
     for st in range(0, len(test_data), 128):
         en = min(st+128, len(test_data)); B = en-st
         ids, ans = ids_all[st:en], ans_all[st:en]; T = ids.shape[1]
-        ap = (ans.unsqueeze(1) + _arange).clamp(max=T-1)
+        ap = (ans.unsqueeze(1)+_arange).clamp(max=T-1)
         bi = torch.arange(B, device=device).unsqueeze(1).expand_as(ap)
         xm = ids.clone(); xm[bi, ap] = mask_id
         logits = model(xm); al = logits[bi, ap]; tgt = ids[bi, ap]
-        lp = F.log_softmax(al, dim=-1)
-        losses = -lp.gather(2, tgt.unsqueeze(2)).squeeze(2)
+        losses = -F.log_softmax(al, dim=-1).gather(2, tgt.unsqueeze(2)).squeeze(2)
         cl = al.clone(); cl[:,:,mask_id] = -float('inf')
         probs = F.softmax(cl, dim=-1)
         confs = probs.max(dim=-1).values; corrects = (probs.argmax(dim=-1)==tgt).float()
         L += losses.sum(0); C += corrects.sum(0); CF += confs.sum(0); N_cnt += B
-        # Vectorized per-dep accumulation
-        bd = dep_ids[st:en]  # (B, ANS_LEN)
+        bd = dep_ids[st:en]
         for ci in range(nc):
-            m = (bd == ci)
-            if m.any():
-                cat_conf[ci] += confs[m].sum()
-                cat_acc[ci] += corrects[m].sum()
-                cat_n[ci] += m.sum()
-
+            m = (bd==ci)
+            if m.any(): cat_conf[ci] += confs[m].sum(); cat_acc[ci] += corrects[m].sum(); cat_n[ci] += m.sum()
     s = N_cnt.clamp(1)
     result = {'pos_loss': (L/s).cpu().tolist(), 'pos_acc': (C/s).cpu().tolist(),
               'pos_conf': (CF/s).cpu().tolist(),
@@ -338,10 +323,9 @@ def gen_eval_with_stats(model, tokenizer, test_data, max_len,
         penc = [tokenizer.encode(p) for p in prefixes]; pm = max(len(p) for p in penc)
         pids = torch.full((B, pm), pad_id, dtype=torch.long)
         for i, e in enumerate(penc): pids[i, :len(e)] = torch.tensor(e)
-
         if decode_policy == 'bcp_oracle':
-            bcp_depths = [d['bcp_depth'] for d in batch]
-            gen = _decode_bcp_oracle(model, pids, ANS_LEN, mask_id, bcp_depths, device)
+            gen = _decode_bcp_oracle(model, pids, ANS_LEN, mask_id,
+                                     [d['bcp_depth'] for d in batch], device)
         else:
             policy = 'random' if decode_policy == 'random' else 'confidence'
             gen, _, _ = generate_diffusion(model, pids, ANS_LEN, mask_id,
@@ -352,16 +336,12 @@ def gen_eval_with_stats(model, tokenizer, test_data, max_len,
             gs = get_answer(batch[i]['string'])
             pc = [ps[j]==gs[j] if j<len(ps) else False for j in range(len(gs))]
             errs = [j for j in range(len(gs)) if j>=len(ps) or ps[j]!=gs[j]]
-            # Check if prediction is a valid (possibly different) solution
             all_sat = False
             if len(ps)==N_VARS and all(c in '01' for c in ps):
-                pred_sigma = [int(c) for c in ps]
-                all_sat = all(_check_clause(cl, pred_sigma) for cl in batch[i]['clauses'])
+                all_sat = all(_check_clause(cl, [int(c) for c in ps]) for cl in batch[i]['clauses'])
             out.append({'correct': ps==gs, 'pos_correct': pc, 'error_positions': errs,
-                        'satisfies_formula': all_sat,
-                        'max_bcp_depth': batch[i]['max_bcp_depth'],
-                        'bcp_depth': batch[i]['bcp_depth'],
-                        'dep_labels': batch[i]['dep_labels']})
+                        'satisfies_formula': all_sat, 'max_bcp_depth': batch[i]['max_bcp_depth'],
+                        'bcp_depth': batch[i]['bcp_depth'], 'dep_labels': batch[i]['dep_labels']})
     return out
 
 
@@ -376,7 +356,6 @@ def stratify_results(per_sample):
     for r in per_sample: bk[_db(r['max_bcp_depth'])].append(r['correct'])
     return {'max_bcp_depth': {k: {'acc': sum(v)/len(v), 'n': len(v)} for k, v in sorted(bk.items())}}
 
-
 def analyse_per_depth_accuracy(per_sample):
     dc = defaultdict(list)
     for r in per_sample:
@@ -385,11 +364,9 @@ def analyse_per_depth_accuracy(per_sample):
             dc[d].append(r['pos_correct'][j] if j < len(r['pos_correct']) else False)
     return {d: {'acc': sum(cs)/len(cs), 'n': len(cs)} for d, cs in sorted(dc.items())}
 
-
 @torch.no_grad()
 def simulate_puma_coverage(model, tokenizer, test_data, max_len,
                            K=None, tau=None, n_samples=200, batch_size=32, device=None):
-    """PUMA coverage — BATCHED, per dep_label."""
     if device is None: device = DEVICE
     if K is None: K = PUMA_K_END
     if tau is None: tau = PUMA_TAU
@@ -401,9 +378,8 @@ def simulate_puma_coverage(model, tokenizer, test_data, max_len,
     strings = [d['string'] for d in test_data[:N]]
     ids_all, ans_all = encode_samples(strings, tokenizer, max_len)
     ids_all, ans_all = ids_all.to(device), ans_all.to(device)
-    dep_ids = torch.tensor([[dci.get(dl, 0) for dl in d['dep_labels']] for d in test_data[:N]],
+    dep_ids = torch.tensor([[dci.get(dl,0) for dl in d['dep_labels']] for d in test_data[:N]],
                             dtype=torch.long, device=device)
-
     for st in range(0, N, batch_size):
         en = min(st+batch_size, N); B = en-st
         ids = ids_all[st:en]; ans_s = ans_all[st:en]; T = ids.shape[1]
@@ -423,17 +399,12 @@ def simulate_puma_coverage(model, tokenizer, test_data, max_len,
             reveal = ((rop < nr.unsqueeze(1)) | (confs > tau)) & is_m
             x[bi[reveal], ap[reveal]] = x0[reveal]; is_m = is_m & ~reveal
         if total == 0: continue
-        frac = steps_m / total  # (B, ANS_LEN)
-        bd = dep_ids[st:en]
+        frac = steps_m / total; bd = dep_ids[st:en]
         for ci in range(nc):
-            m = (bd == ci)
-            if m.any():
-                cov_sum[ci] += frac.cpu()[m.cpu()].sum()
-                cov_n[ci] += m.sum().item()
-
+            m = (bd==ci)
+            if m.any(): cov_sum[ci] += frac.cpu()[m.cpu()].sum(); cov_n[ci] += m.sum().item()
     return {dn: {'mean_coverage': cov_sum[ci].item()/cov_n[ci].item(), 'n': cov_n[ci].item()}
             for ci, dn in enumerate(dep_names) if cov_n[ci] > 0}
-
 
 def analyse_error_localization(per_sample):
     cats = defaultdict(int); total = 0
@@ -451,6 +422,7 @@ def analyse_error_localization(per_sample):
 def train_model(tokenizer, train_data, test_data, max_len,
                 mask_type='random', device=None):
     if device is None: device = DEVICE
+    assert N_EMBD % N_HEAD == 0, f"N_EMBD({N_EMBD}) must be divisible by N_HEAD({N_HEAD})"
     train_ids, train_ans = encode_samples([d['string'] for d in train_data], tokenizer, max_len)
     train_ids, train_ans = train_ids.to(device), train_ans.to(device)
     N, T = train_ids.shape; bpe = (N+BATCH_SIZE-1)//BATCH_SIZE; total_iters = MAX_EPOCHS*bpe
@@ -458,7 +430,7 @@ def train_model(tokenizer, train_data, test_data, max_len,
     model = Transformer(vocab_size=len(tokenizer), block_size=max_len+8, n_layer=N_LAYER,
                         n_head=N_HEAD, n_embd=N_EMBD, dropout=DROPOUT,
                         is_causal=False, pos_enc=POS_ENC).to(device)
-    print(f"  [{mask_type}] params={model.n_params:,}, {bpe} batches/epoch, {MAX_EPOCHS} epochs")
+    print(f"  [{mask_type}] params={model.n_params:,}, {bpe} batches/ep, {MAX_EPOCHS} ep, T={T}")
     optimizer = torch.optim.AdamW(model.parameters(), lr=LR, betas=(0.9,0.99), weight_decay=0.1)
     warmup_iters = WARMUP_EPOCHS * bpe
     def get_lr(it):
@@ -541,7 +513,7 @@ def train_model(tokenizer, train_data, test_data, max_len,
                 ans_mask = torch.zeros(B_b, T, dtype=torch.bool, device=device)
                 ans_mask.scatter_(1, ap, True)
                 t_r = torch.rand(B_b, device=device)
-                m = torch.bernoulli(t_r.unsqueeze(1) * ans_mask.float()).bool()
+                m = torch.bernoulli(t_r.unsqueeze(1)*ans_mask.float()).bool()
                 no_m = ~m.any(dim=1)
                 if no_m.any():
                     rj = torch.randint(ANS_LEN, (no_m.sum(),), device=device)
@@ -591,15 +563,14 @@ def run(tag=''):
     exp_name = f"{EXP_NAME}{'_'+tag if tag else ''}"
     torch.manual_seed(SEED); pyrandom.seed(SEED)
     tok = build_tok(); max_len = INPUT_LEN + 1 + ANS_LEN + 2
-    print(f"\n{'='*70}\n  {exp_name} | N_VARS={N_VARS} N_CLAUSES={N_CLAUSES}\n{'='*70}")
-    train_data = gen_data(N_TRAIN, SEED)
-    test_data = gen_data(N_TEST, SEED+1000)
+    print(f"\n{'='*70}\n  {exp_name} | N_VARS={N_VARS} N_CL={N_CLAUSES} α={CLAUSE_RATIO} "
+          f"INPUT_LEN={INPUT_LEN} max_len={max_len}\n{'='*70}")
+    train_data = gen_data(N_TRAIN, SEED); test_data = gen_data(N_TEST, SEED+1000)
     print(f"  Train: {len(train_data)}, Test: {len(test_data)}")
     dd = defaultdict(int)
     for d in train_data: dd[d['max_bcp_depth']] += 1
     print(f"  BCP depth dist: {dict(sorted(dd.items()))}")
     all_dyn, all_final = {}, {}
-
     for mt in MASK_TYPES:
         print(f"\n{'━'*60}\n  Training: {mt}\n{'━'*60}")
         m, dyn = train_model(tok, train_data, test_data, max_len, mask_type=mt, device=DEVICE)
@@ -632,7 +603,8 @@ def run(tag=''):
                 dt = gen_min_depth_test(500, SEED+4000+d, d)
                 if dt:
                     ps2 = gen_eval_with_stats(m, tok, dt, max_len, decode_policy=dp, device=DEVICE)
-                    all_final[f'depth_sweep_{d}_{mt}_{dp}'] = {'accuracy': sum(r['correct'] for r in ps2)/len(ps2), 'n': len(ps2)}
+                    all_final[f'depth_sweep_{d}_{mt}_{dp}'] = {
+                        'accuracy': sum(r['correct'] for r in ps2)/len(ps2), 'n': len(ps2)}
                     print(f"    depth>={d} {dp}: {all_final[f'depth_sweep_{d}_{mt}_{dp}']['accuracy']:.4f}")
         ps_conf = gen_eval_with_stats(m, tok, test_data, max_len, decode_policy='confidence', device=DEVICE)
         pda = analyse_per_depth_accuracy(ps_conf); all_final[f'per_depth_acc_{mt}'] = pda
@@ -640,39 +612,29 @@ def run(tag=''):
         if mt == 'puma':
             cov = simulate_puma_coverage(m, tok, test_data, max_len, device=DEVICE)
             all_final[f'coverage_{mt}'] = cov
-            for dn, dv in cov.items(): print(f"    coverage/{dn}: {dv['mean_coverage']:.3f} (n={dv['n']})")
+            for dn, dv in cov.items(): print(f"    cov/{dn}: {dv['mean_coverage']:.3f} (n={dv['n']})")
         el = analyse_error_localization(ps_conf); all_final[f'error_loc_{mt}'] = el
         if el['total_errors'] > 0:
-            parts = [f"{k}={v:.2f}" for k,v in el.items() if k!='total_errors' and isinstance(v, float)]
-            print(f"    errors: {el['total_errors']} — {' '.join(parts)}")
+            print(f"    errors: {el['total_errors']} — " +
+                  ' '.join(f"{k}={v:.2f}" for k,v in el.items() if k!='total_errors' and isinstance(v,float)))
         del m; torch.cuda.empty_cache() if torch.cuda.is_available() else None
-
     figs = make_figures(all_dyn, all_final)
-    sd = {'config': {k: globals()[k] for k in ['N_VARS','ANS_LEN','N_CLAUSES','CLAUSE_K','INPUT_LEN',
-          'N_TRAIN','N_TEST','MAX_EPOCHS','BATCH_SIZE','N_LAYER','N_HEAD','N_EMBD','MASK_TYPES','DECODE_POLICIES']}}
+    sd = {'config': {k: globals()[k] for k in ['N_VARS','ANS_LEN','N_CLAUSES','CLAUSE_K','CLAUSE_RATIO',
+          'INPUT_LEN','N_TRAIN','N_TEST','MAX_EPOCHS','BATCH_SIZE','N_LAYER','N_HEAD','N_EMBD',
+          'MASK_TYPES','DECODE_POLICIES']}}
     for k, v in all_dyn.items(): sd[f'dyn_{k}'] = {'checkpoints': v['checkpoints'], 'train_loss': v['train_loss']}
     for k, v in all_final.items(): sd[f'final_{k}'] = v
     save_results(exp_name, sd, figures=figs)
-
     print(f"\n{'='*70}\n  SUMMARY\n{'='*70}")
     for dp in DECODE_POLICIES:
-        print(f"\n  ── {dp} ──"); print(f"  {'Test':<30s}", end='')
-        for mt in MASK_TYPES: print(f" {'acc':>7s} {'sat':>7s}" if mt == MASK_TYPES[0] else f" {'acc':>7s} {'sat':>7s}", end='')
-        print()
+        print(f"\n  ── {dp} ──"); print(f"  {'Test':<28s}  {'random':>14s}  {'puma':>14s}")
         for tt in ['standard']+[f'chain_{d}' for d in [4,8,12,16] if d<=N_VARS]+['full_chain']:
             vals = [all_final.get(f'{tt}_{mt}_{dp}') for mt in MASK_TYPES]
             if any(v is not None for v in vals):
-                print(f"  {tt:<30s}", end='')
+                print(f"  {tt:<28s}", end='')
                 for v in vals:
-                    if v: print(f" {v['accuracy']:>7.4f} {v.get('sat_rate',0):>7.4f}", end='')
-                    else: print(f" {'N/A':>7s} {'N/A':>7s}", end='')
-                print()
-        for d in BCP_DEPTH_SWEEP:
-            if d > N_VARS: continue
-            accs = [all_final.get(f'depth_sweep_{d}_{mt}_{dp}',{}).get('accuracy') for mt in MASK_TYPES]
-            if any(a is not None for a in accs):
-                print(f"  {'bcp>='+str(d):<30s}", end='')
-                for a in accs: print(f" {a:>7.4f} {'':>7s}" if a is not None else f" {'N/A':>7s} {'':>7s}", end='')
+                    if v: print(f"  {v['accuracy']:.4f}/{v.get('sat_rate',0):.4f}", end='')
+                    else: print(f"  {'N/A':>14s}", end='')
                 print()
     return all_dyn, all_final
 
