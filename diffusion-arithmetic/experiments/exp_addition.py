@@ -40,8 +40,8 @@ GEN_EVAL_EVERY = 10000; GEN_EVAL_N = 500
 MASK_TYPES = ['random', 'puma']
 DECODE_POLICIES = ['confidence', 'lsb']
 N_LAYER = 3; N_HEAD = 3; N_EMBD = 192; DROPOUT = 0.1; POS_ENC = 'absolute'
-LR = 3e-4; MIN_LR = 1e-5; WARMUP_ITERS = 2000; GRAD_CLIP = 1.0
-WEIGHT_DECAY = 0.01; EMA_DECAY = 0.9999
+LR = 1e-3; MIN_LR = 1e-4; WARMUP_ITERS = 2000; GRAD_CLIP = 1.0
+WEIGHT_DECAY = 0.1; EMA_DECAY = 0.9999
 PUMA_TAU = 0.9; PUMA_K_START = 3; PUMA_K_END = None  # auto = ANS_LEN
 SEED = 42
 DATA_MODE = 'natural'
@@ -60,6 +60,7 @@ def parse_args():
     p.add_argument('--n-layer', type=int); p.add_argument('--n-head', type=int)
     p.add_argument('--n-embd', type=int); p.add_argument('--dropout', type=float)
     p.add_argument('--lr', type=float)
+    p.add_argument('--weight-decay', type=float)
     p.add_argument('--puma-tau', type=float)
     p.add_argument('--puma-k-start', type=int); p.add_argument('--puma-k-end', type=int)
     p.add_argument('--masks', nargs='+'); p.add_argument('--decode', nargs='+')
@@ -77,7 +78,8 @@ def parse_args():
                    'batch_size': 'BATCH_SIZE', 'eval_every': 'EVAL_EVERY',
                    'gen_eval_every': 'GEN_EVAL_EVERY', 'n_layer': 'N_LAYER',
                    'n_head': 'N_HEAD', 'n_embd': 'N_EMBD', 'dropout': 'DROPOUT',
-                   'lr': 'LR', 'puma_tau': 'PUMA_TAU',
+                   'lr': 'LR', 'weight_decay': 'WEIGHT_DECAY',
+                   'puma_tau': 'PUMA_TAU',
                    'puma_k_start': 'PUMA_K_START', 'puma_k_end': 'PUMA_K_END',
                    'seed': 'SEED', 'continuation_iters': 'CONTINUATION_ITERS'}.items():
         v = getattr(args, a, None)
