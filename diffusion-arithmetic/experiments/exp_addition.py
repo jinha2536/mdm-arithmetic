@@ -36,7 +36,7 @@ ND = 16; ANS_LEN = ND + 1
 N_TRAIN = 10000; N_TEST = 1000; BATCH_SIZE = 200
 MAX_EPOCHS = 5000; EVAL_EVERY = 100; LOG_EVERY = 50
 GEN_EVAL_EVERY = 200; GEN_EVAL_N = 500
-FORMATS = ['plain']; MASK_TYPES = ['random', 'puma']
+FORMATS = ['plain']; MASK_TYPES = ['random', 'puma', 'darm']
 DECODE_POLICIES = ['confidence', 'lsb']
 N_LAYER = 2; N_HEAD = 2; N_EMBD = 128; DROPOUT = 0.2; POS_ENC = 'absolute'
 LR = 1e-3; MIN_LR = 1e-4; WARMUP_EPOCHS = 10; GRAD_CLIP = 1.0
@@ -44,10 +44,9 @@ PUMA_TAU = 0.9; PUMA_K_START = 3; PUMA_K_END = ANS_LEN
 SEED = 42; RUN_AR = False
 DATA_MODE = 'natural'  # 'balanced' or 'natural'
 
-# Continuation: after PUMA training, continue with random masking
-# Tests whether PUMA's fast convergence + random's coverage = best of both
-CONTINUATION_EPOCHS = [500, 1000, 2000, 3000]  # random epochs after PUMA
-RUN_CONTINUATION = True
+# Difficulty-Aware Random Masking: mask probability ∝ per-position loss
+# No hyperparameters — loss itself is the difficulty signal
+RUN_DARM = True
 
 
 def parse_args():
@@ -65,8 +64,7 @@ def parse_args():
     p.add_argument('--decode', nargs='+'); p.add_argument('--no-ar', action='store_true')
     p.add_argument('--ar', action='store_true')
     p.add_argument('--data-mode', choices=['balanced', 'natural'])
-    p.add_argument('--cont-epochs', nargs='+', type=int, help='Continuation epochs after PUMA')
-    p.add_argument('--no-continuation', action='store_true')
+    p.add_argument('--no-darm', action='store_true')
     p.add_argument('--tag', type=str, default=''); p.add_argument('--seed', type=int)
     p.add_argument('--seeds', nargs='+', type=int)
     # Colab/IPython safe parsing
@@ -92,8 +90,7 @@ def parse_args():
     if args.no_ar: g['RUN_AR'] = False
     if args.ar: g['RUN_AR'] = True
     if args.data_mode: g['DATA_MODE'] = args.data_mode
-    if args.no_continuation: g['RUN_CONTINUATION'] = False
-    if args.cont_epochs: g['CONTINUATION_EPOCHS'] = args.cont_epochs
+    if args.no_darm: g['RUN_DARM'] = False
     return args
 
 
@@ -712,9 +709,8 @@ def analyse_confidence_calibration(model, tokenizer, test_samples, fmt, max_len,
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 def train_model(objective, tokenizer, train_samples, test_samples, max_len,
-                fmt, mask_type='random', init_state=None, n_epochs=None, device=None):
+                fmt, mask_type='random', n_epochs=None, device=None):
     """Train model.
-    init_state: if provided, load this state dict as starting point (for continuation).
     n_epochs: override MAX_EPOCHS (for continuation with fewer epochs).
     """
     if device is None: device = DEVICE
@@ -728,11 +724,8 @@ def train_model(objective, tokenizer, train_samples, test_samples, max_len,
     model = Transformer(vocab_size=len(tokenizer), block_size=max_len+8,
                         n_layer=N_LAYER, n_head=N_HEAD, n_embd=N_EMBD,
                         dropout=DROPOUT, is_causal=is_causal, pos_enc=POS_ENC).to(device)
-    if init_state:
-        model.load_state_dict({k: v.to(device) for k, v in init_state.items()})
     tag = objective + (f"/{mask_type}" if objective == 'diffusion' else "")
-    cont_tag = " (from checkpoint)" if init_state else ""
-    print(f"  [{tag}] params={model.n_params:,}, {bpe} batches/epoch, {epochs} epochs{cont_tag}")
+    print(f"  [{tag}] params={model.n_params:,}, {bpe} batches/epoch, {epochs} epochs")
     optimizer = torch.optim.AdamW(model.parameters(), lr=LR, betas=(0.9, 0.99), weight_decay=0.1)
     warmup_iters = WARMUP_EPOCHS * bpe
     def get_lr(it):
@@ -743,6 +736,9 @@ def train_model(objective, tokenizer, train_samples, test_samples, max_len,
     dynamics = {'checkpoints': [], 'gen_checkpoints': [], 'train_loss': []}
     best_loss, best_state = float('inf'), None; it = 0; tg = 0; t0 = time.time()
     _arange = torch.arange(ANS_LEN, device=device)
+
+    # DARM: per-position loss weights (updated at each eval checkpoint)
+    darm_weights = torch.ones(ANS_LEN, device=device)  # start uniform = random
 
     # PUMA streaming buffer
     uses_streaming = mask_type in ('puma', 'oracle_lsb')
@@ -786,12 +782,16 @@ def train_model(objective, tokenizer, train_samples, test_samples, max_len,
         _refresh(list(range(BATCH_SIZE)))
 
     def _do_eval(epoch):
-        nonlocal best_loss, best_state
+        nonlocal best_loss, best_state, darm_weights
         probe = probe_per_position(model, tokenizer, test_samples, objective, fmt, max_len, device)
         dynamics['checkpoints'].append({'epoch': epoch, 'iter': it, 'tg': tg, **probe})
         if probe['overall_loss'] < best_loss and epoch > 0:
             best_loss = probe['overall_loss']
             best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+        # Update DARM weights from probe loss
+        if mask_type == 'darm' and probe['pos_loss']:
+            pl = torch.tensor(probe['pos_loss'], device=device).clamp(min=1e-6)
+            darm_weights = pl / pl.mean()  # normalize to mean=1
         dc = probe.get('dep_context', {})
         parts = [f"{c}={dc[c]['acc']:.2f}" for c in ['g','k','p_above_g','p_above_k','p_above_p'] if c in dc]
         print(f"    [eval ep {epoch}] loss={probe['overall_loss']:.4f} acc={probe['overall_acc']:.4f} "
@@ -840,9 +840,17 @@ def train_model(objective, tokenizer, train_samples, test_samples, max_len,
                     ap = (ans_s.unsqueeze(1) + _arange).clamp(max=T-1)
                     bii = torch.arange(B_b, device=device).unsqueeze(1).expand_as(ap)
                     ans_mask = torch.zeros(B_b, T, dtype=torch.bool, device=device)
-                    for j in range(ANS_LEN): ans_mask[range(B_b), ap[:, j]] = True
+                    ans_mask.scatter_(1, ap, True)
                     t_r = torch.rand(B_b, device=device)
-                    m_probs = t_r.unsqueeze(1) * ans_mask.float()
+                    # DARM: weight mask probabilities by per-position loss
+                    if mask_type == 'darm':
+                        pw = darm_weights.unsqueeze(0)  # (1, ANS_LEN)
+                        # Map position weights to sequence positions
+                        pw_seq = torch.zeros(B_b, T, device=device)
+                        pw_seq.scatter_(1, ap, pw.expand(B_b, -1))
+                        m_probs = (t_r.unsqueeze(1) * ans_mask.float() * pw_seq).clamp(0, 1)
+                    else:
+                        m_probs = t_r.unsqueeze(1) * ans_mask.float()
                     m = torch.bernoulli(m_probs).bool()
                     no_m = ~m.any(dim=1)
                     if no_m.any():
@@ -1201,50 +1209,7 @@ def run(tag=''):
                         print(f"      {labs[p['position']]}: br={p['base_rate']:.2f} "
                               f"cov(c1)={p['cov_c1']:.3f} deficit={p['deficit']:+.4f}")
 
-            # Save PUMA state for continuation training
-            if mt == 'puma':
-                puma_state = {k: v.cpu().clone() for k, v in m.state_dict().items()}
-                print(f"    [saved PUMA checkpoint for continuation]")
-
             del m; torch.cuda.empty_cache() if torch.cuda.is_available() else None
-        # ── Continuation: PUMA checkpoint → random masking ──
-        if RUN_CONTINUATION and 'puma' in MASK_TYPES:
-            print(f"\n{'━'*60}\n  Continuation Training (PUMA→Random)\n{'━'*60}")
-            heavy = gen_carry_heavy_test(N_TEST, fmt, seed=7000, min_max_chain=3)
-            for cont_ep in CONTINUATION_EPOCHS:
-                cont_label = f'puma+rand{cont_ep}'
-                kb = _fk('diffusion', fmt, cont_label, 'confidence')
-                print(f"\n▶ {cont_label}: PUMA({MAX_EPOCHS}ep) → random({cont_ep}ep) = {MAX_EPOCHS+cont_ep} total")
-                m, d = train_model('diffusion', tok, train_data, test_data, max_len,
-                                   fmt, mask_type='random', init_state=puma_state,
-                                   n_epochs=cont_ep, device=DEVICE)
-                all_dyn[kb] = d
-
-                # Full eval: standard + heavy + corner + chain sweep
-                for dp in DECODE_POLICIES:
-                    for name, data in [('standard', test_data), ('heavy', heavy)]:
-                        ps = gen_eval_with_stats(m, tok, data, fmt, max_len, decode_policy=dp, device=DEVICE)
-                        acc = sum(r['correct'] for r in ps) / len(ps)
-                        all_final[_fk('diffusion', fmt, cont_label, f'{name}_{dp}')] = {'accuracy': acc, 'n': len(ps)}
-                        print(f"    {name} {dp}: {acc:.4f}")
-                for cat in ['msb_chain', 'full_propagate', 'long_chain']:
-                    cc = gen_corner_case_test(N_TEST, fmt, seed=6000, category=cat)
-                    if not cc: continue
-                    for dp in DECODE_POLICIES:
-                        ps = gen_eval_with_stats(m, tok, cc, fmt, max_len, decode_policy=dp, device=DEVICE)
-                        acc = sum(r['correct'] for r in ps) / len(ps)
-                        all_final[_fk('diffusion', fmt, cont_label, f'corner_{cat}_{dp}')] = {'accuracy': acc, 'n': len(cc)}
-                        print(f"    corner/{cat} {dp}: {acc:.4f}")
-                for min_cl in sweep_lengths:
-                    cc = gen_min_chain_test(sweep_n, fmt, seed=6500+min_cl, min_chain=min_cl)
-                    if not cc: continue
-                    for dp in DECODE_POLICIES:
-                        ps = gen_eval_with_stats(m, tok, cc, fmt, max_len, decode_policy=dp, device=DEVICE)
-                        acc = sum(r['correct'] for r in ps) / len(ps)
-                        all_final[_fk('diffusion', fmt, cont_label, f'chain_sweep_{min_cl}_{dp}')] = {
-                            'accuracy': acc, 'n': len(cc), 'min_chain': min_cl}
-                        print(f"    chain>={min_cl:2d} {dp}: {acc:.4f}")
-                del m; torch.cuda.empty_cache() if torch.cuda.is_available() else None
 
         # Figures
         figs = make_figures(all_dyn, all_final, fmt)
@@ -1262,8 +1227,6 @@ def run(tag=''):
     print(f"\n{'='*70}\n  SUMMARY\n{'='*70}")
     for fmt in FORMATS:
         all_conditions = list(MASK_TYPES)
-        if RUN_CONTINUATION:
-            all_conditions += [f'puma+rand{ce}' for ce in CONTINUATION_EPOCHS]
         print(f"\n  ── {fmt} ──")
         print(f"  {'Test':<35s}", end='')
         for mt in all_conditions: print(f" {mt:>14s}", end='')
