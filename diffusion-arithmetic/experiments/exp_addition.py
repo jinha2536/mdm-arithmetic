@@ -3,11 +3,10 @@
   Addition — Carry Dependency Learning + PUMA Coverage Deficit
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-  Training: random vs puma masking (iteration-based, EMA)
+  Training: random vs puma (+ optional oracle_lsb, confidence)
   Decode:   confidence (model) vs lsb (oracle) vs random
   Analyses: GKP dependency, carry rarity × accuracy, PUMA coverage,
             corner cases, confidence cascade, counterfactual carry
-  Continuation: random→puma, puma→random (representation persistence)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 """
 import sys, os, time, math, json, random
@@ -22,9 +21,10 @@ from collections import defaultdict
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
                 if '__file__' in dir() else '.')
 from core.tokenizer import CharTokenizer
+from core.model import Transformer
 from core.train_utils import (
-    mount_drive, save_results, save_checkpoint, encode_samples,
-    train_diffusion, puma_k_fixed, generate_diffusion, DEVICE,
+    mount_drive, save_results, generate_ar, generate_diffusion,
+    encode_samples, DEVICE,
 )
 
 EXP_NAME = 'exp_addition'
@@ -32,68 +32,65 @@ EXP_NAME = 'exp_addition'
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Config
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-ND = 32; ANS_LEN = ND + 1
-N_TRAIN = 20000; N_TEST = 1000; BATCH_SIZE = 256
-# ~78 iters/epoch at N_TRAIN=20000/BS=256 → 400k iters ≈ 5000 epochs
-MAX_ITERS = 400000; EVAL_EVERY = 5000; LOG_EVERY = 1000
-GEN_EVAL_EVERY = 10000; GEN_EVAL_N = 500
-MASK_TYPES = ['random', 'puma']
+ND = 16; ANS_LEN = ND + 1
+N_TRAIN = 10000; N_TEST = 1000; BATCH_SIZE = 200
+MAX_EPOCHS = 5000; EVAL_EVERY = 100; LOG_EVERY = 50
+GEN_EVAL_EVERY = 200; GEN_EVAL_N = 500
+FORMATS = ['plain']; MASK_TYPES = ['random', 'puma', 'darm']
 DECODE_POLICIES = ['confidence', 'lsb']
-N_LAYER = 3; N_HEAD = 3; N_EMBD = 192; DROPOUT = 0.1; POS_ENC = 'absolute'
-LR = 1e-3; MIN_LR = 1e-4; WARMUP_ITERS = 2000; GRAD_CLIP = 1.0
-WEIGHT_DECAY = 0.1; EMA_DECAY = 0.9999
-PUMA_TAU = 0.9; PUMA_K = 8  # fixed K (like sudoku), 33 positions / 8 steps ≈ 4 cells/step
-SEED = 42
-DATA_MODE = 'natural'
+N_LAYER = 2; N_HEAD = 2; N_EMBD = 128; DROPOUT = 0.2; POS_ENC = 'absolute'
+LR = 1e-3; MIN_LR = 1e-4; WARMUP_EPOCHS = 10; GRAD_CLIP = 1.0
+PUMA_TAU = 0.9; PUMA_K_START = 3; PUMA_K_END = ANS_LEN
+SEED = 42; RUN_AR = False
+DATA_MODE = 'natural'  # 'balanced' or 'natural'
 
-# Early stopping: patience in iters (None = disabled, run full max_iters)
-# ~50k iters ≈ 640 epochs of patience
-PATIENCE = 50000
-
-# Continuation training: ~100-200 epochs ≈ 10k iters
-CONTINUATION_ITERS = 10000
+# Difficulty-Aware Random Masking: mask probability ∝ per-position loss
+# No hyperparameters — loss itself is the difficulty signal
+RUN_DARM = True
 
 
 def parse_args():
     import argparse
     p = argparse.ArgumentParser()
     p.add_argument('--nd', type=int); p.add_argument('--n-train', type=int)
-    p.add_argument('--n-test', type=int); p.add_argument('--max-iters', type=int)
+    p.add_argument('--n-test', type=int); p.add_argument('--epochs', type=int)
     p.add_argument('--batch-size', type=int); p.add_argument('--eval-every', type=int)
     p.add_argument('--gen-eval-every', type=int)
     p.add_argument('--n-layer', type=int); p.add_argument('--n-head', type=int)
     p.add_argument('--n-embd', type=int); p.add_argument('--dropout', type=float)
-    p.add_argument('--lr', type=float)
-    p.add_argument('--weight-decay', type=float)
-    p.add_argument('--patience', type=int)
     p.add_argument('--puma-tau', type=float)
-    p.add_argument('--puma-k', type=int)
-    p.add_argument('--masks', nargs='+'); p.add_argument('--decode', nargs='+')
+    p.add_argument('--puma-k-start', type=int); p.add_argument('--puma-k-end', type=int)
+    p.add_argument('--formats', nargs='+'); p.add_argument('--masks', nargs='+')
+    p.add_argument('--decode', nargs='+'); p.add_argument('--no-ar', action='store_true')
+    p.add_argument('--ar', action='store_true')
     p.add_argument('--data-mode', choices=['balanced', 'natural'])
-    p.add_argument('--continuation-iters', type=int)
-    p.add_argument('--no-continuation', action='store_true')
+    p.add_argument('--no-darm', action='store_true')
     p.add_argument('--tag', type=str, default=''); p.add_argument('--seed', type=int)
     p.add_argument('--seeds', nargs='+', type=int)
+    # Colab/IPython safe parsing
     try:
         args, _ = p.parse_known_args()
     except SystemExit:
         args, _ = p.parse_known_args([])
     g = globals()
-    for a, gl in {'n_train': 'N_TRAIN', 'n_test': 'N_TEST', 'max_iters': 'MAX_ITERS',
+    for a, gl in {'n_train': 'N_TRAIN', 'n_test': 'N_TEST', 'epochs': 'MAX_EPOCHS',
                    'batch_size': 'BATCH_SIZE', 'eval_every': 'EVAL_EVERY',
                    'gen_eval_every': 'GEN_EVAL_EVERY', 'n_layer': 'N_LAYER',
                    'n_head': 'N_HEAD', 'n_embd': 'N_EMBD', 'dropout': 'DROPOUT',
-                   'lr': 'LR', 'weight_decay': 'WEIGHT_DECAY',
-                   'patience': 'PATIENCE', 'puma_tau': 'PUMA_TAU',
-                   'puma_k': 'PUMA_K',
-                   'seed': 'SEED', 'continuation_iters': 'CONTINUATION_ITERS'}.items():
+                   'puma_tau': 'PUMA_TAU', 'puma_k_start': 'PUMA_K_START',
+                   'puma_k_end': 'PUMA_K_END', 'seed': 'SEED'}.items():
         v = getattr(args, a, None)
         if v is not None: g[gl] = v
     if args.nd:
         g['ND'] = args.nd; g['ANS_LEN'] = args.nd + 1
+        if not args.puma_k_end: g['PUMA_K_END'] = args.nd + 1
+    if args.formats: g['FORMATS'] = args.formats
     if args.masks: g['MASK_TYPES'] = args.masks
     if args.decode: g['DECODE_POLICIES'] = args.decode
+    if args.no_ar: g['RUN_AR'] = False
+    if args.ar: g['RUN_AR'] = True
     if args.data_mode: g['DATA_MODE'] = args.data_mode
+    if args.no_darm: g['RUN_DARM'] = False
     return args
 
 
@@ -101,8 +98,12 @@ def parse_args():
 # Data helpers
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 def _pad(n, w): return str(n).zfill(w)
+
 def _fmt_plain(a, b): return f"{_pad(a,ND)}+{_pad(b,ND)}={_pad(a+b,ANS_LEN)}"
-def get_answer(s): return s.split('=')[1]
+def _fmt_reverse(a, b): return f"{_pad(a,ND)}+{_pad(b,ND)}={_pad(a+b,ANS_LEN)[::-1]}"
+FMT_FN = {'plain': _fmt_plain, 'reverse': _fmt_reverse}
+
+def get_answer(s, fmt): return s.split('=')[1]
 def _parse_operands(s):
     parts = s.split('=')[0].split('+'); return int(parts[0]), int(parts[1])
 
@@ -113,32 +114,41 @@ def _count_carries(a, b):
         s = int(a_s[i]) + int(b_s[i]) + carry; carry = s // 10; count += carry
     return count
 
-def _carry_at_answer_pos(a, b):
-    """Per-answer-position carry-in flag (plain format)."""
+def _carry_at_answer_pos(a, b, fmt):
+    """Per-answer-position carry-in flag."""
     a_s, b_s = _pad(a, ND), _pad(b, ND)
     flags, carry = [], 0
     for i in range(ND - 1, -1, -1):
         s = int(a_s[i]) + int(b_s[i]) + carry; carry = s // 10; flags.append(bool(carry))
     ci = [False] * ANS_LEN
-    for k in range(ANS_LEN):
-        lp = ND - k
-        if lp == ND: ci[k] = flags[ND-1] if ND-1 < len(flags) else False
-        elif 0 <= lp-1 < len(flags): ci[k] = flags[lp-1]
+    if fmt == 'plain':
+        for k in range(ANS_LEN):
+            lp = ND - k
+            if lp == ND: ci[k] = flags[ND-1] if ND-1 < len(flags) else False
+            elif 0 <= lp-1 < len(flags): ci[k] = flags[lp-1]
+    else:
+        for k in range(ANS_LEN):
+            if k == 0: ci[k] = False
+            elif k-1 < len(flags): ci[k] = flags[k-1]
     return ci
 
-def _gkp_at_answer_pos(a, b):
-    """Classify each answer position as g/k/p/carry_out (plain format)."""
+def _gkp_at_answer_pos(a, b, fmt):
+    """Classify each answer position as g/k/p/carry_out."""
     a_s, b_s = _pad(a, ND), _pad(b, ND)
     digit_gkp = []
     for i in range(ND - 1, -1, -1):
         s = int(a_s[i]) + int(b_s[i])
         digit_gkp.append('g' if s >= 10 else ('p' if s == 9 else 'k'))
     out = ['?'] * ANS_LEN
-    out[0] = 'carry_out'
-    for j in range(ND): out[ND - j] = digit_gkp[j]
+    if fmt == 'plain':
+        out[0] = 'carry_out'
+        for j in range(ND): out[ND - j] = digit_gkp[j]
+    else:
+        out[ANS_LEN - 1] = 'carry_out'
+        for j in range(ND): out[j] = digit_gkp[j]
     return out
 
-def _dependency_context_at_pos(a, b):
+def _dependency_context_at_pos(a, b, fmt):
     """Dependency context: g, k, p_above_g, p_above_k, p_above_p, p_bottom, carry_out."""
     a_s, b_s = _pad(a, ND), _pad(b, ND)
     gkp = []
@@ -153,12 +163,16 @@ def _dependency_context_at_pos(a, b):
         elif gkp[d-1] == 'k': dep[d] = 'p_above_k'
         else: dep[d] = 'p_above_p'
     out = ['?'] * ANS_LEN
-    out[0] = 'carry_out'
-    for j in range(ND): out[ND - j] = dep[j]
+    if fmt == 'plain':
+        out[0] = 'carry_out'
+        for j in range(ND): out[ND - j] = dep[j]
+    else:
+        out[ANS_LEN - 1] = 'carry_out'
+        for j in range(ND): out[j] = dep[j]
     return out
 
 def _chain_stats(a, b):
-    """Rich carry-chain stats."""
+    """Rich carry-chain stats: max_chain_len, chain_reaches_msb, msb_carry_out, etc."""
     a_s, b_s = _pad(a, ND), _pad(b, ND)
     gkp = []
     for i in range(ND - 1, -1, -1):
@@ -187,23 +201,19 @@ def _chain_stats(a, b):
 
 def _max_chain_len(a, b): return _chain_stats(a, b)['max_chain_len']
 
-def _pos_labels():
-    return ['MSB'] + [f'p{j}' for j in range(1, ANS_LEN-1)] + ['LSB']
+def _pos_labels(fmt):
+    if fmt == 'plain': return ['MSB'] + [f'p{j}' for j in range(1, ANS_LEN-1)] + ['LSB']
+    return ['LSB'] + [f'p{j}' for j in range(1, ANS_LEN-1)] + ['MSB']
 
-def build_tok():
-    return CharTokenizer(list('0123456789+='), {'mask': 'M', 'pad': 'P'})
+def _lsb_policy(fmt): return 'r2l' if fmt == 'plain' else 'l2r'
+
+def build_tok(): return CharTokenizer(list('0123456789+='), {'mask': 'M', 'pad': 'P'})
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Data generation
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-def gen_data_natural(n, seed):
-    """Natural distribution — no carry balancing."""
-    rng = random.Random(seed)
-    lo, hi = 10**(ND-1), 10**ND - 1
-    return [_fmt_plain(rng.randint(lo, hi), rng.randint(lo, hi)) for _ in range(n)]
-
-def gen_data_balanced(n, seed):
+def gen_data(n, fmt, seed):
     """Carry-balanced training data."""
     rng = random.Random(seed)
     pool = defaultdict(list); seen = set()
@@ -219,26 +229,56 @@ def gen_data_balanced(n, seed):
         a, b = rng.randint(0, 10**ND-1), rng.randint(0, 10**ND-1)
         if (a, b) not in seen: out.append((a, b)); seen.add((a, b))
     rng.shuffle(out)
-    return [_fmt_plain(a, b) for a, b in out[:n]]
+    return [FMT_FN[fmt](a, b) for a, b in out[:n]]
 
-def gen_train_data(n, seed):
-    return gen_data_natural(n, seed) if DATA_MODE == 'natural' else gen_data_balanced(n, seed)
+def gen_data_natural(n, fmt, seed):
+    """Natural distribution training data — NO carry balancing.
+    At ND=32, MSB carry-in base rate drops to ~3-5%, creating the
+    rare-event gradient needed for coverage deficit analysis.
+    """
+    rng = random.Random(seed)
+    lo, hi = 10**(ND-1), 10**ND - 1
+    return [FMT_FN[fmt](rng.randint(lo, hi), rng.randint(lo, hi)) for _ in range(n)]
 
-def gen_test_data(n, seed):
-    return gen_data_natural(n, seed) if DATA_MODE == 'natural' else gen_data_balanced(n, seed)
+def gen_test_data(n, fmt, seed):
+    """Full ND-digit test data. Uses DATA_MODE for consistency with training."""
+    if DATA_MODE == 'natural':
+        return gen_data_natural(n, fmt, seed)
+    rng = random.Random(seed); lo, hi = 10**(ND-1), 10**ND-1
+    pool = defaultdict(list); seen = set()
+    for _ in range(max(n*200, 100000)):
+        a, b = rng.randint(lo, hi), rng.randint(lo, hi)
+        if (a, b) in seen: continue
+        seen.add((a, b)); pool[_count_carries(a, b)].append((a, b))
+    target = max(1, n // max(len(pool), 1)); out = []
+    for nc in sorted(pool): rng.shuffle(pool[nc]); out.extend(pool[nc][:target])
+    while len(out) < n:
+        a, b = rng.randint(lo, hi), rng.randint(lo, hi)
+        if (a, b) not in seen: out.append((a, b)); seen.add((a, b))
+    rng.shuffle(out)
+    return [FMT_FN[fmt](a, b) for a, b in out[:n]]
 
-def gen_carry_heavy_test(n, seed, min_max_chain=3):
+def gen_carry_heavy_test(n, fmt, seed, min_max_chain=3):
     rng = random.Random(seed); lo, hi = 10**(ND-1), 10**ND-1; results = []
     for _ in range(n * 200):
         a, b = rng.randint(lo, hi), rng.randint(lo, hi)
-        if _max_chain_len(a, b) >= min_max_chain: results.append(_fmt_plain(a, b))
+        if _max_chain_len(a, b) >= min_max_chain: results.append(FMT_FN[fmt](a, b))
         if len(results) >= n: break
     return results[:n]
 
-def gen_corner_case_test(n, seed, category='msb_chain'):
+def gen_corner_case_test(n, fmt, seed, category='msb_chain'):
     rng = random.Random(seed); lo, hi = 10**(ND-1), 10**ND-1; results = []
+    def _accept(a, b):
+        st = _chain_stats(a, b)
+        if category == 'msb_chain': return st['chain_reaches_msb']
+        if category == 'full_propagate': return st['n_propagate'] == ND
+        if category == 'long_chain': return st['max_chain_len'] >= ND // 2
+        return False
+
     if category == 'long_chain':
-        return gen_min_chain_test(n, seed, min_chain=ND // 2)
+        # Constructive: place a p-chain of length ND//2 starting at a random position
+        target_len = ND // 2
+        return gen_min_chain_test(n, fmt, seed, min_chain=target_len)
 
     for _ in range(n * 3000):
         if category == 'full_propagate':
@@ -248,42 +288,55 @@ def gen_corner_case_test(n, seed, category='msb_chain'):
             a, b = int(''.join(str(d) for d in ad)), int(''.join(str(d) for d in bd))
         else:
             a, b = rng.randint(lo, hi), rng.randint(lo, hi)
-        st = _chain_stats(a, b)
-        if category == 'msb_chain' and st['chain_reaches_msb']:
-            results.append(_fmt_plain(a, b))
-        elif category == 'full_propagate' and st['n_propagate'] == ND:
-            results.append(_fmt_plain(a, b))
+        if _accept(a, b): results.append(FMT_FN[fmt](a, b))
         if len(results) >= n: break
     if len(results) < n: print(f"    WARNING: corner/{category}: {len(results)}/{n}")
     return results[:n]
 
-def gen_min_chain_test(n, seed, min_chain):
-    """Construct samples with a propagate chain of exactly min_chain length."""
+def gen_min_chain_test(n, fmt, seed, min_chain):
+    """Construct samples with a propagate chain of exactly min_chain length.
+    Places min_chain consecutive p-positions (digit pairs summing to 9)
+    at a random location, fills the rest with g/k positions.
+    """
     rng = random.Random(seed); results = []; seen = set()
     for _ in range(n * 50):
         if len(results) >= n: break
+        # Choose where to place the p-chain
         max_start = ND - min_chain
         if max_start < 0: break
-        chain_start = rng.randint(0, max_start)
+        chain_start = rng.randint(0, max_start)  # digit index (LSB=0)
+
         a_digits = [0] * ND; b_digits = [0] * ND
         for d in range(ND):
             if chain_start <= d < chain_start + min_chain:
+                # p-position: a+b = 9
                 a_d = rng.randint(0, 9); b_d = 9 - a_d
             else:
+                # g or k position: a+b != 9 (and a+b < 10 for k, >= 10 for g)
                 a_d = rng.randint(0, 9); b_d = rng.randint(0, 9)
-                while a_d + b_d == 9: b_d = rng.randint(0, 9)
+                while a_d + b_d == 9:
+                    b_d = rng.randint(0, 9)
             a_digits[d] = a_d; b_digits[d] = b_d
+
+        # Ensure MSB is nonzero
         if a_digits[ND-1] == 0: a_digits[ND-1] = rng.randint(1, 9)
         if b_digits[ND-1] == 0: b_digits[ND-1] = rng.randint(1, 9)
+        # Fix MSB if it was in chain and got overwritten
         if chain_start <= ND-1 < chain_start + min_chain:
-            a_digits[ND-1] = rng.randint(1, 4); b_digits[ND-1] = 9 - a_digits[ND-1]
-        a_str = ''.join(str(d) for d in reversed(a_digits))
-        b_str = ''.join(str(d) for d in reversed(b_digits))
-        a, b = int(a_str), int(b_str)
-        if (a, b) in seen: continue
-        seen.add((a, b))
-        if _max_chain_len(a, b) >= min_chain:
-            results.append(_fmt_plain(a, b))
+            a_digits[ND-1] = rng.randint(1, 8)
+            b_digits[ND-1] = 9 - a_digits[ND-1]
+
+        # Convert digit arrays (LSB=index 0) to integers
+        a = int(''.join(str(a_digits[d]) for d in range(ND-1, -1, -1)))
+        b = int(''.join(str(b_digits[d]) for d in range(ND-1, -1, -1)))
+
+        # Verify actual chain length
+        st = _chain_stats(a, b)
+        if st['max_chain_len'] >= min_chain and (a, b) not in seen:
+            seen.add((a, b)); results.append(FMT_FN[fmt](a, b))
+
+    if len(results) < n:
+        print(f"    WARNING: chain>={min_chain}: {len(results)}/{n}")
     return results[:n]
 
 def gen_counterfactual_pairs(n, seed):
@@ -292,7 +345,7 @@ def gen_counterfactual_pairs(n, seed):
         if len(results) >= n: break
         target_d = rng.randint(1, ND-1); a1, b1 = rng.randint(lo, hi), rng.randint(lo, hi)
         a1_s, b1_s = _pad(a1, ND), _pad(b1, ND)
-        si = ND - 1 - target_d
+        si = ND - 1 - target_d; da, db = int(a1_s[si]), int(b1_s[si])
         carry1 = 0
         for i in range(ND-1, si, -1): s = int(a1_s[i]) + int(b1_s[i]) + carry1; carry1 = s // 10
         for _ in range(200):
@@ -313,17 +366,17 @@ def gen_counterfactual_pairs(n, seed):
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 @torch.no_grad()
-def probe_per_position(model, tokenizer, test_samples, max_len, device=None):
-    """Fully-masked probe: per-position loss/acc/conf + dependency context."""
+def probe_per_position(model, tokenizer, test_samples, objective, fmt, max_len, device=None):
+    """Fully-masked probe: per-position loss/acc/conf + dependency context tracking."""
     if device is None: device = DEVICE
     model.eval(); mask_id = tokenizer.special_ids['mask']
     ids_all, ans_all = encode_samples(test_samples, tokenizer, max_len)
     ids_all, ans_all = ids_all.to(device), ans_all.to(device)
-    ci_tensor = torch.tensor([_carry_at_answer_pos(*_parse_operands(s)) for s in test_samples],
+    ci_tensor = torch.tensor([_carry_at_answer_pos(*_parse_operands(s), fmt) for s in test_samples],
                               dtype=torch.bool, device=device)
     dep_ctx_names = ['g', 'k', 'p_above_g', 'p_above_k', 'p_above_p', 'p_bottom', 'carry_out']
     dep_to_id = {n: i for i, n in enumerate(dep_ctx_names)}
-    dep_ids = torch.tensor([[dep_to_id.get(d, 0) for d in _dependency_context_at_pos(*_parse_operands(s))]
+    dep_ids = torch.tensor([[dep_to_id.get(d, 0) for d in _dependency_context_at_pos(*_parse_operands(s), fmt)]
                              for s in test_samples], dtype=torch.long, device=device)
 
     L = torch.zeros(ANS_LEN, device=device); C = torch.zeros(ANS_LEN, device=device)
@@ -340,37 +393,43 @@ def probe_per_position(model, tokenizer, test_samples, max_len, device=None):
         ans_pos = (ans.unsqueeze(1) + _arange).clamp(max=T-1)
         bi = torch.arange(B, device=device).unsqueeze(1).expand_as(ans_pos)
 
-        xm = ids.clone(); xm[bi, ans_pos] = mask_id
-        logits = model(xm); al = logits[bi, ans_pos]; tgt = ids[bi, ans_pos]
-        lp = F.log_softmax(al, dim=-1)
-        losses = -lp.gather(2, tgt.unsqueeze(2)).squeeze(2)
-        cl = al.clone(); cl[:, :, mask_id] = -float('inf')
-        probs = F.softmax(cl, dim=-1)
-        confs = probs.max(dim=-1).values; preds = probs.argmax(dim=-1)
-        corrects = (preds == tgt).float()
+        if objective == 'ar':
+            logits = model(ids[:, :-1]); pred_pos = ans_pos - 1
+            valid = (pred_pos >= 0) & (pred_pos < logits.shape[1])
+            pred_pos = pred_pos.clamp(min=0, max=logits.shape[1]-1)
+            tgt = ids[bi, ans_pos]; lp = F.log_softmax(logits[bi, pred_pos], dim=-1)
+            losses = -lp.gather(2, tgt.unsqueeze(2)).squeeze(2) * valid.float()
+            preds = logits[bi, pred_pos].argmax(dim=-1)
+            corrects = (preds == tgt).float() * valid.float()
+            confs = F.softmax(logits[bi, pred_pos], dim=-1).max(dim=-1).values * valid.float()
+            w = valid.float()
+        else:
+            xm = ids.clone(); xm[bi, ans_pos] = mask_id
+            logits = model(xm); al = logits[bi, ans_pos]; tgt = ids[bi, ans_pos]
+            lp = F.log_softmax(al, dim=-1)
+            losses = -lp.gather(2, tgt.unsqueeze(2)).squeeze(2)
+            cl = al.clone(); cl[:, :, mask_id] = -float('inf')
+            probs = F.softmax(cl, dim=-1)
+            confs = probs.max(dim=-1).values; preds = probs.argmax(dim=-1)
+            corrects = (preds == tgt).float(); w = torch.ones(B, ANS_LEN, device=device)
 
-        # Vectorized accumulation (no per-position Python loop)
-        L += losses.sum(dim=0)
-        C += corrects.sum(dim=0)
-        CF += confs.sum(dim=0)
-        N += B
+        for j in range(ANS_LEN):
+            L[j] += losses[:, j].sum(); C[j] += corrects[:, j].sum()
+            CF[j] += confs[:, j].sum(); N[j] += w[:, j].sum()
+        ci_b = ci_tensor[st:en]
+        for j in range(ANS_LEN):
+            ci_j = ci_b[:, j] & (w[:, j] > 0); nc_j = ~ci_b[:, j] & (w[:, j] > 0)
+            Lc[j] += losses[ci_j, j].sum(); Cc[j] += corrects[ci_j, j].sum(); Nc[j] += ci_j.sum()
+            Ln[j] += losses[nc_j, j].sum(); Cn[j] += corrects[nc_j, j].sum(); Nn[j] += nc_j.sum()
 
-        ci_b = ci_tensor[st:en]  # [B, ANS_LEN]
-        Lc += (losses * ci_b).sum(dim=0)
-        Cc += (corrects * ci_b).sum(dim=0)
-        Nc += ci_b.sum(dim=0).float()
-        nc_b = ~ci_b
-        Ln += (losses * nc_b).sum(dim=0)
-        Cn += (corrects * nc_b).sum(dim=0)
-        Nn += nc_b.sum(dim=0).float()
-
-        dep_b = dep_ids[st:en].reshape(-1); cf = confs.reshape(-1); co = corrects.reshape(-1)
-        for di, dn in enumerate(dep_ctx_names):
-            m = (dep_b == di)
-            if m.any():
-                dep_conf_sum[dn] += cf[m].sum().item()
-                dep_acc_sum[dn] += co[m].sum().item()
-                dep_count[dn] += m.sum().item()
+        if objective != 'ar':
+            dep_b = dep_ids[st:en].reshape(-1); cf = confs.reshape(-1); co = corrects.reshape(-1)
+            for di, dn in enumerate(dep_ctx_names):
+                m = (dep_b == di)
+                if m.any():
+                    dep_conf_sum[dn] += cf[m].sum().item()
+                    dep_acc_sum[dn] += co[m].sum().item()
+                    dep_count[dn] += m.sum().item()
 
     s = N.clamp(1); pos_conf = (CF/s).cpu().tolist()
     def _sd(num, den): return [n/d if d > 0 else None for n, d in zip(num.cpu().tolist(), den.cpu().tolist())]
@@ -378,68 +437,41 @@ def probe_per_position(model, tokenizer, test_samples, max_len, device=None):
               'pos_loss_carry_in': _sd(Lc, Nc), 'pos_loss_no_carry': _sd(Ln, Nn),
               'pos_acc_carry_in': _sd(Cc, Nc), 'pos_acc_no_carry': _sd(Cn, Nn),
               'overall_loss': (L.sum()/s.sum()).item(), 'overall_acc': (C.sum()/s.sum()).item()}
-    if dep_count:
+    if objective != 'ar' and dep_count:
         result['dep_context'] = {ctx: {'conf': dep_conf_sum[ctx]/n, 'acc': dep_acc_sum[ctx]/n, 'n': n}
                                   for ctx, n in dep_count.items() if n > 0}
-    cr = sorted(range(ANS_LEN), key=lambda j: pos_conf[j], reverse=True)
-    conc = 0; n_p = ANS_LEN * (ANS_LEN - 1) // 2
-    for i in range(ANS_LEN):
-        for j in range(i+1, ANS_LEN):
-            conc += int(cr.index(j) < cr.index(i))
-    result['conf_concordance'] = conc / n_p if n_p > 0 else 0
-    result['conf_spread'] = max(pos_conf) - min(pos_conf)
+    if objective != 'ar':
+        cr = sorted(range(ANS_LEN), key=lambda j: pos_conf[j], reverse=True)
+        conc = 0; n_p = ANS_LEN * (ANS_LEN - 1) // 2
+        for i in range(ANS_LEN):
+            for j in range(i+1, ANS_LEN):
+                ri, rj = cr.index(i), cr.index(j)
+                conc += int(rj < ri) if fmt == 'plain' else int(ri < rj)
+        result['conf_concordance'] = conc / n_p
+        result['conf_spread'] = max(pos_conf) - min(pos_conf)
     return result
 
 
 @torch.no_grad()
-def eval_counterfactual(model, tokenizer, cf_pairs, max_len, device=None):
+def eval_counterfactual(model, tokenizer, cf_pairs, fmt, max_len, device=None):
     if device is None: device = DEVICE
     model.eval(); mask_id = tokenizer.special_ids['mask']
-
-    # Batch all samples: each cf pair → 2 samples
-    all_strings = []
-    all_target_aj = []  # answer-relative position to check
+    deltas, flips = [], 0; c0_ok, c1_ok, n0, n1 = 0, 0, 0, 0
     for cf in cf_pairs:
-        td = cf['target_d']; aj = ND - td
+        td = cf['target_d']; preds_confs = []
         for a, b in cf['pair']:
-            all_strings.append(_fmt_plain(a, b))
-            all_target_aj.append(aj)
-
-    # Encode all at once
-    ids_all, ans_all = encode_samples(all_strings, tokenizer, max_len)
-    ids_all, ans_all = ids_all.to(device), ans_all.to(device)
-    target_aj = torch.tensor(all_target_aj, dtype=torch.long, device=device)
-    target_pos = ans_all + target_aj  # absolute position
-
-    # Batched forward pass (fully masked answer region)
-    _arange = torch.arange(ANS_LEN, device=device)
-    all_preds = []; all_confs = []; all_correct = []
-    for st in range(0, len(all_strings), 128):
-        en = min(st + 128, len(all_strings))
-        ids = ids_all[st:en]; ans = ans_all[st:en]; B = ids.shape[0]
-        ans_pos = (ans.unsqueeze(1) + _arange).clamp(max=ids.shape[1] - 1)
-        bi = torch.arange(B, device=device).unsqueeze(1).expand_as(ans_pos)
-        xm = ids.clone(); xm[bi, ans_pos] = mask_id
-        logits = model(xm)
-        tp = target_pos[st:en]
-        tgt_logits = logits[torch.arange(B, device=device), tp]
-        tgt_logits[:, mask_id] = -float('inf')
-        probs = F.softmax(tgt_logits, dim=-1)
-        pred_tok = probs.argmax(dim=-1)
-        gold_tok = ids[torch.arange(B, device=device), tp]
-        all_preds.extend(pred_tok.cpu().tolist())
-        all_confs.extend(probs.max(dim=-1).values.cpu().tolist())
-        all_correct.extend((pred_tok == gold_tok).cpu().tolist())
-
-    # Aggregate per pair
-    flips = 0; deltas = []; c0_ok, c1_ok, n0, n1 = 0, 0, 0, 0
-    for pi, cf in enumerate(cf_pairs):
-        i0, i1 = pi * 2, pi * 2 + 1
-        deltas.append(abs(all_confs[i1] - all_confs[i0]))
-        if all_preds[i0] != all_preds[i1]: flips += 1
-        for mi, idx in enumerate([i0, i1]):
-            if cf['carry_in'][mi]: c1_ok += all_correct[idx]; n1 += 1
-            else: c0_ok += all_correct[idx]; n0 += 1
+            s = FMT_FN[fmt](a, b); ids = torch.tensor(tokenizer.encode(s), device=device).unsqueeze(0)
+            ans_s = s.index('=') + 1; xm = ids.clone()
+            xm[0, ans_s:ans_s+ANS_LEN] = mask_id; logits = model(xm)
+            aj = ND - td if fmt == 'plain' else td; pos = ans_s + aj
+            cl = logits[0, pos].clone(); cl[mask_id] = -float('inf')
+            probs = F.softmax(cl, dim=-1)
+            preds_confs.append((probs.argmax().item(), probs.max().item(), probs.argmax().item() == ids[0, pos].item()))
+        deltas.append(abs(preds_confs[1][1] - preds_confs[0][1]))
+        if preds_confs[0][0] != preds_confs[1][0]: flips += 1
+        for mi, (_, _, ok) in enumerate(preds_confs):
+            if cf['carry_in'][mi]: c1_ok += ok; n1 += 1
+            else: c0_ok += ok; n0 += 1
     n = len(cf_pairs)
     return {'n_pairs': n, 'mean_conf_delta': sum(deltas)/max(n,1),
             'prediction_flip_rate': flips/max(n,1),
@@ -447,32 +479,31 @@ def eval_counterfactual(model, tokenizer, cf_pairs, max_len, device=None):
 
 
 @torch.no_grad()
-def gen_eval_with_stats(model, tokenizer, test_samples, max_len,
+def gen_eval_with_stats(model, tokenizer, test_samples, fmt, max_len,
                         decode_policy='confidence', device=None):
     """Per-sample generation with chain stats + error positions."""
     if device is None: device = DEVICE
     mask_id = tokenizer.special_ids['mask']; pad_id = tokenizer.special_ids['pad']
     model.eval(); out = []
-    lsb_policy = 'r2l'  # plain format: LSB is rightmost
     for st in range(0, len(test_samples), 128):
         batch = test_samples[st:min(st+128, len(test_samples))]; B = len(batch)
         penc = [tokenizer.encode(s.split('=')[0]+'=') for s in batch]
         pm = max(len(p) for p in penc)
         pids = torch.full((B, pm), pad_id, dtype=torch.long)
         for i, e in enumerate(penc): pids[i, :len(e)] = torch.tensor(e)
-        policy = lsb_policy if decode_policy == 'lsb' else decode_policy
+        policy = _lsb_policy(fmt) if decode_policy == 'lsb' else 'confidence'
         gen, _, info = generate_diffusion(model, pids, ANS_LEN, mask_id,
                                           policy=policy, greedy=True, device=device)
-        pred_ids = gen[:, pm:pm+ANS_LEN]
+        pred_ids = gen[:, pm:pm+ANS_LEN]; orders = info.get('orders')
         for i in range(B):
             s = batch[i]; ps = tokenizer.decode(pred_ids[i].cpu().tolist())
-            gs = get_answer(s); a, b = _parse_operands(s)
+            gs = get_answer(s, fmt); a, b = _parse_operands(s)
             pc = [ps[j] == gs[j] if j < len(ps) else False for j in range(len(gs))]
             errs = [j for j in range(len(gs)) if j >= len(ps) or ps[j] != gs[j]]
             out.append({'correct': ps==gs, 'pos_correct': pc, 'error_positions': errs,
-                       'chain_stats': _chain_stats(a, b), 'gkp_at_pos': _gkp_at_answer_pos(a, b),
-                       'dep_ctx': _dependency_context_at_pos(a, b),
-                       'n_carries': _count_carries(a, b), 'carry_flags': _carry_at_answer_pos(a, b)})
+                       'chain_stats': _chain_stats(a, b), 'gkp_at_pos': _gkp_at_answer_pos(a, b, fmt),
+                       'dep_ctx': _dependency_context_at_pos(a, b, fmt),
+                       'n_carries': _count_carries(a, b), 'carry_flags': _carry_at_answer_pos(a, b, fmt)})
     return out
 
 
@@ -498,9 +529,9 @@ def stratify_results(per_sample):
     return out
 
 
-def analyse_carry_rarity(per_sample, test_samples):
+def analyse_carry_rarity(per_sample, test_samples, fmt):
     """Per-position carry-in base rate × conditional accuracy."""
-    ci_flags = [_carry_at_answer_pos(*_parse_operands(s)) for s in test_samples]
+    ci_flags = [_carry_at_answer_pos(*_parse_operands(s), fmt) for s in test_samples]
     N = len(per_sample); per_pos = []
     for j in range(ANS_LEN):
         ci1, ci0 = [], []
@@ -531,20 +562,20 @@ def analyse_carry_rarity(per_sample, test_samples):
 
 
 @torch.no_grad()
-def simulate_puma_coverage(model, tokenizer, test_samples, max_len,
+def simulate_puma_coverage(model, tokenizer, test_samples, fmt, max_len,
                            K=None, tau=None, n_samples=200, device=None):
     """Measure PUMA chain coverage × carry-in condition."""
     if device is None: device = DEVICE
-    if K is None: K = PUMA_K
+    if K is None: K = PUMA_K_END
     if tau is None: tau = PUMA_TAU
     model.eval(); mask_id = tokenizer.special_ids['mask']
-    ci_flags = [_carry_at_answer_pos(*_parse_operands(s)) for s in test_samples[:n_samples]]
+    ci_flags = [_carry_at_answer_pos(*_parse_operands(s), fmt) for s in test_samples[:n_samples]]
     N = min(len(test_samples), n_samples)
-    c1s, c0s = torch.zeros(ANS_LEN), torch.zeros(ANS_LEN)
-    c1n, c0n = torch.zeros(ANS_LEN, dtype=torch.long), torch.zeros(ANS_LEN, dtype=torch.long)
+    c1s, c0s, c1n, c0n = torch.zeros(ANS_LEN), torch.zeros(ANS_LEN), \
+                          torch.zeros(ANS_LEN, dtype=torch.long), torch.zeros(ANS_LEN, dtype=torch.long)
     for si in range(N):
         s = test_samples[si]; ci = ci_flags[si]
-        prefix = s.split('=')[0]+'='; answer = get_answer(s)
+        prefix = s.split('=')[0]+'='; answer = get_answer(s, fmt)
         penc = tokenizer.encode(prefix); aenc = tokenizer.encode(answer); T_pre = len(penc)
         x = torch.tensor(penc + [mask_id]*ANS_LEN, dtype=torch.long, device=device).unsqueeze(0)
         x0 = torch.tensor(aenc[:ANS_LEN], dtype=torch.long, device=device)
@@ -591,12 +622,15 @@ def simulate_puma_coverage(model, tokenizer, test_samples, max_len,
     return {'per_position': per_pos, 'corr': corr}
 
 
-def analyse_error_localization(per_sample):
-    """Where in the chain do errors occur?"""
+def analyse_error_localization(per_sample, fmt):
+    """Where in the chain do errors occur? Maps errors to chain structure.
+    Returns: {overflow_errors, chain_top_errors, chain_mid_errors,
+              chain_bottom_errors, gk_errors} as fractions of total errors.
+    """
     cats = defaultdict(int); total_errs = 0
     for r in per_sample:
         if r['correct']: continue
-        gkp = r['gkp_at_pos']; dep = r['dep_ctx']
+        gkp = r['gkp_at_pos']; cs = r['chain_stats']; dep = r['dep_ctx']
         for j in r['error_positions']:
             if j >= len(gkp): continue
             total_errs += 1
@@ -608,172 +642,351 @@ def analyse_error_localization(per_sample):
             elif dep[j] == 'p_above_p': cats['p_chain_interior'] += 1
     if total_errs == 0: return {'total_errors': 0}
     return {'total_errors': total_errs,
-            **{k: v/total_errs for k, v in cats.items()}}
+            **{k: v/total_errs for k, v in sorted(cats.items())}}
 
 
 @torch.no_grad()
-def analyse_confidence_calibration(model, tokenizer, test_samples, max_len, device=None):
-    """Per chain-length bin: mean confidence for correct vs wrong predictions."""
+def analyse_confidence_calibration(model, tokenizer, test_samples, fmt, max_len,
+                                   decode_policy='confidence', device=None):
+    """When the model is wrong, is it confident or uncertain?
+    Returns per-chain-length: mean confidence for correct/incorrect predictions.
+    """
     if device is None: device = DEVICE
-    ps = gen_eval_with_stats(model, tokenizer, test_samples, max_len,
-                             decode_policy='confidence', device=device)
-    mask_id = tokenizer.special_ids['mask']
-    ids_all, ans_all = encode_samples(test_samples, tokenizer, max_len)
-    ids_all, ans_all = ids_all.to(device), ans_all.to(device)
-    _arange = torch.arange(ANS_LEN, device=device)
+    model.eval(); mask_id = tokenizer.special_ids['mask']
+    pad_id = tokenizer.special_ids['pad']
+    by_cl = defaultdict(lambda: {'conf_correct': [], 'conf_wrong': []})
 
-    confs_per = []
     for st in range(0, len(test_samples), 128):
-        en = min(st+128, len(test_samples))
-        ids, ans = ids_all[st:en], ans_all[st:en]; B = ids.shape[0]
-        ans_pos = (ans.unsqueeze(1) + _arange).clamp(max=ids.shape[1]-1)
-        bi = torch.arange(B, device=device).unsqueeze(1).expand_as(ans_pos)
-        xm = ids.clone(); xm[bi, ans_pos] = mask_id
-        logits = model(xm); al = logits[bi, ans_pos]
+        batch = test_samples[st:min(st+128, len(test_samples))]; B = len(batch)
+        penc = [tokenizer.encode(s.split('=')[0]+'=') for s in batch]
+        pm = max(len(p) for p in penc)
+        pids = torch.full((B, pm), pad_id, dtype=torch.long)
+        for i, e in enumerate(penc): pids[i, :len(e)] = torch.tensor(e)
+
+        # Single forward pass with all answer positions masked
+        full_enc = [tokenizer.encode(s) for s in batch]
+        ml = max(len(e) for e in full_enc)
+        ids = torch.full((B, ml), pad_id, dtype=torch.long, device=device)
+        for i, e in enumerate(full_enc):
+            ids[i, :len(e)] = torch.tensor(e, device=device)
+        ans_starts = torch.tensor([s.index('=')+1 for s in batch], device=device)
+        _ar = torch.arange(ANS_LEN, device=device)
+        ap = (ans_starts.unsqueeze(1) + _ar).clamp(max=ml-1)
+        bi = torch.arange(B, device=device).unsqueeze(1).expand_as(ap)
+        xm = ids.clone(); xm[bi, ap] = mask_id
+        logits = model(xm); al = logits[bi, ap]
         cl = al.clone(); cl[:, :, mask_id] = -float('inf')
-        confs_per.extend(F.softmax(cl, dim=-1).max(dim=-1).values.mean(dim=1).cpu().tolist())
+        probs = F.softmax(cl, dim=-1)
+        confs = probs.max(dim=-1).values; preds = cl.argmax(dim=-1)
+        tgt = ids[bi, ap]; correct = (preds == tgt)
 
-    def _cl_bin(cl):
-        if cl <= 2: return 'cl<=2'
-        if cl <= 4: return 'cl<=4'
-        return 'cl>=5'
-
-    bins = defaultdict(lambda: {'correct': [], 'wrong': []})
-    for i, r in enumerate(ps):
-        cl = r['chain_stats']['max_chain_len']
-        bn = _cl_bin(cl)
-        (bins[bn]['correct'] if r['correct'] else bins[bn]['wrong']).append(
-            confs_per[i] if i < len(confs_per) else 0.5)
+        for i in range(B):
+            a, b = _parse_operands(batch[i])
+            cs = _chain_stats(a, b)
+            mcl = cs['max_chain_len']
+            cl_bin = 0 if mcl == 0 else (2 if mcl <= 2 else (4 if mcl <= 4 else
+                     (8 if mcl <= 8 else (16 if mcl <= 16 else 32))))
+            for j in range(ANS_LEN):
+                c = confs[i, j].item()
+                if correct[i, j]: by_cl[cl_bin]['conf_correct'].append(c)
+                else: by_cl[cl_bin]['conf_wrong'].append(c)
 
     result = {}
-    for bn, data in sorted(bins.items()):
-        mc = sum(data['correct'])/len(data['correct']) if data['correct'] else None
-        mw = sum(data['wrong'])/len(data['wrong']) if data['wrong'] else None
-        oc = sum(1 for c in data['wrong'] if c > 0.8)/len(data['wrong']) if data['wrong'] else None
-        result[bn] = {'mean_conf_correct': mc, 'mean_conf_wrong': mw,
-                      'overconfident_wrong': oc, 'n_correct': len(data['correct']),
-                      'n_wrong': len(data['wrong'])}
+    for cl_bin in sorted(by_cl):
+        cc = by_cl[cl_bin]['conf_correct']
+        cw = by_cl[cl_bin]['conf_wrong']
+        result[f'cl<={cl_bin}'] = {
+            'mean_conf_correct': sum(cc)/len(cc) if cc else None,
+            'mean_conf_wrong': sum(cw)/len(cw) if cw else None,
+            'n_correct': len(cc), 'n_wrong': len(cw),
+            'overconfident_wrong': sum(1 for c in cw if c > 0.8)/max(len(cw),1) if cw else None,
+        }
     return result
 
 
-def _quick_gen(model, tokenizer, test_samples, max_len, decode_policy='confidence',
-               n=None, device=None):
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Training
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+def train_model(objective, tokenizer, train_samples, test_samples, max_len,
+                fmt, mask_type='random', n_epochs=None, device=None):
+    """Train model.
+    n_epochs: override MAX_EPOCHS (for continuation with fewer epochs).
+    """
+    if device is None: device = DEVICE
+    epochs = n_epochs or MAX_EPOCHS
+    train_ids, train_ans = encode_samples(train_samples, tokenizer, max_len)
+    train_ids, train_ans = train_ids.to(device), train_ans.to(device)
+    N, T = train_ids.shape; bpe = (N + BATCH_SIZE - 1) // BATCH_SIZE
+    total_iters = epochs * bpe
+    mask_id = tokenizer.special_ids['mask']; pad_id = tokenizer.special_ids['pad']
+    is_causal = (objective == 'ar')
+    model = Transformer(vocab_size=len(tokenizer), block_size=max_len+8,
+                        n_layer=N_LAYER, n_head=N_HEAD, n_embd=N_EMBD,
+                        dropout=DROPOUT, is_causal=is_causal, pos_enc=POS_ENC).to(device)
+    tag = objective + (f"/{mask_type}" if objective == 'diffusion' else "")
+    print(f"  [{tag}] params={model.n_params:,}, {bpe} batches/epoch, {epochs} epochs")
+    optimizer = torch.optim.AdamW(model.parameters(), lr=LR, betas=(0.9, 0.99), weight_decay=0.1)
+    warmup_iters = WARMUP_EPOCHS * bpe
+    def get_lr(it):
+        if it < warmup_iters: return LR * it / max(warmup_iters, 1)
+        ratio = (it - warmup_iters) / max(total_iters - warmup_iters, 1)
+        return MIN_LR + 0.5 * (LR - MIN_LR) * (1 + math.cos(math.pi * min(ratio, 1.0)))
+
+    dynamics = {'checkpoints': [], 'gen_checkpoints': [], 'train_loss': []}
+    best_loss, best_state = float('inf'), None; it = 0; tg = 0; t0 = time.time()
+    _arange = torch.arange(ANS_LEN, device=device)
+
+    # DARM: per-position loss weights (updated at each eval checkpoint)
+    darm_weights = torch.ones(ANS_LEN, device=device)  # start uniform = random
+
+    # PUMA streaming buffer
+    uses_streaming = mask_type in ('puma', 'oracle_lsb')
+    if uses_streaming:
+        puma_x0 = torch.zeros(BATCH_SIZE, T, dtype=torch.long, device=device)
+        puma_z = torch.zeros(BATCH_SIZE, T, dtype=torch.long, device=device)
+        puma_ans = torch.zeros(BATCH_SIZE, dtype=torch.long, device=device)
+        puma_stage = torch.zeros(BATCH_SIZE, dtype=torch.long, device=device)
+        pool = torch.randperm(N); pool_ptr = 0
+
+        def _refresh(indices):
+            nonlocal pool_ptr, pool
+            idx_t = torch.tensor(indices, device=device); n = len(indices)
+            if pool_ptr + n > len(pool): pool = torch.randperm(N); pool_ptr = 0
+            si = pool[pool_ptr:pool_ptr+n].to(device); pool_ptr += n
+            puma_x0[idx_t] = train_ids[si]; puma_z[idx_t] = train_ids[si].clone()
+            puma_ans[idx_t] = train_ans[si]; puma_stage[idx_t] = 0
+            ap = (puma_ans[idx_t].unsqueeze(1) + _arange).clamp(max=T-1)
+            bii = idx_t.unsqueeze(1).expand_as(ap)
+            puma_z[bii, ap] = mask_id
+
+        def _advance(logits, K_cur):
+            nonlocal puma_stage
+            B = BATCH_SIZE; ap = (puma_ans.unsqueeze(1) + _arange).clamp(max=T-1)
+            bi = torch.arange(B, device=device).unsqueeze(1).expand_as(ap)
+            is_m = (puma_z[bi, ap] == mask_id)
+            if not is_m.any(): _refresh(list(range(B))); return
+            nm = is_m.sum(dim=1).float()
+            K_rem = (K_cur - puma_stage).clamp(min=1)
+            nr = (nm / K_rem.float()).ceil().long().clamp(min=1)
+            lp = logits[bi, ap].clone(); lp[:, :, mask_id] = -float('inf')
+            confs = F.softmax(lp, dim=-1).max(dim=-1).values; confs[~is_m] = -float('inf')
+            ranked = confs.argsort(dim=1, descending=True)
+            rop = torch.zeros_like(ranked); rop.scatter_(1, ranked, _arange.expand(B, -1))
+            reveal = ((rop < nr.unsqueeze(1)) | (confs > PUMA_TAU)) & is_m
+            puma_z[bi[reveal], ap[reveal]] = puma_x0[bi[reveal], ap[reveal]]
+            puma_stage += 1
+            done = (~(puma_z[bi, ap] == mask_id).any(dim=1)) | (puma_stage >= K_cur)
+            if done.any(): _refresh(done.nonzero(as_tuple=True)[0].tolist())
+
+        _refresh(list(range(BATCH_SIZE)))
+
+    def _do_eval(epoch):
+        nonlocal best_loss, best_state, darm_weights
+        probe = probe_per_position(model, tokenizer, test_samples, objective, fmt, max_len, device)
+        dynamics['checkpoints'].append({'epoch': epoch, 'iter': it, 'tg': tg, **probe})
+        if probe['overall_loss'] < best_loss and epoch > 0:
+            best_loss = probe['overall_loss']
+            best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+        # Update DARM weights from probe loss
+        if mask_type == 'darm' and probe['pos_loss']:
+            pl = torch.tensor(probe['pos_loss'], device=device).clamp(min=1e-6)
+            darm_weights = pl / pl.mean()  # normalize to mean=1
+        dc = probe.get('dep_context', {})
+        parts = [f"{c}={dc[c]['acc']:.2f}" for c in ['g','k','p_above_g','p_above_k','p_above_p'] if c in dc]
+        print(f"    [eval ep {epoch}] loss={probe['overall_loss']:.4f} acc={probe['overall_acc']:.4f} "
+              + (' '.join(parts) if parts else '') + f" | {time.time()-t0:.0f}s")
+
+    def _do_gen(epoch):
+        if objective != 'diffusion': return
+        for dp in ['confidence']:
+            r = _quick_gen(model, tokenizer, test_samples, objective, fmt, dp, device=device)
+            entry = dynamics['gen_checkpoints'][-1] if dynamics['gen_checkpoints'] and \
+                    dynamics['gen_checkpoints'][-1].get('epoch') == epoch else {'epoch': epoch}
+            entry.setdefault('gen_acc', {})[dp] = r['accuracy']
+            if entry not in dynamics['gen_checkpoints']: dynamics['gen_checkpoints'].append(entry)
+            print(f"      [gen] {dp}={r['accuracy']:.3f}")
+
+    model.eval(); _do_eval(0); model.train()
+
+    for epoch in range(1, epochs + 1):
+        epoch_loss = torch.tensor(0.0, device=device); epoch_tg = 0; epoch_n = 0
+        K_cur = PUMA_K_START + int((PUMA_K_END - PUMA_K_START) * epoch / epochs) if uses_streaming else 0
+
+        if uses_streaming:
+            for _ in range(bpe):
+                for pg in optimizer.param_groups: pg['lr'] = get_lr(it)
+                m = (puma_z == mask_id)
+                if m.sum() == 0: _refresh(list(range(BATCH_SIZE))); m = (puma_z == mask_id)
+                logits = model(puma_z); loss = F.cross_entropy(logits[m], puma_x0[m])
+                epoch_tg += m.sum().item()
+                optimizer.zero_grad(set_to_none=True); loss.backward()
+                nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP); optimizer.step()
+                _advance(logits.detach(), K_cur)
+                epoch_loss += loss.detach(); epoch_n += 1; it += 1
+        else:
+            perm = torch.randperm(N, device=device)
+            for bi in range(bpe):
+                for pg in optimizer.param_groups: pg['lr'] = get_lr(it)
+                idx = perm[bi*BATCH_SIZE:min((bi+1)*BATCH_SIZE, N)]
+                ids = train_ids[idx]; ans_s = train_ans[idx]; B_b = ids.shape[0]
+                if objective == 'ar':
+                    logits = model(ids[:, :-1]); targets = ids[:, 1:]
+                    pos = torch.arange(T-1, device=device).unsqueeze(0)
+                    lm = (pos >= (ans_s.unsqueeze(1) - 1)) & (targets != pad_id)
+                    if lm.sum() == 0: it += 1; continue
+                    loss = F.cross_entropy(logits[lm], targets[lm]); epoch_tg += lm.sum().item()
+                else:
+                    ap = (ans_s.unsqueeze(1) + _arange).clamp(max=T-1)
+                    bii = torch.arange(B_b, device=device).unsqueeze(1).expand_as(ap)
+                    ans_mask = torch.zeros(B_b, T, dtype=torch.bool, device=device)
+                    ans_mask.scatter_(1, ap, True)
+                    t_r = torch.rand(B_b, device=device)
+                    # DARM: weight mask probabilities by per-position loss
+                    if mask_type == 'darm':
+                        pw = darm_weights.unsqueeze(0)  # (1, ANS_LEN)
+                        # Map position weights to sequence positions
+                        pw_seq = torch.zeros(B_b, T, device=device)
+                        pw_seq.scatter_(1, ap, pw.expand(B_b, -1))
+                        m_probs = (t_r.unsqueeze(1) * ans_mask.float() * pw_seq).clamp(0, 1)
+                    else:
+                        m_probs = t_r.unsqueeze(1) * ans_mask.float()
+                    m = torch.bernoulli(m_probs).bool()
+                    no_m = ~m.any(dim=1)
+                    if no_m.any():
+                        rj = torch.randint(ANS_LEN, (no_m.sum(),), device=device)
+                        fp = ap[no_m].gather(1, rj.unsqueeze(1)).squeeze(1)
+                        m[no_m.nonzero(as_tuple=True)[0], fp] = True
+                    xm = ids.clone(); xm[m] = mask_id; logits = model(xm)
+                    if m.sum() == 0: it += 1; continue
+                    loss = F.cross_entropy(logits[m], ids[m]); epoch_tg += m.sum().item()
+                optimizer.zero_grad(set_to_none=True); loss.backward()
+                nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP); optimizer.step()
+                epoch_loss += loss.detach(); epoch_n += 1; it += 1
+
+        tg += epoch_tg
+        if epoch % LOG_EVERY == 0:
+            dynamics['train_loss'].append((epoch, epoch_loss.item()/max(epoch_n, 1)))
+            print(f"    ep {epoch:4d}/{epochs} | loss {epoch_loss.item()/max(epoch_n,1):.4f} | "
+                  f"lr {get_lr(it):.1e} | tg {tg:,} | {time.time()-t0:.0f}s")
+        do_eval = (epoch % EVAL_EVERY == 0) or \
+                  (epoch < epochs*0.1 and epoch % max(EVAL_EVERY//5, 1) == 0) or \
+                  (epoch < epochs*0.3 and epoch % max(EVAL_EVERY//2, 1) == 0)
+        if do_eval and epoch < epochs:
+            model.eval(); _do_eval(epoch)
+            if epoch % GEN_EVAL_EVERY == 0: _do_gen(epoch)
+            model.train()
+
+    if best_state: model.load_state_dict({k: v.to(device) for k, v in best_state.items()})
+    model.eval(); _do_eval(epochs); _do_gen(epochs)
+    return model, dynamics
+
+
+def _quick_gen(model, tokenizer, test_samples, objective, fmt,
+               decode_policy='confidence', n=None, device=None):
     if n is None: n = GEN_EVAL_N
     if device is None: device = DEVICE
     subset = test_samples[:n]; mask_id = tokenizer.special_ids['mask']
-    pad_id = tokenizer.special_ids['pad']
-    lsb_policy = 'r2l'
-    results = []
+    pad_id = tokenizer.special_ids['pad']; results = []
     for st in range(0, len(subset), 128):
         batch = subset[st:st+128]; B = len(batch)
         penc = [tokenizer.encode(s.split('=')[0]+'=') for s in batch]
         pm = max(len(p) for p in penc)
         pids = torch.full((B, pm), pad_id, dtype=torch.long)
         for i, e in enumerate(penc): pids[i, :len(e)] = torch.tensor(e)
-        policy = lsb_policy if decode_policy == 'lsb' else decode_policy
-        gen, _, _ = generate_diffusion(model, pids, ANS_LEN, mask_id,
-                                       policy=policy, greedy=True, device=device)
-        pred = gen[:, pm:pm+ANS_LEN]
+        if objective == 'ar':
+            gen = generate_ar(model, pids, ANS_LEN, device); pred = gen[:, pm:pm+ANS_LEN]
+        else:
+            policy = _lsb_policy(fmt) if decode_policy == 'lsb' else 'confidence'
+            gen, _, _ = generate_diffusion(model, pids, ANS_LEN, mask_id, policy=policy, greedy=True, device=device)
+            pred = gen[:, pm:pm+ANS_LEN]
         for i in range(B):
-            ps = tokenizer.decode(pred[i].cpu().tolist()); gs = get_answer(batch[i])
-            results.append({'correct': ps==gs})
-    return {'accuracy': sum(r['correct'] for r in results)/max(len(results),1), 'n': len(results)}
+            ps = tokenizer.decode(pred[i].cpu().tolist()); gs = get_answer(batch[i], fmt)
+            pc = [ps[j]==gs[j] if j<len(ps) else False for j in range(len(gs))]
+            a, b = _parse_operands(batch[i])
+            results.append({'correct': ps==gs, 'pos_correct': pc, 'carry_flags': _carry_at_answer_pos(a,b,fmt)})
+    n_r = len(results)
+    pos_acc = [sum(r['pos_correct'][j] for r in results)/max(n_r,1) for j in range(ANS_LEN)]
+    return {'accuracy': sum(r['correct'] for r in results)/max(n_r,1), 'position_accuracy': pos_acc, 'n': n_r}
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# Training wrapper (uses unified train_diffusion)
+# Figures (compact)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-def train_model(mask_type, tokenizer, train_samples, test_samples, max_len,
-                max_iters=None, init_state=None, device=None):
-    """Wrapper around train_diffusion for addition experiment."""
-    if device is None: device = DEVICE
-    if max_iters is None: max_iters = MAX_ITERS
-
-    train_ids, train_ans = encode_samples(train_samples, tokenizer, max_len)
-    train_ids, train_ans = train_ids.to(device), train_ans.to(device)
-
-    # PUMA K schedule: fixed (no ramp → clean early stopping)
-    k_sched = puma_k_fixed(PUMA_K)
-
-    # Eval callback
-    def eval_fn(model, it, tg):
-        probe = probe_per_position(model, tokenizer, test_samples, max_len, device)
-        dc = probe.get('dep_context', {})
-        parts = [f"{c}={dc[c]['acc']:.2f}" for c in ['g','k','p_above_g','p_above_k','p_above_p']
-                 if c in dc]
-        print(f"    [eval it {it}] loss={probe['overall_loss']:.4f} "
-              f"acc={probe['overall_acc']:.4f} {' '.join(parts)}")
-        # Quick gen eval at certain intervals
-        if it > 0 and it % GEN_EVAL_EVERY == 0:
-            r = _quick_gen(model, tokenizer, test_samples, max_len, 'confidence', device=device)
-            print(f"      [gen] confidence={r['accuracy']:.3f}")
-            probe['gen_acc_confidence'] = r['accuracy']
-        return probe
-
-    model, dynamics = train_diffusion(
-        train_ids=train_ids, train_ans=train_ans, ans_len=ANS_LEN, tokenizer=tokenizer,
-        mask_type=mask_type, blank_masks=None,
-        puma_tau=PUMA_TAU, puma_k_schedule=k_sched if mask_type == 'puma' else None,
-        n_layer=N_LAYER, n_head=N_HEAD, n_embd=N_EMBD, dropout=DROPOUT, pos_enc=POS_ENC,
-        max_iters=max_iters, batch_size=BATCH_SIZE,
-        lr=LR, min_lr=MIN_LR, warmup_iters=WARMUP_ITERS,
-        grad_clip=GRAD_CLIP, weight_decay=WEIGHT_DECAY, ema_decay=EMA_DECAY,
-        eval_fn=eval_fn, eval_every=EVAL_EVERY, log_every=LOG_EVERY,
-        patience=PATIENCE,
-        init_state=init_state, device=device,
-    )
-    return model, dynamics
-
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# Figures
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-def make_figures(all_dyn, all_final):
-    figs = {}; labels = _pos_labels()
+def make_figures(all_dyn, all_final, fmt):
+    figs = {}; labels = _pos_labels(fmt)
     cmap = plt.cm.coolwarm
-    def pc(j): return cmap(1.0 - j/(ANS_LEN-1))
+    def pc(j): return cmap(1.0 - j/(ANS_LEN-1)) if fmt=='plain' else cmap(j/(ANS_LEN-1))
+    conds = ([('ar', '')] if RUN_AR else []) + [('diffusion', mt) for mt in MASK_TYPES]
+    COLORS = {'ar': '#e74c3c', 'diff-ran': '#3498db', 'diff-pum': '#8e44ad',
+              'diff-ora': '#9b59b6', 'diff-con': '#1abc9c'}
+    def _ck(obj, mt=''): return 'ar' if obj=='ar' else f"diff-{mt[:3]}"
+    def _fk(obj, mt='', dp=''): return f"ar_{fmt}" if obj=='ar' else f"{obj}_{fmt}_{mt}_{dp}"
 
     # Fig 1: Per-position accuracy over training
-    nc = len(MASK_TYPES)
+    nc = len(conds)
     fig, axes = plt.subplots(1, nc, figsize=(6*nc, 5), squeeze=False); axes = axes[0]
-    for ai, mt in enumerate(MASK_TYPES):
-        dyn = all_dyn.get(mt)
+    for ai, (obj, mt) in enumerate(conds):
+        key = _fk(obj, mt, 'confidence'); dyn = all_dyn.get(key)
         if not dyn: continue
-        ax = axes[ai]; xs = [c['iter'] for c in dyn['checkpoints']]
+        ax = axes[ai]; xs = [c['epoch'] for c in dyn['checkpoints']]
         for j in range(ANS_LEN):
-            ys = [c['pos_acc'][j] for c in dyn['checkpoints'] if 'pos_acc' in c]
-            if ys: ax.plot(xs[:len(ys)], ys, '-', color=pc(j), label=labels[j], lw=1.2)
-        ax.set_xlabel('Iteration'); ax.set_ylabel('Accuracy'); ax.set_ylim(-0.05, 1.05)
-        ax.set_title(mt); ax.legend(fontsize=4, ncol=4); ax.grid(alpha=0.3)
-    fig.suptitle('Per-Position Probe Accuracy', y=1.02); fig.tight_layout()
-    figs['pos_acc'] = fig
+            ax.plot(xs, [c['pos_acc'][j] for c in dyn['checkpoints']], '-', color=pc(j), label=labels[j], lw=1.2)
+        ax.set_xlabel('Epoch'); ax.set_ylabel('Accuracy'); ax.set_ylim(-0.05, 1.05)
+        ax.set_title(_ck(obj, mt)); ax.legend(fontsize=4, ncol=4); ax.grid(alpha=0.3)
+    fig.suptitle(f'Per-Position Probe Accuracy — {fmt}', y=1.02); fig.tight_layout()
+    figs[f'pos_acc_{fmt}'] = fig
 
-    # Fig 2: Chain sweep comparison
-    sweep_lengths = [2, 3, 4, 6, 8, 12]
-    if ND >= 24: sweep_lengths += [16, 20]
-    if ND >= 32: sweep_lengths += [24, 28]
-    sweep_lengths = [cl for cl in sweep_lengths if cl <= ND]
+    # Fig 2: Dep context evolution
+    dconds = [(mt, _fk('diffusion', mt, 'confidence')) for mt in MASK_TYPES
+              if _fk('diffusion', mt, 'confidence') in all_dyn]
+    ctx_colors = {'g': '#2ecc71', 'k': '#3498db', 'p_above_g': '#27ae60',
+                  'p_above_k': '#2980b9', 'p_above_p': '#e74c3c', 'p_bottom': '#f39c12'}
+    if dconds:
+        fig, axes = plt.subplots(2, len(dconds), figsize=(7*len(dconds), 10), squeeze=False)
+        for ai, (mt, key) in enumerate(dconds):
+            dyn = all_dyn[key]; cps = dyn['checkpoints']; xs = [c['epoch'] for c in cps]
+            for ri, metric in enumerate(['conf', 'acc']):
+                ax = axes[ri][ai]
+                for ctx in ['g', 'k', 'p_above_g', 'p_above_k', 'p_above_p']:
+                    ys = [c.get('dep_context', {}).get(ctx, {}).get(metric, float('nan')) for c in cps]
+                    if any(not math.isnan(y) for y in ys):
+                        ax.plot(xs, ys, '-', color=ctx_colors.get(ctx), label=ctx, lw=1.5)
+                ax.set_xlabel('Epoch'); ax.set_ylabel(metric.capitalize()); ax.set_ylim(0, 1.05)
+                ax.set_title(f'{mt} — {metric}'); ax.legend(fontsize=6); ax.grid(alpha=0.3)
+        fig.suptitle(f'Dependency Context Over Training — {fmt}', y=1.02); fig.tight_layout()
+        figs[f'dep_ctx_{fmt}'] = fig
+
+    # Fig 3: Standard vs carry-heavy vs corner cases
+    test_types = ['standard', 'heavy'] + [f'corner_{c}' for c in ['msb_chain', 'full_propagate', 'long_chain']]
     for dp in DECODE_POLICIES:
-        fig, ax = plt.subplots(figsize=(10, 5))
-        for mt, col, mk in [('random', '#3498db', 'o'), ('puma', '#8e44ad', 's')]:
-            accs = []
-            for cl in sweep_lengths:
-                r = all_final.get(f'{mt}_chain_sweep_{cl}_{dp}')
-                accs.append(r['accuracy'] if r else None)
-            valid = [(cl, a) for cl, a in zip(sweep_lengths, accs) if a is not None]
-            if valid:
-                ax.plot([v[0] for v in valid], [v[1] for v in valid], f'-{mk}',
-                        color=col, label=mt, lw=2, markersize=8)
-        ax.set_xlabel('Min carry chain length'); ax.set_ylabel('Accuracy')
-        ax.set_title(f'Chain Length Sweep — {dp} decode'); ax.legend(); ax.grid(alpha=0.3)
-        fig.tight_layout(); figs[f'chain_sweep_{dp}'] = fig
+        fig, ax = plt.subplots(figsize=(12, 5))
+        for mi, mt in enumerate(MASK_TYPES):
+            accs, lbls = [], []
+            for tt in test_types:
+                key = _fk('diffusion', mt, f'{tt}_{dp}')
+                r = all_final.get(key)
+                if r: accs.append(r['accuracy']); lbls.append(tt.replace('corner_',''))
+            if accs:
+                x = range(len(lbls)); w = 0.35; off = -w/2 if mi == 0 else w/2
+                col = '#3498db' if mt == 'random' else '#8e44ad'
+                ax.bar([i+off for i in x], accs, w, label=mt, color=col, alpha=0.8)
+        if lbls:
+            ax.set_xticks(range(len(lbls))); ax.set_xticklabels(lbls, fontsize=8, rotation=20)
+        ax.set_ylabel('Accuracy'); ax.set_title(f'{dp} decode — {fmt}')
+        ax.legend(); ax.grid(alpha=0.3, axis='y')
+        all_a = [all_final.get(_fk('diffusion', mt, f'{tt}_{dp}'), {}).get('accuracy', 1)
+                 for mt in MASK_TYPES for tt in test_types]
+        all_a = [a for a in all_a if a is not None]
+        if all_a: ax.set_ylim(max(0, min(all_a)-0.05), 1.005)
+        fig.tight_layout(); figs[f'test_types_{dp}_{fmt}'] = fig
 
-    # Fig 3: Carry rarity × accuracy gap
-    fig, ax = plt.subplots(figsize=(8, 5))
+    # Fig 4: Carry rarity × accuracy gap
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+    ax = axes[0]
     for mt, color, mk in [('random', '#3498db', 'o'), ('puma', '#8e44ad', 's')]:
-        r = all_final.get(f'{mt}_carry_rarity')
+        r = all_final.get(_fk('diffusion', mt, 'carry_rarity'))
         if not r: continue
         brs = [p['base_rate'] for p in r['per_position'] if p['acc_gap'] is not None]
         gaps = [p['acc_gap'] for p in r['per_position'] if p['acc_gap'] is not None]
@@ -781,7 +994,70 @@ def make_figures(all_dyn, all_final):
                    label=f"{mt} (r={r['corr']:.2f})" if r['corr'] else mt)
     ax.axhline(0, color='gray', ls=':'); ax.set_xlabel('Carry-in base rate')
     ax.set_ylabel('acc(c=0) - acc(c=1)'); ax.legend(); ax.grid(alpha=0.3)
-    fig.tight_layout(); figs['carry_rarity'] = fig
+    ax = axes[1]
+    bins_order = ['rare(<15%)', 'low(15-30%)', 'mid(30-50%)', 'high(>=50%)']
+    for mi, (mt, col) in enumerate([('random', '#3498db'), ('puma', '#8e44ad')]):
+        r = all_final.get(_fk('diffusion', mt, 'carry_rarity'))
+        if not r: continue
+        bl = [b for b in bins_order if b in r['binned']]; gs = [r['binned'][b]['mean_gap'] for b in bl]
+        if bl:
+            x = range(len(bl)); w = 0.35; off = -w/2 if mi == 0 else w/2
+            ax.bar([i+off for i in x], gs, w, label=mt, color=col, alpha=0.8)
+            ax.set_xticks(range(len(bl))); ax.set_xticklabels(bl, fontsize=7)
+    ax.axhline(0, color='gray', ls=':'); ax.set_ylabel('Mean acc gap'); ax.legend(); ax.grid(alpha=0.3)
+    fig.suptitle(f'Carry Rarity × Accuracy — {fmt}', y=1.02); fig.tight_layout()
+    figs[f'carry_rarity_{fmt}'] = fig
+
+    # Fig 5: PUMA coverage deficit
+    cov = all_final.get(_fk('diffusion', 'puma', 'coverage'))
+    if cov:
+        fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+        ax = axes[0]
+        c1 = [p['cov_c1'] or 0 for p in cov['per_position']]
+        c0 = [p['cov_c0'] or 0 for p in cov['per_position']]
+        x = range(ANS_LEN)
+        ax.bar([i-0.2 for i in x], c0, 0.4, label='carry=0', color='#2ecc71', alpha=0.7)
+        ax.bar([i+0.2 for i in x], c1, 0.4, label='carry=1', color='#e74c3c', alpha=0.7)
+        ax.axhline(0.5, color='gray', ls='--', alpha=0.5, label='random baseline')
+        ax.set_xticks(list(x)); ax.set_xticklabels(labels, fontsize=6, rotation=45)
+        ax.set_ylabel('Coverage'); ax.legend(fontsize=7); ax.grid(alpha=0.3)
+        ax = axes[1]
+        brs = [p['base_rate'] for p in cov['per_position'] if p['deficit'] is not None]
+        ds = [p['deficit'] for p in cov['per_position'] if p['deficit'] is not None]
+        ax.scatter(brs, ds, c='#8e44ad', s=60, alpha=0.7); ax.axhline(0, color='gray', ls=':')
+        ax.set_xlabel('Carry-in base rate'); ax.set_ylabel('Coverage deficit')
+        if cov['corr'] is not None: ax.set_title(f"r={cov['corr']:.2f}")
+        ax.grid(alpha=0.3)
+        fig.suptitle(f'PUMA Coverage Deficit — {fmt}', y=1.02); fig.tight_layout()
+        figs[f'coverage_{fmt}'] = fig
+
+    # Fig 6: Chain length sweep (generalization boundary)
+    sweep_cls = sorted(set(int(k.split('_')[-2]) for k in all_final
+                           if 'chain_sweep' in k and k.endswith('confidence')))
+    if sweep_cls:
+        fig, ax = plt.subplots(figsize=(10, 6))
+        for mt, col, mk in [('puma', '#8e44ad', 's'), ('random', '#3498db', 'o')]:
+            cls, accs = [], []
+            for cl in sweep_cls:
+                r = all_final.get(_fk('diffusion', mt, f'chain_sweep_{cl}_confidence'))
+                if r:
+                    cls.append(cl); accs.append(r['accuracy'])
+            if cls:
+                ax.plot(cls, accs, f'-{mk}', color=col, label=mt, ms=8, lw=2, alpha=0.8)
+        # Add full_propagate as rightmost point
+        for mt, col, mk in [('puma', '#8e44ad', 's'), ('random', '#3498db', 'o')]:
+            fp = all_final.get(_fk('diffusion', mt, f'corner_full_propagate_confidence'))
+            if fp:
+                ax.plot(ANS_LEN, fp['accuracy'], mk, color=col, ms=12, alpha=0.8,
+                        markeredgecolor='black', markeredgewidth=1.5)
+                ax.annotate(f"full_prop\n{fp['accuracy']:.3f}",
+                           (ANS_LEN, fp['accuracy']), fontsize=7,
+                           textcoords='offset points', xytext=(10, 5))
+        ax.set_xlabel('Min chain length'); ax.set_ylabel('Accuracy')
+        ax.set_title(f'Chain Length Sweep — Generalization Boundary')
+        ax.legend(fontsize=10); ax.grid(alpha=0.3)
+        ax.set_ylim(-0.05, 1.05)
+        fig.tight_layout(); figs[f'chain_sweep_{fmt}'] = fig
 
     return figs
 
@@ -790,191 +1066,197 @@ def make_figures(all_dyn, all_final):
 # Run
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
+def _fk(obj, fmt, mt='', dp=''):
+    return f"ar_{fmt}" if obj == 'ar' else f"{obj}_{fmt}_{mt}_{dp}"
+
 def run(tag=''):
     exp_name = f"{EXP_NAME}_{tag}" if tag else EXP_NAME
-    mount_drive()
-    torch.manual_seed(SEED); random.seed(SEED)
-    tok = build_tok()
+    print(f"\n{'='*70}\n  {exp_name}")
+    print(f"  ND={ND} Model={N_LAYER}L/{N_EMBD}D/{N_HEAD}H data={DATA_MODE}")
+    print(f"  N_TRAIN={N_TRAIN} N_TEST={N_TEST} epochs={MAX_EPOCHS}")
+    print(f"  masks={MASK_TYPES} decode={DECODE_POLICIES}")
+    print(f"{'='*70}")
+    mount_drive(); torch.manual_seed(SEED); random.seed(SEED)
+    if torch.cuda.is_available(): torch.cuda.manual_seed(SEED)
+    tok = build_tok(); sample = _fmt_plain(10**(ND-1), 10**(ND-1))
+    max_len = len(tok.encode(sample))
+    all_dyn, all_final = {}, {}
 
-    print(f"\n{'='*70}")
-    print(f"  Addition ND={ND} | masks={MASK_TYPES} | decode={DECODE_POLICIES}")
-    print(f"  N_TRAIN={N_TRAIN} N_TEST={N_TEST} MAX_ITERS={MAX_ITERS}")
-    print(f"  arch: {N_LAYER}L/{N_HEAD}H/{N_EMBD}D | data: {DATA_MODE}")
-    print(f"{'='*70}\n")
+    for fmt in FORMATS:
+        if DATA_MODE == 'natural':
+            train_data = gen_data_natural(N_TRAIN, fmt, seed=SEED)
+        else:
+            train_data = gen_data(N_TRAIN, fmt, seed=SEED)
+        test_data = gen_test_data(N_TEST, fmt, seed=9000)
+        # Show carry-in base rate distribution
+        ci_counts = [0] * ANS_LEN; ci_totals = [0] * ANS_LEN
+        for s in test_data:
+            a, b = _parse_operands(s); ci = _carry_at_answer_pos(a, b, fmt)
+            for j in range(ANS_LEN):
+                ci_totals[j] += 1
+                if ci[j]: ci_counts[j] += 1
+        labs = _pos_labels(fmt)
+        br_str = ' '.join(f"{labs[j]}={ci_counts[j]/max(ci_totals[j],1):.2f}" for j in range(ANS_LEN))
+        print(f"\n  [{fmt}] train={len(train_data)} test={len(test_data)} mode={DATA_MODE}")
+        print(f"    carry-in base rates: {br_str}")
 
-    train_data = gen_train_data(N_TRAIN, seed=SEED)
-    test_data = gen_test_data(N_TEST, seed=SEED + 1000)
-    max_len = max(len(tok.encode(s)) for s in train_data)
+        if RUN_AR:
+            key = _fk('ar', fmt); print(f"\n▶ {key}")
+            m, d = train_model('ar', tok, train_data, test_data, max_len, fmt)
+            all_dyn[key] = d
+            r = _quick_gen(m, tok, test_data, 'ar', fmt, device=DEVICE)
+            all_final[_fk('ar', fmt, '', 'ar')] = r
+            print(f"  AR acc: {r['accuracy']:.4f}")
+            del m; torch.cuda.empty_cache() if torch.cuda.is_available() else None
 
-    all_dyn = {}; all_final = {}
-    saved_states = {}  # mask_type → state_dict for continuation
+        for mt in MASK_TYPES:
+            kb = _fk('diffusion', fmt, mt, 'confidence')
+            print(f"\n{'━'*60}\n▶ {kb}\n{'━'*60}")
+            m, d = train_model('diffusion', tok, train_data, test_data, max_len, fmt, mask_type=mt)
+            all_dyn[kb] = d
 
-    # ── Main training ──
-    for mt in MASK_TYPES:
-        print(f"\n{'━'*60}\n▶ {mt}\n{'━'*60}")
-        m, d = train_model(mt, tok, train_data, test_data, max_len)
-        all_dyn[mt] = d
-        saved_states[mt] = {k: v.cpu().clone() for k, v in m.state_dict().items()}
-        save_checkpoint(exp_name, saved_states[mt], tag=mt)
-
-        # Standard + heavy eval
-        heavy = gen_carry_heavy_test(N_TEST, seed=7000, min_max_chain=3)
-        for dp in DECODE_POLICIES:
-            for name, data in [('standard', test_data), ('heavy', heavy)]:
-                ps = gen_eval_with_stats(m, tok, data, max_len, decode_policy=dp, device=DEVICE)
-                acc = sum(r['correct'] for r in ps) / len(ps)
-                key = f'{mt}_{name}_{dp}'
-                all_final[key] = {'accuracy': acc, 'n': len(ps), 'stratified': stratify_results(ps)}
-                print(f"    {name} {dp}: {acc:.4f}")
-
-        # Corner cases
-        for cat in ['msb_chain', 'full_propagate', 'long_chain']:
-            cc = gen_corner_case_test(N_TEST, seed=6000, category=cat)
-            if not cc: continue
+            # Standard + heavy eval with all decode policies
+            heavy = gen_carry_heavy_test(N_TEST, fmt, seed=7000, min_max_chain=3)
             for dp in DECODE_POLICIES:
-                ps = gen_eval_with_stats(m, tok, cc, max_len, decode_policy=dp, device=DEVICE)
-                acc = sum(r['correct'] for r in ps) / len(ps)
-                all_final[f'{mt}_corner_{cat}_{dp}'] = {'accuracy': acc, 'n': len(cc)}
-                print(f"    corner/{cat} {dp}: {acc:.4f}")
-
-        # Chain length sweep
-        print(f"  Chain length sweep...")
-        sweep_lengths = [2, 3, 4, 6, 8, 12]
-        if ND >= 24: sweep_lengths += [16, 20]
-        if ND >= 32: sweep_lengths += [24, 28]
-        sweep_lengths = [cl for cl in sweep_lengths if cl <= ND]
-        for min_cl in sweep_lengths:
-            cc = gen_min_chain_test(500, seed=6500+min_cl, min_chain=min_cl)
-            if not cc: continue
-            for dp in DECODE_POLICIES:
-                ps = gen_eval_with_stats(m, tok, cc, max_len, decode_policy=dp, device=DEVICE)
-                acc = sum(r['correct'] for r in ps) / len(ps)
-                all_final[f'{mt}_chain_sweep_{min_cl}_{dp}'] = {'accuracy': acc, 'n': len(cc)}
-                print(f"    chain>={min_cl:2d} {dp}: {acc:.4f}")
-
-        # Counterfactual
-        cf = gen_counterfactual_pairs(200, seed=SEED+42)
-        cfr = eval_counterfactual(m, tok, cf, max_len, device=DEVICE)
-        all_final[f'{mt}_cf'] = cfr
-        print(f"    CF: flip={cfr['prediction_flip_rate']:.3f} "
-              f"acc(c=0)={cfr['acc_carry_in_0']:.3f} acc(c=1)={cfr['acc_carry_in_1']:.3f}")
-
-        # Error localization
-        for min_cl in [4, 8, 12, 16, 20]:
-            if min_cl > ND: continue
-            cc = gen_min_chain_test(500, seed=6500+min_cl, min_chain=min_cl)
-            if not cc: continue
-            ps = gen_eval_with_stats(m, tok, cc, max_len, decode_policy='confidence', device=DEVICE)
-            el = analyse_error_localization(ps)
-            all_final[f'{mt}_error_loc_{min_cl}'] = el
-
-        # Carry rarity
-        ps_conf = gen_eval_with_stats(m, tok, test_data, max_len, decode_policy='confidence', device=DEVICE)
-        rarity = analyse_carry_rarity(ps_conf, test_data)
-        all_final[f'{mt}_carry_rarity'] = rarity
-        print(f"    Rarity corr: {rarity['corr']:.3f}" if rarity['corr'] else "    Rarity corr: N/A")
-
-        # PUMA coverage (puma only)
-        if mt == 'puma':
-            cov = simulate_puma_coverage(m, tok, test_data, max_len, device=DEVICE)
-            all_final[f'{mt}_coverage'] = cov
-            print(f"    Coverage corr: {cov['corr']:.3f}" if cov['corr'] else "    Coverage corr: N/A")
-
-        # Confidence calibration
-        cal_samples = gen_carry_heavy_test(N_TEST, seed=7000, min_max_chain=3)
-        cal = analyse_confidence_calibration(m, tok, cal_samples, max_len, device=DEVICE)
-        all_final[f'{mt}_calibration'] = cal
-
-        del m; torch.cuda.empty_cache() if torch.cuda.is_available() else None
-
-    # ── Continuation training ──
-    args = parse_args()
-    if not getattr(args, 'no_continuation', False) and len(MASK_TYPES) >= 2:
-        cont_pairs = []
-        if 'random' in saved_states and 'puma' in MASK_TYPES:
-            cont_pairs.append(('random', 'puma'))  # random→puma
-        if 'puma' in saved_states and 'random' in MASK_TYPES:
-            cont_pairs.append(('puma', 'random'))   # puma→random
-
-        for src, tgt in cont_pairs:
-            label = f'{src}_to_{tgt}'
-            print(f"\n{'━'*60}\n▶ Continuation: {label} ({CONTINUATION_ITERS} iters)\n{'━'*60}")
-            m, d = train_model(tgt, tok, train_data, test_data, max_len,
-                               max_iters=CONTINUATION_ITERS,
-                               init_state=saved_states[src])
-            all_dyn[label] = d
-
-            # Evaluate continuation model — same tests as main
-            for dp in DECODE_POLICIES:
-                for name, data in [('standard', test_data),
-                                   ('heavy', gen_carry_heavy_test(N_TEST, seed=7000, min_max_chain=3))]:
-                    ps = gen_eval_with_stats(m, tok, data, max_len, decode_policy=dp, device=DEVICE)
+                for name, data in [('standard', test_data), ('heavy', heavy)]:
+                    ps = gen_eval_with_stats(m, tok, data, fmt, max_len, decode_policy=dp, device=DEVICE)
                     acc = sum(r['correct'] for r in ps) / len(ps)
-                    all_final[f'{label}_{name}_{dp}'] = {'accuracy': acc, 'n': len(ps)}
+                    key = _fk('diffusion', fmt, mt, f'{name}_{dp}')
+                    all_final[key] = {'accuracy': acc, 'n': len(ps), 'stratified': stratify_results(ps)}
                     print(f"    {name} {dp}: {acc:.4f}")
+                    if name == 'standard':
+                        for sn, bk in stratify_results(ps).items():
+                            parts = [f"{k}={v['acc']:.4f}(n={v['n']})" for k, v in bk.items()]
+                            print(f"      {sn}: {' '.join(parts)}")
 
             # Corner cases
             for cat in ['msb_chain', 'full_propagate', 'long_chain']:
-                cc = gen_corner_case_test(N_TEST, seed=6000, category=cat)
+                cc = gen_corner_case_test(N_TEST, fmt, seed=6000, category=cat)
                 if not cc: continue
                 for dp in DECODE_POLICIES:
-                    ps = gen_eval_with_stats(m, tok, cc, max_len, decode_policy=dp, device=DEVICE)
+                    ps = gen_eval_with_stats(m, tok, cc, fmt, max_len, decode_policy=dp, device=DEVICE)
                     acc = sum(r['correct'] for r in ps) / len(ps)
-                    all_final[f'{label}_corner_{cat}_{dp}'] = {'accuracy': acc, 'n': len(cc)}
-                    print(f"    corner/{cat} {dp}: {acc:.4f}")
+                    all_final[_fk('diffusion', fmt, mt, f'corner_{cat}_{dp}')] = {'accuracy': acc, 'n': len(cc)}
+                    print(f"    corner/{cat} {dp}: {acc:.4f} (n={len(cc)})")
 
-            # Full chain sweep (same lengths as main)
+            # ── Chain length sweep (PUMA generalization boundary) ──
+            print(f"  Chain length sweep...")
             sweep_lengths = [2, 3, 4, 6, 8, 12]
             if ND >= 24: sweep_lengths += [16, 20]
             if ND >= 32: sweep_lengths += [24, 28]
             sweep_lengths = [cl for cl in sweep_lengths if cl <= ND]
+            sweep_n = min(500, N_TEST)
             for min_cl in sweep_lengths:
-                cc = gen_min_chain_test(500, seed=6500+min_cl, min_chain=min_cl)
+                cc = gen_min_chain_test(sweep_n, fmt, seed=6500+min_cl, min_chain=min_cl)
                 if not cc: continue
                 for dp in DECODE_POLICIES:
-                    ps = gen_eval_with_stats(m, tok, cc, max_len, decode_policy=dp, device=DEVICE)
+                    ps = gen_eval_with_stats(m, tok, cc, fmt, max_len, decode_policy=dp, device=DEVICE)
                     acc = sum(r['correct'] for r in ps) / len(ps)
-                    all_final[f'{label}_chain_sweep_{min_cl}_{dp}'] = {'accuracy': acc, 'n': len(cc)}
-                    print(f"    chain>={min_cl:2d} {dp}: {acc:.4f}")
+                    key = _fk('diffusion', fmt, mt, f'chain_sweep_{min_cl}_{dp}')
+                    all_final[key] = {'accuracy': acc, 'n': len(cc), 'min_chain': min_cl}
+                    print(f"    chain>={min_cl:2d} {dp}: {acc:.4f} (n={len(cc)})")
+
+            # Counterfactual
+            cf = gen_counterfactual_pairs(200, seed=SEED+42)
+            cfr = eval_counterfactual(m, tok, cf, fmt, max_len, device=DEVICE)
+            all_final[_fk('diffusion', fmt, mt, 'cf')] = cfr
+            print(f"    CF: flip={cfr['prediction_flip_rate']:.3f} acc(c=0)={cfr['acc_carry_in_0']:.3f} "
+                  f"acc(c=1)={cfr['acc_carry_in_1']:.3f}")
+
+            # ── Error localization on chain sweep failures ──
+            print(f"  Error localization...")
+            for min_cl in [4, 8, 12, 16, 20, 24]:
+                if min_cl > ND: continue
+                cc = gen_min_chain_test(500, fmt, seed=6500+min_cl, min_chain=min_cl)
+                if not cc: continue
+                ps = gen_eval_with_stats(m, tok, cc, fmt, max_len, decode_policy='confidence', device=DEVICE)
+                el = analyse_error_localization(ps, fmt)
+                key = _fk('diffusion', fmt, mt, f'error_loc_{min_cl}')
+                all_final[key] = el
+                if el['total_errors'] > 0:
+                    parts = [f"{k}={v:.2f}" for k, v in el.items() if k != 'total_errors' and isinstance(v, float)]
+                    print(f"    chain>={min_cl}: {el['total_errors']} errors — {' '.join(parts)}")
+
+            # ── Confidence calibration ──
+            print(f"  Confidence calibration...")
+            # Use heavy + chain sweep samples for enough wrong predictions
+            cal_samples = gen_carry_heavy_test(N_TEST, fmt, seed=7000, min_max_chain=3)
+            cal = analyse_confidence_calibration(m, tok, cal_samples, fmt, max_len, device=DEVICE)
+            all_final[_fk('diffusion', fmt, mt, 'calibration')] = cal
+            for cl_bin, info in cal.items():
+                mc = info['mean_conf_correct']; mw = info['mean_conf_wrong']
+                oc = info.get('overconfident_wrong')
+                if mw is not None:
+                    print(f"    {cl_bin}: conf_ok={mc:.3f} conf_err={mw:.3f} "
+                          f"overconf={oc:.1%} (n_err={info['n_wrong']})")
+
+            # Carry rarity
+            ps_conf = gen_eval_with_stats(m, tok, test_data, fmt, max_len, decode_policy='confidence', device=DEVICE)
+            rarity = analyse_carry_rarity(ps_conf, test_data, fmt)
+            all_final[_fk('diffusion', fmt, mt, 'carry_rarity')] = rarity
+            print(f"    Rarity corr: {rarity['corr']:.3f}" if rarity['corr'] else "    Rarity corr: N/A")
+            for bn, bd in rarity['binned'].items():
+                print(f"      {bn}: gap={bd['mean_gap']:+.4f}")
+
+            # PUMA coverage (puma only)
+            if mt == 'puma':
+                cov = simulate_puma_coverage(m, tok, test_data, fmt, max_len, device=DEVICE)
+                all_final[_fk('diffusion', fmt, mt, 'coverage')] = cov
+                print(f"    Coverage corr: {cov['corr']:.3f}" if cov['corr'] else "    Coverage corr: N/A")
+                labs = _pos_labels(fmt)
+                for p in cov['per_position']:
+                    if p['deficit'] is not None:
+                        print(f"      {labs[p['position']]}: br={p['base_rate']:.2f} "
+                              f"cov(c1)={p['cov_c1']:.3f} deficit={p['deficit']:+.4f}")
 
             del m; torch.cuda.empty_cache() if torch.cuda.is_available() else None
 
-    # ── Figures & save ──
-    figs = make_figures(all_dyn, all_final)
-    sd = {'config': {k: globals()[k] for k in
-           ['ND','ANS_LEN','N_TRAIN','N_TEST','MAX_ITERS',
-            'BATCH_SIZE','N_LAYER','N_HEAD','N_EMBD','MASK_TYPES','DECODE_POLICIES','DATA_MODE']}}
+        # Figures
+        figs = make_figures(all_dyn, all_final, fmt)
+
+    # Save
+    sd = {'config': {k: globals()[k] for k in ['ND','ANS_LEN','N_TRAIN','N_TEST','MAX_EPOCHS',
+           'BATCH_SIZE','N_LAYER','N_HEAD','N_EMBD','MASK_TYPES','DECODE_POLICIES','DATA_MODE']}}
     for k, v in all_dyn.items():
-        sd[f'dyn_{k}'] = {'checkpoints': v['checkpoints'], 'train_loss': v['train_loss']}
-    for k, v in all_final.items():
-        sd[f'final_{k}'] = v
+        sd[f'dyn_{k}'] = {'checkpoints': v['checkpoints'], 'train_loss': v['train_loss'],
+                          'gen_checkpoints': v.get('gen_checkpoints', [])}
+    for k, v in all_final.items(): sd[f'final_{k}'] = v
     save_results(exp_name, sd, figures=figs)
 
     # Summary
     print(f"\n{'='*70}\n  SUMMARY\n{'='*70}")
-    all_conditions = list(MASK_TYPES)
-    if not getattr(args, 'no_continuation', False):
-        for src, tgt in [('random', 'puma'), ('puma', 'random')]:
-            if f'{src}_to_{tgt}' in all_dyn:
-                all_conditions.append(f'{src}_to_{tgt}')
+    for fmt in FORMATS:
+        all_conditions = list(MASK_TYPES)
+        print(f"\n  ── {fmt} ──")
+        print(f"  {'Test':<35s}", end='')
+        for mt in all_conditions: print(f" {mt:>14s}", end='')
+        print()
+        for dp in DECODE_POLICIES:
+            for tt in ['standard', 'heavy', 'corner_msb_chain', 'corner_full_propagate', 'corner_long_chain']:
+                key_parts = [_fk('diffusion', fmt, mt, f'{tt}_{dp}') for mt in all_conditions]
+                accs = [all_final.get(k, {}).get('accuracy') for k in key_parts]
+                if any(a is not None for a in accs):
+                    print(f"  {tt+'_'+dp:<35s}", end='')
+                    for a in accs: print(f" {a:>14.4f}" if a is not None else f" {'N/A':>14s}", end='')
+                    print()
+            # Chain sweep
+            for min_cl in [2, 3, 4, 6, 8, 12, 16, 20, 24, 28]:
+                key_parts = [_fk('diffusion', fmt, mt, f'chain_sweep_{min_cl}_{dp}') for mt in all_conditions]
+                accs = [all_final.get(k, {}).get('accuracy') for k in key_parts]
+                if any(a is not None for a in accs):
+                    print(f"  {'chain>='+str(min_cl)+'_'+dp:<35s}", end='')
+                    for a in accs: print(f" {a:>14.4f}" if a is not None else f" {'N/A':>14s}", end='')
+                    print()
 
-    print(f"\n  {'Test':<35s}", end='')
-    for mt in all_conditions: print(f" {mt:>14s}", end='')
-    print()
-    for dp in DECODE_POLICIES:
-        for tt in ['standard', 'heavy', 'corner_msb_chain', 'corner_full_propagate', 'corner_long_chain']:
-            accs = [all_final.get(f'{mt}_{tt}_{dp}', {}).get('accuracy') for mt in all_conditions]
-            if any(a is not None for a in accs):
-                print(f"  {tt+'_'+dp:<35s}", end='')
-                for a in accs: print(f" {a:>14.4f}" if a is not None else f" {'N/A':>14s}", end='')
-                print()
-        for min_cl in [4, 8, 12, 16, 20, 24, 28]:
-            accs = [all_final.get(f'{mt}_chain_sweep_{min_cl}_{dp}', {}).get('accuracy')
-                    for mt in all_conditions]
-            if any(a is not None for a in accs):
-                print(f"  {'chain>='+str(min_cl)+'_'+dp:<35s}", end='')
-                for a in accs: print(f" {a:>14.4f}" if a is not None else f" {'N/A':>14s}", end='')
-                print()
+        # Error localization summary
+        print(f"\n  ── Error Localization ──")
+        for mt in MASK_TYPES:
+            print(f"  {mt}:")
+            for min_cl in [4, 8, 12, 16, 20, 24]:
+                el = all_final.get(_fk('diffusion', fmt, mt, f'error_loc_{min_cl}'))
+                if el and el.get('total_errors', 0) > 0:
+                    parts = [f"{k}={v:.2f}" for k, v in el.items() if k != 'total_errors' and isinstance(v, float)]
+                    print(f"    cl>={min_cl}: n={el['total_errors']} {' '.join(parts)}")
 
     return all_dyn, all_final
 
