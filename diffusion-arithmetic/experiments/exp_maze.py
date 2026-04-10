@@ -51,7 +51,7 @@ MAX_ITERS = 200000; EVAL_EVERY = 5000; LOG_EVERY = 1000
 GEN_EVAL_EVERY = 10000; GEN_EVAL_N = 200
 
 MASK_TYPES = ['random', 'puma']
-DECODE_POLICIES = ['confidence', 'bfs_oracle', 'random']
+DECODE_POLICIES = ['confidence', 'bfs_oracle', 'dead_end_filling', 'random']
 
 N_LAYER = 4; N_HEAD = 4; N_EMBD = 128; DROPOUT = 0.1; POS_ENC = 'absolute'
 LR = 3e-4; MIN_LR = 1e-5; WARMUP_ITERS = 2000; GRAD_CLIP = 1.0
@@ -73,6 +73,9 @@ PATIENCE = None
 
 # Corridor sweep lengths for evaluation
 CORRIDOR_SWEEP = [2, 4, 6, 8, 10, 12, 15, 20, 25, 30]
+
+# Dead-end branch size sweep for evaluation
+DEAD_END_SWEEP = [2, 4, 6, 8, 10, 15, 20]
 
 
 def parse_args():
@@ -321,13 +324,14 @@ def compute_corridor_segments(path, roles):
     return segments
 
 
-def compute_corridor_stats(path, roles):
-    """Corridor statistics for a maze path (= chain_stats analog)."""
+def compute_corridor_stats(path, roles, grid=None, path_set=None, H=None, W=None):
+    """Corridor + dead-end + junction statistics for a maze (= chain_stats analog)."""
     segs = compute_corridor_segments(path, roles)
     lengths = [s[1] for s in segs]
     n_junctions = sum(1 for ci in path if roles.get(ci) == 'junction')
     n_corridor = sum(1 for ci in path if roles.get(ci) == 'corridor')
-    return {
+
+    stats = {
         'path_length': len(path),
         'max_corridor_len': max(lengths, default=0),
         'n_corridor_segments': len(segs),
@@ -336,6 +340,23 @@ def compute_corridor_stats(path, roles):
         'corridor_lengths': lengths,
         'is_pure_corridor': n_junctions == 0,
     }
+
+    # Dead-end and total junction stats (require grid)
+    if grid is not None and path_set is not None and H is not None:
+        de = compute_dead_end_stats(grid, path_set, H, W)
+        stats['max_dead_end_len'] = de['max_dead_end_len']
+        stats['n_dead_end_branches'] = de['n_dead_end_branches']
+        stats['dead_end_lengths'] = de['dead_end_lengths']
+        stats['total_off_path'] = de['total_off_path']
+        stats['n_junctions_total'] = compute_junction_count(grid, H, W)
+    else:
+        stats['max_dead_end_len'] = 0
+        stats['n_dead_end_branches'] = 0
+        stats['dead_end_lengths'] = []
+        stats['total_off_path'] = 0
+        stats['n_junctions_total'] = n_junctions
+
+    return stats
 
 
 def compute_dependency_context(grid, path, path_set, roles, bfs_depths, start, end, H, W):
@@ -373,6 +394,131 @@ def compute_dependency_context(grid, path, path_set, roles, bfs_depths, start, e
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Dead-End Branch Analysis (secondary difficulty axis)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+def compute_dead_end_stats(grid, path_set, H, W):
+    """Compute dead-end branch statistics.
+    A dead-end branch is a connected component of open cells NOT on the
+    solution path. In a perfect maze (tree), each component is a subtree
+    hanging off a junction on the solution path.
+
+    Returns dict with:
+      max_dead_end_len:   size of largest off-path component (cells)
+      n_dead_end_branches: number of off-path components
+      dead_end_lengths:   sorted list of component sizes (descending)
+      total_off_path:     total off-path open cells
+    """
+    off_path = set()
+    for i in range(H * W):
+        if grid[i] != '#' and i not in path_set:
+            off_path.add(i)
+
+    if not off_path:
+        return {'max_dead_end_len': 0, 'n_dead_end_branches': 0,
+                'dead_end_lengths': [], 'total_off_path': 0}
+
+    visited = set()
+    branches = []
+    for seed in off_path:
+        if seed in visited:
+            continue
+        comp = set()
+        queue = deque([seed])
+        visited.add(seed)
+        while queue:
+            ci = queue.popleft()
+            comp.add(ci)
+            r, c = ci // W, ci % W
+            for dr, dc in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
+                nr, nc = r + dr, c + dc
+                ni = nr * W + nc
+                if 0 <= nr < H and 0 <= nc < W and ni in off_path and ni not in visited:
+                    visited.add(ni)
+                    queue.append(ni)
+        branches.append(len(comp))
+
+    branches.sort(reverse=True)
+    return {
+        'max_dead_end_len': branches[0] if branches else 0,
+        'n_dead_end_branches': len(branches),
+        'dead_end_lengths': branches,
+        'total_off_path': len(off_path),
+    }
+
+
+def compute_dead_end_filling_order(grid, start, end, H, W):
+    """Dead-end filling algorithm → per-open-cell decode order.
+
+    Algorithm:
+      1. Build adjacency among open cells
+      2. Iteratively remove degree-1 cells (not start/end)
+      3. Track removal round per cell
+      4. Remaining cells (solution backbone) ordered by BFS from start
+
+    Returns dict: cell_index → rank (lower = decoded first = easier).
+    Dead-end tips get lowest ranks; solution path backbone gets highest.
+    """
+    open_cells = set()
+    adj = defaultdict(set)
+    for i in range(H * W):
+        if grid[i] == '#':
+            continue
+        open_cells.add(i)
+        r, c = i // W, i % W
+        for dr, dc in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
+            nr, nc = r + dr, c + dc
+            ni = nr * W + nc
+            if 0 <= nr < H and 0 <= nc < W and grid[ni] != '#':
+                adj[i].add(ni)
+
+    remaining = set(open_cells)
+    degree = {i: len(adj[i] & remaining) for i in remaining}
+
+    order = {}
+    rank = 0
+
+    while True:
+        leaves = [i for i in remaining
+                  if degree.get(i, 0) == 1 and i != start and i != end]
+        if not leaves:
+            break
+        for leaf in leaves:
+            order[leaf] = rank
+            rank += 1
+            remaining.discard(leaf)
+            for nb in adj[leaf]:
+                if nb in remaining:
+                    degree[nb] -= 1
+
+    # Remaining = solution path backbone → order by BFS from start
+    bfs_q = deque([start])
+    bfs_visited = {start}
+    while bfs_q:
+        ci = bfs_q.popleft()
+        if ci in remaining and ci not in order:
+            order[ci] = rank
+            rank += 1
+        for nb in adj[ci]:
+            if nb in remaining and nb not in bfs_visited:
+                bfs_visited.add(nb)
+                bfs_q.append(nb)
+
+    return order
+
+
+def compute_junction_count(grid, H, W):
+    """Count total junctions (open cells with ≥3 open neighbors) in the maze."""
+    count = 0
+    for i in range(H * W):
+        if grid[i] == '#':
+            continue
+        if _open_neighbors(grid, i, H, W) >= 3:
+            count += 1
+    return count
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Data Formatting
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -405,7 +551,7 @@ def _make_entry(grid, start, end, compute_meta=False):
     entry = {'string': f"{puzzle_str}={sol_str}", 'path_length': len(path)}
 
     roles = classify_path_cells(grid, path_set, start, end, H, W)
-    cstats = compute_corridor_stats(path, roles)
+    cstats = compute_corridor_stats(path, roles, grid, path_set, H, W)
     entry['corridor_stats'] = cstats
 
     if compute_meta:
@@ -437,6 +583,10 @@ def _make_entry(grid, start, end, compute_meta=False):
         for rank, ci in enumerate(path_by_depth):
             oracle_order[ci] = rank
         entry['bfs_oracle_order'] = oracle_order
+
+        # Dead-end filling oracle order
+        entry['de_filling_order'] = compute_dead_end_filling_order(
+            grid, start, end, H, W)
     return entry
 
 
@@ -539,6 +689,21 @@ def gen_min_corridor_test(n, seed, min_corridor):
             data.append(entry)
     if len(data) < n:
         print(f"  WARNING: corridor>={min_corridor}: {len(data)}/{n}")
+    return data[:n]
+
+
+def gen_min_dead_end_test(n, seed, min_dead_end):
+    """Generate test set with max dead-end branch size >= min_dead_end."""
+    rng = random.Random(seed)
+    data = []
+    for _ in range(n * 50):
+        if len(data) >= n: break
+        grid, si, ei = gen_maze_dfs(GRID_N, rng, straightness_bias=0.0)
+        entry = _make_entry(grid, si, ei, compute_meta=True)
+        if entry and entry['corridor_stats'].get('max_dead_end_len', 0) >= min_dead_end:
+            data.append(entry)
+    if len(data) < n:
+        print(f"  WARNING: dead_end>={min_dead_end}: {len(data)}/{n}")
     return data[:n]
 
 
@@ -669,15 +834,18 @@ def generate_blanks(model, tokenizer, test_data, decode_policy='confidence',
 
         # Static decode order
         static_order = None
-        if decode_policy in ('bfs_oracle', 'random'):
+        if decode_policy in ('bfs_oracle', 'dead_end_filling', 'random'):
             static_order = torch.full((B, ANS_LEN), 9999, dtype=torch.long, device=device)
             for i in range(B):
                 blank_js = blank_m[i].nonzero(as_tuple=True)[0].tolist()
                 if decode_policy == 'random':
                     random.shuffle(blank_js)
                     for rank, j in enumerate(blank_js): static_order[i, j] = rank
-                elif 'bfs_oracle_order' in batch[i]:
+                elif decode_policy == 'bfs_oracle' and 'bfs_oracle_order' in batch[i]:
                     oracle = batch[i]['bfs_oracle_order']
+                    for j in blank_js: static_order[i, j] = oracle.get(j, 9999)
+                elif decode_policy == 'dead_end_filling' and 'de_filling_order' in batch[i]:
+                    oracle = batch[i]['de_filling_order']
                     for j in blank_js: static_order[i, j] = oracle.get(j, 9999)
 
         # Multi-reveal iterative decode
@@ -727,7 +895,7 @@ def generate_blanks(model, tokenizer, test_data, decode_policy='confidence',
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 def stratify_by_corridor(per_sample):
-    """Stratify accuracy by corridor properties (= stratify_results in addition)."""
+    """Stratify accuracy by corridor, dead-end, and junction properties."""
     def _mcl(mcl):
         if mcl <= 2: return 'cl=0-2'
         if mcl <= 5: return 'cl=3-5'
@@ -735,9 +903,24 @@ def stratify_by_corridor(per_sample):
         if mcl <= 20: return 'cl=11-20'
         return 'cl=21+'
 
+    def _mdel(mdel):
+        if mdel <= 0: return 'de=0'
+        if mdel <= 3: return 'de=1-3'
+        if mdel <= 8: return 'de=4-8'
+        if mdel <= 15: return 'de=9-15'
+        return 'de=16+'
+
+    def _nj(nj):
+        if nj <= 2: return 'jn=0-2'
+        if nj <= 5: return 'jn=3-5'
+        if nj <= 10: return 'jn=6-10'
+        return 'jn=11+'
+
     strata = {
         'max_corridor': lambda st: _mcl(st.get('max_corridor_len', 0)),
         'pure_corridor': lambda st: 'pure' if st.get('is_pure_corridor') else 'mixed',
+        'max_dead_end': lambda st: _mdel(st.get('max_dead_end_len', 0)),
+        'n_junctions': lambda st: _nj(st.get('n_junctions_total', st.get('n_junction_cells', 0))),
     }
     out = {}
     for name, fn in strata.items():
@@ -1023,6 +1206,29 @@ def make_figures(all_dyn, all_final):
         ax.set_title(f'Corridor Sweep — {dp}'); ax.legend(); ax.grid(alpha=0.3)
         fig.tight_layout(); figs[f'corridor_sweep_{dp}'] = fig
 
+    # Fig 3b: Dead-end sweep
+    for dp in DECODE_POLICIES:
+        has_data = False
+        for mt in MASK_TYPES:
+            for mdel in DEAD_END_SWEEP:
+                if f'{mt}_dead_end_sweep_{mdel}_{dp}' in all_final:
+                    has_data = True; break
+            if has_data: break
+        if not has_data: continue
+        fig, ax = plt.subplots(figsize=(10, 5))
+        for mt in MASK_TYPES:
+            xs_plot, ys_plot = [], []
+            for mdel in DEAD_END_SWEEP:
+                key = f'{mt}_dead_end_sweep_{mdel}_{dp}'
+                r = all_final.get(key)
+                if r:
+                    xs_plot.append(mdel); ys_plot.append(r['accuracy'])
+            if xs_plot:
+                ax.plot(xs_plot, ys_plot, 'o-', color=COLORS.get(mt, 'gray'), label=mt, lw=2)
+        ax.set_xlabel('Min dead-end branch size'); ax.set_ylabel('Accuracy')
+        ax.set_title(f'Dead-End Sweep — {dp}'); ax.legend(); ax.grid(alpha=0.3)
+        fig.tight_layout(); figs[f'dead_end_sweep_{dp}'] = fig
+
     # Fig 4: BFS depth × accuracy
     fig, ax = plt.subplots(figsize=(10, 5))
     depth_bins_order = ['shallow(0-5)', 'mid(6-15)', 'deep(16-30)', 'very_deep(31+)']
@@ -1072,6 +1278,23 @@ def run(tag=''):
         elif mcl <= 20: cl_dist['11-20'] += 1
         else: cl_dist['21+'] += 1
     print(f"  Train corridor dist: {dict(sorted(cl_dist.items()))}")
+    # Profile dead-end distribution
+    de_dist = defaultdict(int)
+    jn_dist = defaultdict(int)
+    for d in train_data:
+        mdel = d['corridor_stats'].get('max_dead_end_len', 0)
+        if mdel <= 0: de_dist['0'] += 1
+        elif mdel <= 3: de_dist['1-3'] += 1
+        elif mdel <= 8: de_dist['4-8'] += 1
+        elif mdel <= 15: de_dist['9-15'] += 1
+        else: de_dist['16+'] += 1
+        nj = d['corridor_stats'].get('n_junctions_total', 0)
+        if nj <= 2: jn_dist['0-2'] += 1
+        elif nj <= 5: jn_dist['3-5'] += 1
+        elif nj <= 10: jn_dist['6-10'] += 1
+        else: jn_dist['11+'] += 1
+    print(f"  Train dead-end dist: {dict(sorted(de_dist.items()))}")
+    print(f"  Train junction dist: {dict(sorted(jn_dist.items()))}")
 
     print(f"\n  Generating {N_TEST} test mazes (with metadata)...")
     t0 = time.time()
@@ -1125,6 +1348,20 @@ def run(tag=''):
                 all_final[f'{mt}_corridor_sweep_{min_cl}_{dp}'] = {
                     'accuracy': acc, 'n': len(cc), 'min_corridor': min_cl}
                 print(f"    corridor>={min_cl:2d} {dp}: {acc:.4f} (n={len(cc)})")
+
+        # ── Dead-end sweep ──
+        print(f"  Dead-end sweep...")
+        for min_de in DEAD_END_SWEEP:
+            if min_de > GRID_N * 3: continue
+            cc = gen_min_dead_end_test(min(500, N_TEST), seed=SEED + 7000 + min_de,
+                                       min_dead_end=min_de)
+            if not cc: continue
+            for dp in DECODE_POLICIES:
+                ps = generate_blanks(m, tok, cc, decode_policy=dp, device=DEVICE)
+                acc = sum(r['correct'] for r in ps) / len(ps)
+                all_final[f'{mt}_dead_end_sweep_{min_de}_{dp}'] = {
+                    'accuracy': acc, 'n': len(cc), 'min_dead_end': min_de}
+                print(f"    dead_end>={min_de:2d} {dp}: {acc:.4f} (n={len(cc)})")
 
         # ── Corridor rarity ──
         print(f"  Corridor rarity analysis...")
@@ -1197,7 +1434,8 @@ def run(tag=''):
     sd = {'config': {k: globals()[k] for k in [
         'GRID_N', 'GRID_H', 'GRID_W', 'CELL_N', 'N_TRAIN', 'N_TEST', 'MAX_ITERS',
         'BATCH_SIZE', 'N_LAYER', 'N_HEAD', 'N_EMBD', 'MASK_TYPES', 'DECODE_POLICIES',
-        'PUMA_K_START', 'PUMA_K_END', 'PUMA_K_STEP', 'PUMA_K_EVERY', 'PUMA_TAU', 'STRAIGHTNESS_BIAS']}}
+        'PUMA_K_START', 'PUMA_K_END', 'PUMA_K_STEP', 'PUMA_K_EVERY', 'PUMA_TAU',
+        'STRAIGHTNESS_BIAS', 'DEAD_END_SWEEP']}}
     for k, v in all_dyn.items():
         sd[k] = {'checkpoints': v['checkpoints'], 'train_loss': v['train_loss']}
     for k, v in all_final.items():
@@ -1224,6 +1462,15 @@ def run(tag=''):
             accs = [all_final.get(k, {}).get('accuracy') for k in key_parts]
             if any(a is not None for a in accs):
                 print(f"  {'corridor>='+str(min_cl)+'_'+dp:<40s}", end='')
+                for a in accs:
+                    print(f" {a:>14.4f}" if a is not None else f" {'N/A':>14s}", end='')
+                print()
+        # Dead-end sweep
+        for min_de in DEAD_END_SWEEP:
+            key_parts = [f'{mt}_dead_end_sweep_{min_de}_{dp}' for mt in MASK_TYPES]
+            accs = [all_final.get(k, {}).get('accuracy') for k in key_parts]
+            if any(a is not None for a in accs):
+                print(f"  {'dead_end>='+str(min_de)+'_'+dp:<40s}", end='')
                 for a in accs:
                     print(f" {a:>14.4f}" if a is not None else f" {'N/A':>14s}", end='')
                 print()
