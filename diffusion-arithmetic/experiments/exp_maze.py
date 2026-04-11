@@ -63,6 +63,7 @@ PUMA_TAU = 0.9
 # K_EVERY=None → auto: ramp over first 1/3 of training (matching paper)
 PUMA_K_START = 12; PUMA_K_END = None; PUMA_K_STEP = 3; PUMA_K_EVERY = None
 SEED = 42
+NO_AMP = False
 STRAIGHTNESS_BIAS = 0.0  # 0.0=normal DFS, higher=longer corridors in training
 
 # Continuation training
@@ -96,6 +97,7 @@ def parse_args():
     p.add_argument('--continuation-iters', type=int)
     p.add_argument('--patience', type=int)
     p.add_argument('--no-continuation', action='store_true')
+    p.add_argument('--no-amp', action='store_true')
     p.add_argument('--tag', type=str, default=''); p.add_argument('--seed', type=int)
     p.add_argument('--seeds', nargs='+', type=int)
     try:
@@ -110,7 +112,7 @@ def parse_args():
                    'lr': 'LR', 'puma_tau': 'PUMA_TAU',
                    'puma_k_start': 'PUMA_K_START', 'puma_k_end': 'PUMA_K_END',
                    'puma_k_step': 'PUMA_K_STEP', 'puma_k_every': 'PUMA_K_EVERY',
-                   'seed': 'SEED', 'straightness_bias': 'STRAIGHTNESS_BIAS',
+                   'seed': 'SEED', 'no_amp': 'NO_AMP', 'straightness_bias': 'STRAIGHTNESS_BIAS',
                    'continuation_iters': 'CONTINUATION_ITERS',
                    'patience': 'PATIENCE'}.items():
         v = getattr(args, a, None)
@@ -1138,6 +1140,7 @@ def train(mask_type, tokenizer, train_data, test_data, max_len,
         eval_fn=eval_fn, eval_every=EVAL_EVERY, log_every=LOG_EVERY,
         patience=globals().get('PATIENCE'),
         init_state=init_state, device=device,
+        use_amp=False if NO_AMP else None,
     )
     return model, dynamics
 

@@ -70,6 +70,7 @@ PUMA_TAU = 0.9; PUMA_K = 8
 PUMA_K_START = None; PUMA_K_END = None
 PUMA_K_STEP = 5; PUMA_K_EVERY = None
 SEED = 42
+NO_AMP = False
 
 # Continuation training
 CONTINUATION_ITERS = 10000
@@ -111,6 +112,7 @@ def parse_args():
     p.add_argument('--continuation-iters', type=int, default=None)
     p.add_argument('--patience', type=int, default=None)
     p.add_argument('--no-continuation', action='store_true')
+    p.add_argument('--no-amp', action='store_true')
     p.add_argument('--tag', type=str, default='')
     p.add_argument('--seed', type=int, default=None)
     p.add_argument('--seeds', nargs='+', type=int, default=None)
@@ -126,7 +128,7 @@ def parse_args():
                    'puma_k': 'PUMA_K', 'puma_tau': 'PUMA_TAU',
                    'puma_k_start': 'PUMA_K_START', 'puma_k_end': 'PUMA_K_END',
                    'puma_k_step': 'PUMA_K_STEP', 'puma_k_every': 'PUMA_K_EVERY',
-                   'seed': 'SEED',
+                   'seed': 'SEED', 'no_amp': 'NO_AMP',
                    'difficulty_decay': 'DIFFICULTY_DECAY',
                    'continuation_iters': 'CONTINUATION_ITERS',
                    'patience': 'PATIENCE'}.items():
@@ -1227,6 +1229,7 @@ def train(mask_type, tokenizer, train_data, test_data_dict, max_len,
         eval_fn=eval_fn, eval_every=EVAL_EVERY, log_every=LOG_EVERY,
         patience=globals().get('PATIENCE'),
         init_state=init_state, device=device,
+        use_amp=False if NO_AMP else None,
     )
     return model, dynamics
 

@@ -48,6 +48,7 @@ PUMA_TAU = 0.9; PUMA_K = 8  # fixed K (default)
 PUMA_K_START = None; PUMA_K_END = None
 PUMA_K_STEP = 3; PUMA_K_EVERY = None  # None = auto (ramp over first 1/3)
 SEED = 42
+NO_AMP = False
 DATA_MODE = 'natural'
 
 # Early stopping: patience in iters (None = disabled, run full max_iters)
@@ -80,6 +81,7 @@ def parse_args():
     p.add_argument('--data-mode', choices=['balanced', 'natural'])
     p.add_argument('--continuation-iters', type=int)
     p.add_argument('--no-continuation', action='store_true')
+    p.add_argument('--no-amp', action='store_true')
     p.add_argument('--tag', type=str, default=''); p.add_argument('--seed', type=int)
     p.add_argument('--seeds', nargs='+', type=int)
     try:
@@ -96,7 +98,7 @@ def parse_args():
                    'puma_k': 'PUMA_K', 'puma_k_start': 'PUMA_K_START',
                    'puma_k_end': 'PUMA_K_END', 'puma_k_step': 'PUMA_K_STEP',
                    'puma_k_every': 'PUMA_K_EVERY',
-                   'seed': 'SEED', 'continuation_iters': 'CONTINUATION_ITERS'}.items():
+                   'seed': 'SEED', 'no_amp': 'NO_AMP', 'continuation_iters': 'CONTINUATION_ITERS'}.items():
         v = getattr(args, a, None)
         if v is not None: g[gl] = v
     if args.nd:
@@ -746,6 +748,7 @@ def train_model(mask_type, tokenizer, train_samples, test_samples, max_len,
         eval_fn=eval_fn, eval_every=EVAL_EVERY, log_every=LOG_EVERY,
         patience=PATIENCE,
         init_state=init_state, device=device,
+        use_amp=False if NO_AMP else None,
     )
     return model, dynamics
 
