@@ -150,6 +150,8 @@ def train_diffusion(
     init_state=None,        # state_dict to initialize model from
     # Device
     device=None,
+    # AMP
+    use_amp=None,           # None=auto, True=force, False=disable
 ):
     """
     Unified iteration-based diffusion training with EMA.
@@ -322,8 +324,8 @@ def train_diffusion(
     model.train()
 
     # ── AMP setup (bfloat16 on A100 — no scaler needed) ──
-    use_amp = (device.type == 'cuda' and
-               torch.cuda.is_bf16_supported())
+    if use_amp is None:
+        use_amp = (device.type == 'cuda' and torch.cuda.is_bf16_supported())
     amp_dtype = torch.bfloat16 if use_amp else torch.float32
     ctx = torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp)
     if use_amp:
