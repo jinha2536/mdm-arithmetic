@@ -33,7 +33,7 @@ experiments/
 | Task     | ANS_LEN | K_start → K_end | K_step | Reveal/step (start→end) |
 |----------|---------|-----------------|--------|-------------------------|
 | Addition | 33      | 3 → 16          | 2      | 11 → 2                  |
-| ListOps  | 20      | 2 → 10          | 1      | 10 → 2                  |
+| ListOps  | 20      | 2 → 10          | 2      | 10 → 2                  |
 | Sudoku   | 81      | 5 → 40          | 5      | 16 → 2                  |
 | Maze     | 441     | 10 → 40         | 5      | 44 → 11                 |
 
@@ -45,7 +45,7 @@ experiments/
 
 # ListOps (depth=5, ~4h)
 %run experiments/exp_listops.py --max-depth 5 --n-layer 8 --n-head 4 --n-embd 256 \
-    --n-train 100000 --depth-decay 0.8 --puma-k-start 2 --puma-k-end 10 --puma-k-step 1
+    --n-train 100000 --depth-decay 0.8 --puma-k-start 2 --puma-k-end 10 --puma-k-step 2
 
 # Sudoku (~6h)
 %run experiments/exp_sudoku.py --puma-k-start 5 --puma-k-end 40 --puma-k-step 5
