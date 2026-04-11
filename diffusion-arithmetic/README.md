@@ -45,7 +45,7 @@ experiments/
 
 # ListOps (depth=5, ~4h)
 %run experiments/exp_listops.py --max-depth 5 --n-layer 8 --n-head 4 --n-embd 256 \
-    --n-train 100000 --depth-decay 0.8 --puma-k-start 2 --puma-k-end 10 --puma-k-step 2
+    --n-train 100000 --depth-decay 0.1 --puma-k-start 2 --puma-k-end 10 --puma-k-step 2
 
 # Sudoku (~6h)
 %run experiments/exp_sudoku.py --puma-k-start 5 --puma-k-end 40 --puma-k-step 5
