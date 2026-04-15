@@ -971,16 +971,16 @@ def run(tag=''):
     full_chain_pct = sum(1 for m in train_metas if m['is_full_chain']) / len(train_metas)
     print(f"  Full chain: {full_chain_pct*100:.1f}%")
 
+    # Tokenizer
+    tokenizer = build_tok()
+    max_len = MAX_SEQ_LEN
+    print(f"  Vocab size: {tokenizer.vocab_size}, Max seq len: {max_len}")
+
     # Corner cases
     corner_samples, corner_metas = None, None
     if os.path.exists(corner_path):
         corner_samples, corner_metas = load_corner_cases(corner_path, tokenizer)
         print(f"  Corner cases (Game of 24): {len(corner_samples)} samples")
-
-    # Tokenizer
-    tokenizer = build_tok()
-    max_len = MAX_SEQ_LEN
-    print(f"  Vocab size: {tokenizer.vocab_size}, Max seq len: {max_len}")
 
     # Train
     all_dyn, all_final = {}, {}
