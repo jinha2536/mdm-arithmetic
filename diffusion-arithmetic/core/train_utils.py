@@ -148,6 +148,9 @@ def train_diffusion(
     patience=None,          # stop if no improvement for this many iters; None=disabled
     # Continuation
     init_state=None,        # state_dict to initialize model from
+    # Stratum-level training loss logging (training-side diagnostic)
+    sample_strata=None,     # [N] long tensor — per-sample stratum id (None = no logging)
+    stratum_names=None,     # list[str] for readable labels; len determines n_strata
     # Device
     device=None,
     # AMP
@@ -229,6 +232,7 @@ def train_diffusion(
         buf_x0 = torch.zeros(batch_size, T, dtype=torch.long, device=device)
         buf_ans = torch.zeros(batch_size, dtype=torch.long, device=device)
         buf_stage = torch.zeros(batch_size, dtype=torch.long, device=device)
+        buf_orig_idx = torch.zeros(batch_size, dtype=torch.long, device=device)
         buf_pool = torch.randperm(N)
         buf_ptr = 0
 
@@ -243,6 +247,7 @@ def train_diffusion(
             buf_z[idx_t] = train_ids[si].clone()
             buf_ans[idx_t] = train_ans[si]
             buf_stage[idx_t] = 0
+            buf_orig_idx[idx_t] = si
             ap = (buf_ans[idx_t].unsqueeze(1) + _arange).clamp(max=T - 1)
             bii = idx_t.unsqueeze(1).expand_as(ap)
             bl = blank_masks[si]
@@ -319,6 +324,19 @@ def train_diffusion(
                 return True  # signal to stop
         return False
 
+    # ── Stratum loss logging setup ──
+    log_strata = sample_strata is not None
+    if log_strata:
+        sample_strata = sample_strata.to(device).long()
+        assert sample_strata.shape == (N,), f"sample_strata must be [N={N}], got {sample_strata.shape}"
+        S = len(stratum_names) if stratum_names else int(sample_strata.max().item()) + 1
+        strat_loss_sum = torch.zeros(S, device=device)
+        strat_token_count = torch.zeros(S, dtype=torch.long, device=device)
+        dynamics['stratified_loss'] = []   # [{'iter', 'per_stratum_loss'[S], 'per_stratum_n'[S]}]
+        dynamics['stratum_names'] = stratum_names or [f's{i}' for i in range(S)]
+        print(f"  [{mask_type}] Stratum loss logging: {S} strata "
+              f"({dynamics['stratum_names']})")
+
     model.eval()
     _do_eval(0)
     model.train()
@@ -384,11 +402,40 @@ def train_diffusion(
             for name, param in model.named_parameters():
                 ema_state[name].lerp_(param.data, 1 - ema_decay)
 
+        # Stratum-level training loss accumulation (per-token, scattered by sample stratum)
+        if log_strata and m.sum() > 0:
+            with torch.no_grad():
+                if uses_streaming:
+                    tgt_tok = buf_x0[m]
+                    row_idx = m.nonzero(as_tuple=True)[0]    # [K_masked]
+                    sample_strata_b = sample_strata[buf_orig_idx]  # [B]
+                else:
+                    tgt_tok = ids[m]
+                    row_idx = m.nonzero(as_tuple=True)[0]
+                    sample_strata_b = sample_strata[idx]     # [B]
+                token_losses = F.cross_entropy(
+                    logits[m].float(), tgt_tok, reduction='none')  # [K_masked]
+                token_strata = sample_strata_b[row_idx]            # [K_masked]
+                strat_loss_sum.scatter_add_(0, token_strata, token_losses)
+                strat_token_count.scatter_add_(0, token_strata,
+                                                torch.ones_like(token_strata))
+
         if uses_streaming:
             _advance(logits.detach(), K_cur)
 
         if it % log_every == 0:
             dynamics['train_loss'].append((it, loss.item()))
+            if log_strata:
+                denom = strat_token_count.clamp(min=1).float()
+                per_strat = (strat_loss_sum / denom).cpu().tolist()
+                per_n = strat_token_count.cpu().tolist()
+                dynamics['stratified_loss'].append({
+                    'iter': it,
+                    'per_stratum_loss': per_strat,
+                    'per_stratum_n': per_n,
+                })
+                strat_loss_sum.zero_()
+                strat_token_count.zero_()
             print(f"    it {it:6d}/{max_iters} | loss {loss.item():.4f} | "
                   f"lr {get_lr(it):.1e} | tg {tg:,} | {time.time() - t0:.0f}s")
 
@@ -591,3 +638,162 @@ def evaluate(model, tokenizer, test_samples, objective,
             o.shape[0] for o in all_orders[k]))
         result['decode_orders'] = torch.cat(all_orders[biggest_group], dim=0)
     return result
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# PUMA reveal trajectory — shared across all domains
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+@torch.no_grad()
+def simulate_reveal_trajectory(
+    model, tokenizer, test_ids, ans_starts, ans_len,
+    blank_masks=None, K=16, tau=0.9, batch_size=64, device=None):
+    """
+    Run PUMA-style forward process on a batch of examples, tracking for each
+    (example, position) at which stage the position was first revealed.
+
+    This is the shared diagnostic for all domains: it shows exactly which
+    positions PUMA's confidence ordering defers (or never reaches) during
+    training.
+
+    Args:
+        test_ids:    [N, T] encoded sequences (prefix + gold answer + pad)
+        ans_starts:  [N] answer-region start positions
+        ans_len:     int, length of answer region
+        blank_masks: [N, ans_len] bool, True = maskable position
+                     (None = all positions maskable)
+        K:           number of PUMA stages
+        tau:         confidence threshold for immediate reveal (PUMA paper)
+
+    Returns dict:
+        reveal_stage:        [N, ans_len] int, stage at which each position was
+                             first revealed (0..K-1; K = never revealed)
+        still_masked_start:  [N, K+1, ans_len] bool — mask state at start of each stage.
+                             [:, 0, :] = initial blank_masks; [:, K, :] = final
+        n_revealed_per_stage:[N, K] int — how many maskable positions revealed at stage k
+    """
+    if device is None:
+        device = DEVICE
+    model.eval()
+    mask_id = tokenizer.special_ids['mask']
+    N, T = test_ids.shape
+
+    # Defaults
+    if blank_masks is None:
+        blank_masks = torch.ones(N, ans_len, dtype=torch.bool)
+    blank_masks = blank_masks.to(device)
+    test_ids = test_ids.to(device)
+    ans_starts = ans_starts.to(device)
+
+    _arange = torch.arange(ans_len, device=device)
+
+    reveal_stage = torch.full((N, ans_len), K, dtype=torch.long, device=device)
+    still_masked_start = torch.zeros(N, K + 1, ans_len, dtype=torch.bool, device=device)
+    still_masked_start[:, 0, :] = blank_masks.clone()
+    n_revealed_per_stage = torch.zeros(N, K, dtype=torch.long, device=device)
+
+    for st in range(0, N, batch_size):
+        en = min(st + batch_size, N)
+        B = en - st
+        ids_b = test_ids[st:en].clone()     # [B, T]
+        ans_b = ans_starts[st:en]            # [B]
+        bl_b = blank_masks[st:en].clone()    # [B, ans_len]
+
+        # Absolute positions in the sequence
+        ap = (ans_b.unsqueeze(1) + _arange).clamp(max=T - 1)  # [B, ans_len]
+        bi = torch.arange(B, device=device).unsqueeze(1).expand_as(ap)
+
+        # is_m[b, j] = True iff answer position j in example b is still masked
+        is_m = bl_b.clone()
+        # Initialize the masked region
+        ids_b[bi[is_m], ap[is_m]] = mask_id
+
+        for k in range(K):
+            still_masked_start[st:en, k, :] = is_m
+
+            if not is_m.any():
+                # All revealed; later stages stay fully revealed
+                for k2 in range(k + 1, K + 1):
+                    still_masked_start[st:en, k2, :] = False
+                break
+
+            # Forward pass
+            logits = model(ids_b)                # [B, T, V]
+            lp = logits[bi, ap].clone()          # [B, ans_len, V]
+            lp[:, :, mask_id] = -float('inf')
+            confs = F.softmax(lp, dim=-1).max(dim=-1).values  # [B, ans_len]
+            confs = torch.where(is_m, confs, torch.full_like(confs, -float('inf')))
+
+            # PUMA streaming logic (matches train_diffusion _advance)
+            nm = is_m.sum(dim=1).float()                      # [B]
+            K_rem = torch.full((B,), K - k, dtype=torch.float, device=device)
+            nr = (nm / K_rem).ceil().long().clamp(min=1)      # [B]
+
+            ranked = confs.argsort(dim=1, descending=True)    # [B, ans_len]
+            rop = torch.zeros_like(ranked)
+            rop.scatter_(1, ranked, _arange.expand(B, -1))
+
+            reveal = ((rop < nr.unsqueeze(1)) | (confs > tau)) & is_m
+            n_revealed_per_stage[st:en, k] = reveal.sum(dim=1)
+
+            # Teacher-force: reveal gold tokens at these positions
+            gold_ids = test_ids[st:en, :]     # [B, T]
+            reveal_b, reveal_j = reveal.nonzero(as_tuple=True)
+            if reveal_b.numel() > 0:
+                reveal_abs = ap[reveal_b, reveal_j]
+                ids_b[reveal_b, reveal_abs] = gold_ids[reveal_b, reveal_abs]
+                reveal_stage[st + reveal_b, reveal_j] = k
+                is_m[reveal_b, reveal_j] = False
+
+        # Record final state
+        still_masked_start[st:en, K, :] = is_m
+
+    return {
+        'reveal_stage': reveal_stage.cpu(),
+        'still_masked_start': still_masked_start.cpu(),
+        'n_revealed_per_stage': n_revealed_per_stage.cpu(),
+        'K': K, 'tau': tau, 'N': N,
+    }
+
+
+def compute_reveal_vs_order_tau(reveal_stage, reasoning_order, blank_masks=None):
+    """Per-example Kendall tau between PUMA's reveal order and a canonical
+    reasoning order. Used as training-time diagnostic: measures whether the
+    model's confidence-induced unmasking order matches the task's logical
+    deduction order.
+
+    Positions sharing a reveal stage are treated as tied (scipy handles ties).
+    Only positions where blank_masks is True are included (answer region).
+
+    Args:
+        reveal_stage:    tensor/array [N, L] — stage at which each position
+                         was first revealed (low = earlier)
+        reasoning_order: tensor/array [N, L] — canonical rank per position
+                         (low = earlier in reasoning order)
+        blank_masks:     optional bool [N, L] — maskable positions only.
+                         If None, all L positions included.
+
+    Returns: numpy array [N] — per-example Kendall tau (NaN if <2 maskable
+             positions, which shouldn't occur in practice).
+    """
+    import numpy as np
+    from scipy.stats import kendalltau
+
+    rs = reveal_stage.cpu().numpy() if hasattr(reveal_stage, 'cpu') else np.asarray(reveal_stage)
+    ro = reasoning_order.cpu().numpy() if hasattr(reasoning_order, 'cpu') else np.asarray(reasoning_order)
+    if blank_masks is not None:
+        bm = blank_masks.cpu().numpy() if hasattr(blank_masks, 'cpu') else np.asarray(blank_masks)
+        bm = bm.astype(bool)
+    else:
+        bm = np.ones_like(rs, dtype=bool)
+
+    N = rs.shape[0]
+    taus = np.full(N, np.nan, dtype=np.float32)
+    for i in range(N):
+        m = bm[i]
+        if m.sum() < 2:
+            continue
+        t, _ = kendalltau(rs[i][m], ro[i][m])
+        if t is not None and not np.isnan(t):
+            taus[i] = float(t)
+    return taus

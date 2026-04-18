@@ -32,7 +32,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 from core.tokenizer import CharTokenizer
 from core.train_utils import (
     mount_drive, save_results, save_checkpoint, encode_samples,
-    train_diffusion, puma_k_step, generate_diffusion, DEVICE,
+    train_diffusion, puma_k_step, generate_diffusion,
+    simulate_reveal_trajectory, compute_reveal_vs_order_tau, DEVICE,
 )
 
 EXP_NAME = 'exp_maze'
@@ -46,7 +47,9 @@ GRID_W = GRID_H
 CELL_N = GRID_H * GRID_W   # = 225
 ANS_LEN = CELL_N            # solution is same size as puzzle
 
-N_TRAIN = 50000; N_TEST = 1000; BATCH_SIZE = 128
+N_TRAIN = 50000; N_TEST = 5000; BATCH_SIZE = 128
+# Per-bucket count for constructed tests (sweeps, corners) — shared across analyses
+N_PER_BUCKET = 300
 MAX_ITERS = 200000; EVAL_EVERY = 5000; LOG_EVERY = 1000
 GEN_EVAL_EVERY = 10000; GEN_EVAL_N = 200
 
@@ -77,6 +80,19 @@ CORRIDOR_SWEEP = [2, 4, 6, 8, 10, 12, 15, 20, 25, 30]
 
 # Dead-end branch size sweep for evaluation
 DEAD_END_SWEEP = [2, 4, 6, 8, 10, 15, 20]
+
+# Backbone length sweep — NEW, primary extreme axis (analog of addition chain sweep)
+# Adjusted by grid size. GRID_N=7 (15x15): backbone typically 10-25
+# GRID_N=10 (21x21): backbone typically 20-40
+BACKBONE_SWEEP = [4, 8, 12, 16, 20, 25, 30]
+
+# Reveal trajectory: K stages for per-domain diagnostic
+REVEAL_K_DEFAULT = 30  # matches typical maze K_END; will be overridden to actual K_end
+# Reveal-vs-reasoning tau (PUMA-only, backbone-extreme training subset)
+REVEAL_TAU_MIN_BACKBONE = 16     # samples with backbone ≥ this are tracked
+REVEAL_TAU_N_TRACKED = 100
+REVEAL_TAU_EVERY = 20000
+REVEAL_TAU_K_THRESHOLD_FRAC = 0.7
 
 
 def parse_args():
@@ -458,8 +474,17 @@ def compute_dead_end_filling_order(grid, start, end, H, W):
       3. Track removal round per cell
       4. Remaining cells (solution backbone) ordered by BFS from start
 
-    Returns dict: cell_index → rank (lower = decoded first = easier).
-    Dead-end tips get lowest ranks; solution path backbone gets highest.
+    Returns:
+        order: dict cell_index → rank (lower = decoded first = easier).
+               Dead-end tips get lowest ranks; solution path backbone gets
+               highest.
+        n_fillable: int — rank count of cells dead-end-fillable.
+                    Cells with rank >= n_fillable are BACKBONE (structurally
+                    essential — cannot be reduced by dead-end filling).
+
+    Backbone analog to addition's p-chain: the set of positions whose values
+    cannot be determined from local structure alone and must be resolved via
+    sequential decisions along the path.
     """
     open_cells = set()
     adj = defaultdict(set)
@@ -493,6 +518,8 @@ def compute_dead_end_filling_order(grid, start, end, H, W):
                 if nb in remaining:
                     degree[nb] -= 1
 
+    n_fillable = rank  # ranks [0, n_fillable) = dead-end-fillable; [n_fillable, ...) = backbone
+
     # Remaining = solution path backbone → order by BFS from start
     bfs_q = deque([start])
     bfs_visited = {start}
@@ -506,7 +533,24 @@ def compute_dead_end_filling_order(grid, start, end, H, W):
                 bfs_visited.add(nb)
                 bfs_q.append(nb)
 
-    return order
+    return order, n_fillable
+
+
+def compute_backbone_length(path, dead_end_order, n_fillable):
+    """Length of the backbone subset of the shortest path.
+
+    Backbone = path cells that survive iterative dead-end filling.
+    Analog to addition's max_chain_len: positions forming a sequential
+    dependency structure that local elimination cannot break.
+
+    Args:
+        path: list of cell indices on shortest path (start → end)
+        dead_end_order: dict from compute_dead_end_filling_order
+        n_fillable: threshold from same function
+
+    Returns: int — number of path cells that are backbone.
+    """
+    return sum(1 for ci in path if dead_end_order.get(ci, -1) >= n_fillable)
 
 
 def compute_junction_count(grid, H, W):
@@ -586,9 +630,22 @@ def _make_entry(grid, start, end, compute_meta=False):
             oracle_order[ci] = rank
         entry['bfs_oracle_order'] = oracle_order
 
-        # Dead-end filling oracle order
-        entry['de_filling_order'] = compute_dead_end_filling_order(
-            grid, start, end, H, W)
+        # Dead-end filling oracle order + backbone length
+        de_order, n_fillable = compute_dead_end_filling_order(grid, start, end, H, W)
+        entry['de_filling_order'] = de_order
+        entry['n_fillable'] = n_fillable
+        entry['backbone_length'] = compute_backbone_length(path, de_order, n_fillable)
+        # Add to corridor_stats for stratification usage
+        entry['corridor_stats']['backbone_length'] = entry['backbone_length']
+    else:
+        # Lightweight path: still compute de_filling_order + backbone_length
+        # (needed for training-data stratification and reveal-τ reasoning order).
+        # This is cheap (O(open_cells) per maze) so we always do it.
+        de_order, n_fillable = compute_dead_end_filling_order(grid, start, end, H, W)
+        entry['de_filling_order'] = de_order
+        entry['n_fillable'] = n_fillable
+        entry['backbone_length'] = compute_backbone_length(path, de_order, n_fillable)
+        entry['corridor_stats']['backbone_length'] = entry['backbone_length']
     return entry
 
 
@@ -707,6 +764,122 @@ def gen_min_dead_end_test(n, seed, min_dead_end):
     if len(data) < n:
         print(f"  WARNING: dead_end>={min_dead_end}: {len(data)}/{n}")
     return data[:n]
+
+
+def gen_min_backbone_test(n, seed, min_backbone):
+    """Generate test set with backbone_length >= min_backbone.
+
+    Backbone = path cells that survive iterative dead-end filling. This is
+    the primary extreme-case axis for maze: mazes where dead-end heuristics
+    reduce the problem the least, leaving the longest sequential decision
+    chain on the solution path. Analog of addition's min_chain test.
+    """
+    rng = random.Random(seed)
+    data = []
+    for _ in range(n * 100):  # backbone≥X is rarer than corridor≥X
+        if len(data) >= n: break
+        grid, si, ei = gen_maze_dfs(GRID_N, rng, straightness_bias=0.0)
+        entry = _make_entry(grid, si, ei, compute_meta=True)
+        if entry and entry.get('backbone_length', 0) >= min_backbone:
+            data.append(entry)
+    if len(data) < n:
+        print(f"  WARNING: backbone>={min_backbone}: {len(data)}/{n}")
+    return data[:n]
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Unified test suite — all analyses slice from here
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+def _bucket_from_entries(entries, tokenizer, max_len):
+    """Package entry list with encoded ids for batched analysis."""
+    strings = [e['string'] for e in entries]
+    if not strings:
+        return {'entries': [], 'strings': [], 'ids': torch.empty(0, max_len, dtype=torch.long),
+                'ans_starts': torch.empty(0, dtype=torch.long), 'n': 0}
+    ids, ans = encode_samples(strings, tokenizer, max_len)
+    return {
+        'entries': entries, 'strings': strings,
+        'ids': ids, 'ans_starts': ans, 'n': len(entries),
+    }
+
+
+def build_test_suite(tokenizer, max_len, seed=None):
+    """Unified test suite for maze.
+
+    Structure:
+        suite['natural']:                  N_TEST mazes, natural DFS distribution
+        suite['constructed']['corridor_{L}']: corridor ≥ L bucket
+        suite['constructed']['backbone_{L}']: backbone ≥ L bucket (primary extreme axis)
+        suite['constructed']['dead_end_{L}']: dead-end branch ≥ L
+        suite['constructed']['pure_corridor']: snake maze (zero junction)
+    All entries carry 'meta' field with per-cell dependency_context, bfs_oracle_order,
+    de_filling_order, backbone_length.
+    """
+    if seed is None: seed = SEED + 1000
+    suite = {}
+    nat = gen_test_data(N_TEST, seed)
+    suite['natural'] = _bucket_from_entries(nat, tokenizer, max_len)
+
+    suite['constructed'] = {}
+    for L in CORRIDOR_SWEEP:
+        ent = gen_min_corridor_test(N_PER_BUCKET, seed=seed + 300 + L, min_corridor=L)
+        if ent:
+            suite['constructed'][f'corridor_{L}'] = _bucket_from_entries(ent, tokenizer, max_len)
+    for L in BACKBONE_SWEEP:
+        ent = gen_min_backbone_test(N_PER_BUCKET, seed=seed + 400 + L, min_backbone=L)
+        if ent:
+            suite['constructed'][f'backbone_{L}'] = _bucket_from_entries(ent, tokenizer, max_len)
+    for L in DEAD_END_SWEEP:
+        ent = gen_min_dead_end_test(N_PER_BUCKET, seed=seed + 500 + L, min_dead_end=L)
+        if ent:
+            suite['constructed'][f'dead_end_{L}'] = _bucket_from_entries(ent, tokenizer, max_len)
+    pc = gen_corner_case_test(N_PER_BUCKET, seed=seed + 600, category='pure_corridor')
+    if pc:
+        suite['constructed']['pure_corridor'] = _bucket_from_entries(pc, tokenizer, max_len)
+
+    print(f"  Maze test suite built:")
+    print(f"    natural: {suite['natural']['n']}")
+    for k, v in suite['constructed'].items():
+        print(f"    constructed/{k}: {v['n']}")
+    return suite
+
+
+def filter_natural(suite, pred):
+    """Filter natural bucket by predicate on entry; returns same-shape bucket."""
+    nat = suite['natural']
+    idx = [i for i, e in enumerate(nat['entries']) if pred(e)]
+    if not idx:
+        return {'entries': [], 'strings': [],
+                'ids': torch.empty(0, nat['ids'].shape[1], dtype=torch.long),
+                'ans_starts': torch.empty(0, dtype=torch.long), 'n': 0}
+    return {
+        'entries': [nat['entries'][i] for i in idx],
+        'strings': [nat['strings'][i] for i in idx],
+        'ids': nat['ids'][idx],
+        'ans_starts': nat['ans_starts'][idx],
+        'n': len(idx),
+    }
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Training stratum construction
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+STRATUM_BOUNDS_BB = [(0, 6), (6, 12), (12, 18), (18, 24), (24, 999)]
+STRATUM_NAMES = ['bb_0_5', 'bb_6_11', 'bb_12_17', 'bb_18_23', 'bb_24plus']
+
+
+def _backbone_to_stratum(bb):
+    for i, (lo, hi) in enumerate(STRATUM_BOUNDS_BB):
+        if lo <= bb < hi:
+            return i
+    return len(STRATUM_BOUNDS_BB) - 1
+
+
+def build_training_strata(train_data):
+    """Compute stratum id per training entry by backbone_length."""
+    strata = [_backbone_to_stratum(e.get('backbone_length', 0)) for e in train_data]
+    counts = [strata.count(i) for i in range(len(STRATUM_NAMES))]
+    return torch.tensor(strata, dtype=torch.long), STRATUM_NAMES, counts
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -918,11 +1091,19 @@ def stratify_by_corridor(per_sample):
         if nj <= 10: return 'jn=6-10'
         return 'jn=11+'
 
+    def _bb(bb):
+        if bb <= 4: return 'bb=0-4'
+        if bb <= 10: return 'bb=5-10'
+        if bb <= 16: return 'bb=11-16'
+        if bb <= 22: return 'bb=17-22'
+        return 'bb=23+'
+
     strata = {
         'max_corridor': lambda st: _mcl(st.get('max_corridor_len', 0)),
         'pure_corridor': lambda st: 'pure' if st.get('is_pure_corridor') else 'mixed',
         'max_dead_end': lambda st: _mdel(st.get('max_dead_end_len', 0)),
         'n_junctions': lambda st: _nj(st.get('n_junctions_total', st.get('n_junction_cells', 0))),
+        'backbone': lambda st: _bb(st.get('backbone_length', 0)),
     }
     out = {}
     for name, fn in strata.items():
@@ -991,71 +1172,100 @@ def analyse_corridor_rarity(per_sample, test_data):
 
 
 @torch.no_grad()
-def simulate_puma_coverage(model, tokenizer, test_data, max_len,
-                           K=None, tau=None, n_samples=200, batch_size=16, device=None):
-    """PUMA coverage simulation — BATCHED (was per-sample)."""
+def analyse_reveal_patterns(model, tokenizer, bucket, max_len,
+                             K=REVEAL_K_DEFAULT, tau=PUMA_TAU, device=None):
+    """For extreme-case bucket, run PUMA forward and aggregate reveal behavior
+    by (a) dependency context, (b) backbone-path rank, (c) never-revealed map.
+
+    Core failure diagnostic: on hard mazes PUMA defers structurally-critical
+    backbone cells, while Random covers them uniformly.
+    """
     if device is None: device = DEVICE
-    if K is None: K = globals().get('_PUMA_K_FINAL', PUMA_K_END or 24)
-    if tau is None: tau = PUMA_TAU
-    model.eval(); mask_id = tokenizer.special_ids['mask']; pad_id = tokenizer.special_ids['pad']
-    dot_id = tokenizer.encode('.')[0]; eq_id = tokenizer.encode('=')[0]
+    if bucket['n'] == 0:
+        return {'n': 0}
 
-    N = min(len(test_data), n_samples)
-    n_ctx = len(DEP_CONTEXTS)
-    cov_sum = torch.zeros(n_ctx); cov_count = torch.zeros(n_ctx, dtype=torch.long)
-    _ar = torch.arange(ANS_LEN, device=device)
+    # Compute blank_masks (open-cell mask) for PUMA forward
+    dot_id = tokenizer.encode('.')[0]
+    blank_masks = (bucket['ids'][:, :ANS_LEN] == dot_id)
 
-    for st in range(0, N, batch_size):
-        en = min(st + batch_size, N); batch = test_data[st:en]; B = len(batch)
-        full_enc = [tokenizer.encode(d['string']) for d in batch]
-        ml = max(len(e) for e in full_enc)
-        ids = torch.full((B, ml), pad_id, dtype=torch.long, device=device)
-        for i, e in enumerate(full_enc):
-            ids[i, :len(e)] = torch.tensor(e, device=device)
+    traj = simulate_reveal_trajectory(
+        model, tokenizer, bucket['ids'], bucket['ans_starts'], ANS_LEN,
+        blank_masks=blank_masks, K=K, tau=tau, device=device)
 
-        ans_starts = (ids == eq_id).long().argmax(dim=1) + 1
-        ap = (ans_starts.unsqueeze(1) + _ar).clamp(max=ml - 1)
-        bi = torch.arange(B, device=device).unsqueeze(1).expand_as(ap)
+    rs = traj['reveal_stage']              # [N, ANS_LEN]
+    smm = traj['still_masked_start']       # [N, K+1, ANS_LEN]
+    N = bucket['n']
 
-        blank_m = (ids[:, :ANS_LEN] == dot_id)
-        x = ids.clone(); x0_at_ans = ids[bi, ap].clone()
-        x[bi[blank_m], ap[blank_m]] = mask_id
+    # (1) By dependency context (junction / corridor_deep / corridor_entrance / etc.)
+    by_role_raw = {r: [] for r in DEP_CONTEXTS}
+    for i, ent in enumerate(bucket['entries']):
+        meta = ent.get('meta', {})
+        for j in range(ANS_LEN):
+            role = meta.get(j, {}).get('dep_context', 'wall')
+            if role not in ('wall', 'off_path'):   # only open cells on/near path
+                by_role_raw.setdefault(role, []).append(smm[i, :K, j].float())
+    by_role = {}
+    for r, xs in by_role_raw.items():
+        if xs:
+            by_role[r] = {
+                'still_masked_per_stage': torch.stack(xs).mean(dim=0).tolist(),
+                'n_positions': len(xs),
+            }
 
-        # Context IDs
-        ctx_batch = torch.zeros(B, ANS_LEN, dtype=torch.long, device=device)
-        for i in range(B):
-            meta = batch[i].get('meta', {})
-            ctx_list = [DEP_CTX_TO_ID.get(meta.get(j, {}).get('dep_context', 'off_path'), 1)
-                        for j in range(ANS_LEN)]
-            ctx_batch[i] = torch.tensor(ctx_list, dtype=torch.long, device=device)
+    # (2) By backbone-path rank — primary axis (analog of addition chain-position)
+    # For each entry, sort backbone cells by their BFS depth from start and track
+    # reveal timing by rank-from-start.
+    bb_acc = defaultdict(list)
+    max_bb_rank = 0
+    for i, ent in enumerate(bucket['entries']):
+        meta = ent.get('meta', {})
+        de_order = ent.get('de_filling_order', {})
+        n_fillable = ent.get('n_fillable', 0)
+        if not de_order: continue
+        # backbone cells on path, sorted by their BFS depth from start
+        bb_cells = [j for j in range(ANS_LEN)
+                    if meta.get(j, {}).get('on_path')
+                    and de_order.get(j, -1) >= n_fillable
+                    and meta.get(j, {}).get('bfs_depth', -1) >= 0]
+        bb_cells.sort(key=lambda j: meta[j]['bfs_depth'])
+        for rank, j in enumerate(bb_cells):
+            max_bb_rank = max(max_bb_rank, rank)
+            bb_acc[rank].append(smm[i, :K, j].float())
+    by_backbone_rank = []
+    for rank in range(max_bb_rank + 1):
+        xs = bb_acc.get(rank, [])
+        if xs:
+            by_backbone_rank.append({
+                'rank': rank,
+                'still_masked_per_stage': torch.stack(xs).mean(dim=0).tolist(),
+                'n': len(xs),
+            })
 
-        is_m = blank_m.clone(); steps_m = torch.zeros(B, ANS_LEN); total_steps = 0
-        for step in range(K):
-            if not is_m.any(): break
-            total_steps += 1; steps_m += is_m.cpu().float()
-            logits = model(x); al = logits[bi, ap].clone(); al[:, :, mask_id] = -float('inf')
-            confs = F.softmax(al, dim=-1).max(dim=-1).values; confs[~is_m] = -float('inf')
-            nm = is_m.sum(dim=1).float(); K_rem = max(K - step, 1)
-            nr = (nm / K_rem).ceil().long().clamp(min=1)
-            ranked = confs.argsort(dim=1, descending=True)
-            rop = torch.zeros_like(ranked); rop.scatter_(1, ranked, _ar.expand(B, -1))
-            reveal = ((rop < nr.unsqueeze(1)) | (confs > tau)) & is_m
-            x[bi[reveal], ap[reveal]] = x0_at_ans[reveal]; is_m = is_m & ~reveal
+    # (3) Never-revealed fraction per cell position
+    never = (rs >= K).float().mean(dim=0).tolist()
 
-        if total_steps == 0: continue
-        frac = steps_m / total_steps
-        # Accumulate per-context — vectorized scatter
-        for i in range(B):
-            bj = blank_m[i].nonzero(as_tuple=True)[0]
-            for j in bj.tolist():
-                ctx_id = ctx_batch[i, j].item()
-                cov_sum[ctx_id] += frac[i, j].item(); cov_count[ctx_id] += 1
+    # (4) Representative traces
+    order_by_bb = sorted(range(N), key=lambda i: bucket['entries'][i].get('backbone_length', 0))
+    picks = [order_by_bb[len(order_by_bb) // 6],
+             order_by_bb[len(order_by_bb) // 2],
+             order_by_bb[-1]] if N >= 3 else list(range(N))
+    reps = []
+    for i in picks:
+        ent = bucket['entries'][i]
+        reps.append({
+            'backbone_length': ent.get('backbone_length', 0),
+            'path_length': ent.get('path_length', 0),
+            'corridor_stats': ent.get('corridor_stats', {}),
+            'reveal_stage': rs[i].tolist(),
+        })
 
-    per_ctx = {}
-    for ci, cn in enumerate(DEP_CONTEXTS):
-        nc = cov_count[ci].item()
-        if nc > 0: per_ctx[cn] = {'mean_coverage': cov_sum[ci].item() / nc, 'n': nc}
-    return per_ctx
+    return {
+        'n': N, 'K': K, 'tau': tau,
+        'by_role': by_role,
+        'by_backbone_rank': by_backbone_rank,
+        'never_revealed': never,
+        'representative_traces': reps,
+    }
 
 
 def analyse_error_localization(per_sample, test_data):
@@ -1083,9 +1293,11 @@ def analyse_error_localization(per_sample, test_data):
 # Training
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-def train(mask_type, tokenizer, train_data, test_data, max_len,
-          max_iters=None, init_state=None, device=None):
-    """Train maze model using unified train_diffusion. Returns (model, dynamics)."""
+def train_model(mask_type, tokenizer, train_data, suite, max_len,
+                max_iters=None, init_state=None, device=None):
+    """Train maze model. train_data is list of entries (must have backbone_length).
+    `suite` is the unified test suite (for eval probe on natural + reveal-τ on extreme).
+    """
     if device is None: device = DEVICE
     if max_iters is None: max_iters = MAX_ITERS
 
@@ -1097,7 +1309,61 @@ def train(mask_type, tokenizer, train_data, test_data, max_len,
     dot_id = tokenizer.encode('.')[0]
     blank_masks = (train_ids[:, :ANS_LEN] == dot_id)
 
-    # PUMA K schedule: step function (auto-compute K_END and K_EVERY)
+    # Training strata (backbone length buckets)
+    sample_strata, stratum_names, stratum_counts = build_training_strata(train_data)
+    print(f"  Training strata counts: " +
+          ', '.join(f"{n}={c}" for n, c in zip(stratum_names, stratum_counts)))
+
+    # Natural probe target (from suite)
+    natural_entries = suite['natural']['entries']
+
+    # Reveal-τ tracked subset: stratified by backbone_length.
+    # Reasoning order = dead-end-filling order (lower rank = unmask first).
+    # Per-stratum trajectories will show: bb_0_5 → τ ≈ +1 (dead-end filling
+    # order learned), bb_24plus → τ ≈ 0 (extreme case misalignment).
+    reveal_tracked_ids = None
+    reveal_tracked_ans = None
+    reveal_reasoning_order = None
+    reveal_blanks = None
+    reveal_tracked_strata = None
+    if mask_type == 'puma':
+        per_stratum_cap = max(REVEAL_TAU_N_TRACKED // len(STRATUM_NAMES), 10)
+        tracked_by_stratum = {sn: [] for sn in STRATUM_NAMES}
+        for i, e in enumerate(train_data):
+            bb = e.get('backbone_length', 0)
+            si = _backbone_to_stratum(bb)
+            sn = STRATUM_NAMES[si]
+            if len(tracked_by_stratum[sn]) < per_stratum_cap:
+                tracked_by_stratum[sn].append((i, si))
+        tracked_flat = [t for v in tracked_by_stratum.values() for t in v]
+        strata_counts = {sn: len(v) for sn, v in tracked_by_stratum.items()}
+        if sum(strata_counts.values()) >= 30:
+            tracked = [t[0] for t in tracked_flat]
+            tracked_strata = [t[1] for t in tracked_flat]
+            reveal_tracked_ids = train_ids[tracked]
+            reveal_tracked_ans = train_ans[tracked]
+            reveal_tracked_strata = torch.tensor(tracked_strata, dtype=torch.long)
+            N_tr = len(tracked)
+            ro = torch.full((N_tr, ANS_LEN), ANS_LEN, dtype=torch.long)
+            bm = torch.zeros(N_tr, ANS_LEN, dtype=torch.bool)
+            for i, idx in enumerate(tracked):
+                ent = train_data[idx]
+                de_order = ent.get('de_filling_order', {})
+                if not de_order:
+                    continue
+                for j in range(ANS_LEN):
+                    if j in de_order:
+                        ro[i, j] = de_order[j]
+                bm[i] = blank_masks[idx]
+            reveal_reasoning_order = ro
+            reveal_blanks = bm
+            print(f"  Reveal-τ tracking (stratified): total={N_tr}, by stratum: " +
+                  ', '.join(f"{sn}={c}" for sn, c in strata_counts.items() if c > 0))
+        else:
+            print(f"  Reveal-τ tracking: SKIPPED "
+                  f"(total tracked < 30: {strata_counts})")
+
+    # PUMA K schedule
     k_sched = None
     if mask_type == 'puma':
         avg_blanks = blank_masks.sum(dim=1).float().mean().item()
@@ -1117,16 +1383,59 @@ def train(mask_type, tokenizer, train_data, test_data, max_len,
         print(f"  PUMA K: {PUMA_K_START} → {final_k} (+{PUMA_K_STEP} every {k_every//1000}k, "
               f"cap={k_end}, avg blanks={avg_blanks:.0f})")
         globals()['_PUMA_K_FINAL'] = final_k
+    K_final_for_tau = k_sched(max_iters) if k_sched else None
 
-    # Eval callback
     def eval_fn(model, it, tg):
-        probe = probe_per_cell(model, tokenizer, test_data, max_len, device)
+        probe = probe_per_cell(model, tokenizer, natural_entries, max_len, device)
         dc = probe.get('dep_context', {})
         parts = [f"{c}={dc[c]['mean_acc']:.3f}" for c in
                  ['junction', 'corridor_entrance', 'corridor_shallow', 'corridor_deep']
                  if c in dc]
         print(f"    [eval it {it}] loss={probe['overall_loss']:.4f} "
               f"acc={probe['overall_acc']:.4f} {' '.join(parts)}")
+
+        # Reveal-τ (PUMA only, past K threshold) — stratified by backbone stratum
+        if (reveal_tracked_ids is not None and it > 0
+                and it % REVEAL_TAU_EVERY == 0 and K_final_for_tau is not None):
+            K_cur = k_sched(it)
+            if K_cur >= K_final_for_tau * REVEAL_TAU_K_THRESHOLD_FRAC:
+                traj = simulate_reveal_trajectory(
+                    model, tokenizer, reveal_tracked_ids, reveal_tracked_ans, ANS_LEN,
+                    blank_masks=reveal_blanks, K=K_cur, tau=PUMA_TAU,
+                    batch_size=32, device=device)
+                taus = compute_reveal_vs_order_tau(
+                    traj['reveal_stage'], reveal_reasoning_order, reveal_blanks)
+                import numpy as _np
+                valid_mask = ~_np.isnan(taus)
+                stratum_np = reveal_tracked_strata.cpu().numpy()
+                per_stratum = {}
+                for si, sn in enumerate(STRATUM_NAMES):
+                    m = valid_mask & (stratum_np == si)
+                    vs = taus[m]
+                    if len(vs) >= 3:
+                        per_stratum[sn] = {
+                            'n': int(len(vs)),
+                            'mean': float(vs.mean()),
+                            'q25': float(_np.percentile(vs, 25)),
+                            'q50': float(_np.percentile(vs, 50)),
+                            'q75': float(_np.percentile(vs, 75)),
+                        }
+                valid = taus[valid_mask]
+                if len(valid) > 0:
+                    probe['reveal_tau'] = {
+                        'K_cur': K_cur, 'n': int(len(valid)),
+                        'mean': float(valid.mean()),
+                        'q25': float(_np.percentile(valid, 25)),
+                        'q50': float(_np.percentile(valid, 50)),
+                        'q75': float(_np.percentile(valid, 75)),
+                        'min': float(valid.min()), 'max': float(valid.max()),
+                        'per_stratum': per_stratum,
+                    }
+                    strata_str = ' | '.join(
+                        f"{sn}={d['q50']:+.2f}(n{d['n']})"
+                        for sn, d in per_stratum.items())
+                    print(f"      [reveal-τ] K={K_cur} overall={probe['reveal_tau']['q50']:+.3f} "
+                          f"| {strata_str}")
         return probe
 
     model, dynamics = train_diffusion(
@@ -1139,10 +1448,15 @@ def train(mask_type, tokenizer, train_data, test_data, max_len,
         grad_clip=GRAD_CLIP, weight_decay=WEIGHT_DECAY, ema_decay=EMA_DECAY,
         eval_fn=eval_fn, eval_every=EVAL_EVERY, log_every=LOG_EVERY,
         patience=globals().get('PATIENCE'),
+        sample_strata=sample_strata, stratum_names=stratum_names,
         init_state=init_state, device=device,
         use_amp=False if NO_AMP else None,
     )
     return model, dynamics
+
+
+# Backward-compat alias — some scripts may still import `train`
+train = train_model
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -1248,6 +1562,114 @@ def make_figures(all_dyn, all_final):
     ax.legend(); ax.grid(alpha=0.3, axis='y')
     fig.tight_layout(); figs['depth_accuracy'] = fig
 
+    # Backbone sweep — PRIMARY extreme axis
+    for dp in DECODE_POLICIES:
+        fig, ax = plt.subplots(figsize=(10, 5))
+        for mt, col, mk in [('random', '#3498db', 'o'), ('puma', '#8e44ad', 's')]:
+            xs, ys = [], []
+            for L in BACKBONE_SWEEP:
+                r = all_final.get(f'{mt}_backbone_sweep_{L}_{dp}')
+                if r is not None:
+                    xs.append(L); ys.append(r['accuracy'])
+            if xs:
+                ax.plot(xs, ys, f'-{mk}', color=col, label=mt, lw=2, markersize=8)
+        ax.set_xlabel('Min backbone length (dead-end filling remainder)')
+        ax.set_ylabel('Accuracy'); ax.set_title(f'Backbone Length Sweep — {dp} decode')
+        ax.legend(); ax.grid(alpha=0.3); ax.set_ylim(-0.05, 1.05)
+        fig.tight_layout(); figs[f'backbone_sweep_{dp}'] = fig
+
+    # Stratum loss trajectory — training-side diagnostic
+    mts_with_strat = [mt for mt in MASK_TYPES
+                     if all_dyn.get(f'dyn_{mt}', {}).get('stratified_loss')]
+    if mts_with_strat:
+        nm = len(mts_with_strat)
+        fig, axes = plt.subplots(1, nm, figsize=(7 * nm, 5), squeeze=False); axes = axes[0]
+        s_cmap = plt.cm.viridis
+        for ai, mt in enumerate(mts_with_strat):
+            dyn = all_dyn[f'dyn_{mt}']
+            sl = dyn['stratified_loss']
+            names = dyn.get('stratum_names', [])
+            S = len(names) if names else (len(sl[0]['per_stratum_loss']) if sl else 0)
+            ax = axes[ai]
+            xs = [e['iter'] for e in sl]
+            for si in range(S):
+                ys = [e['per_stratum_loss'][si] if e['per_stratum_n'][si] > 0 else None
+                      for e in sl]
+                label = names[si] if si < len(names) else f's{si}'
+                valid = [(x, y) for x, y in zip(xs, ys) if y is not None]
+                if valid:
+                    ax.plot([p[0] for p in valid], [p[1] for p in valid],
+                            '-', color=s_cmap(si / max(S - 1, 1)), label=label, lw=1.5)
+            ax.set_xlabel('Iteration'); ax.set_ylabel('Masked-token loss (training)')
+            ax.set_title(f'{mt}: stratum loss trajectory'); ax.set_yscale('log')
+            ax.legend(fontsize=8); ax.grid(alpha=0.3)
+        fig.suptitle('Training-time loss by backbone-length stratum', y=1.02)
+        fig.tight_layout(); figs['stratum_loss'] = fig
+
+    # Reveal heatmap on extreme backbone bucket
+    extreme_key = None
+    for L in sorted(BACKBONE_SWEEP, reverse=True):
+        if any(f'{mt}_reveal_backbone_{L}' in all_final for mt in MASK_TYPES):
+            extreme_key = f'backbone_{L}'; break
+    if extreme_key is not None:
+        mts_with_rev = [mt for mt in MASK_TYPES
+                        if f'{mt}_reveal_{extreme_key}' in all_final]
+        nm = len(mts_with_rev)
+        if nm > 0:
+            fig, axes = plt.subplots(1, nm, figsize=(6 * nm, 5), squeeze=False); axes = axes[0]
+            import numpy as _np
+            for ai, mt in enumerate(mts_with_rev):
+                rev = all_final[f'{mt}_reveal_{extreme_key}']
+                br = rev.get('by_backbone_rank', [])
+                if not br: continue
+                K = rev.get('K', REVEAL_K_DEFAULT)
+                mat = [row['still_masked_per_stage'] for row in br]
+                arr = _np.array(mat)
+                ax = axes[ai]
+                im = ax.imshow(arr, aspect='auto', origin='lower',
+                               cmap='Reds', vmin=0, vmax=1, interpolation='nearest')
+                ax.set_xlabel(f'PUMA stage (K={K})')
+                ax.set_ylabel('Backbone rank (0 = nearest to start)')
+                ax.set_title(f'{mt}: still-masked fraction ({extreme_key}, N={rev["n"]})')
+                plt.colorbar(im, ax=ax, label='still masked')
+            fig.suptitle(f'Reveal trajectory — {extreme_key}', y=1.02)
+            fig.tight_layout(); figs[f'reveal_{extreme_key}'] = fig
+
+    # Reveal-vs-reasoning τ trajectory (PUMA only, stratified by backbone).
+    # Central training-time diagnostic: dead-end-filling order alignment for
+    # easy strata (bb_0_5 → τ ≈ +1) vs hard ones (bb_24plus → τ ≈ 0).
+    puma_dyn = all_dyn.get('dyn_puma', {})
+    tau_pts = [c for c in puma_dyn.get('checkpoints', []) if 'reveal_tau' in c]
+    if tau_pts:
+        fig, ax = plt.subplots(figsize=(10, 5))
+        # Overall IQR shaded
+        xs = [c['iter'] for c in tau_pts]
+        mids = [c['reveal_tau']['q50'] for c in tau_pts]
+        q25s = [c['reveal_tau']['q25'] for c in tau_pts]
+        q75s = [c['reveal_tau']['q75'] for c in tau_pts]
+        ax.fill_between(xs, q25s, q75s, alpha=0.2, color='#8e44ad', label='overall IQR')
+        ax.plot(xs, mids, '--', color='#5e2d6e', lw=1.5, label='overall median')
+        # Per-stratum trajectories
+        s_cmap = plt.cm.plasma
+        for si, sn in enumerate(STRATUM_NAMES):
+            xs_s, mids_s = [], []
+            for c in tau_pts:
+                ps = c['reveal_tau'].get('per_stratum', {}).get(sn)
+                if ps is not None:
+                    xs_s.append(c['iter']); mids_s.append(ps['q50'])
+            if xs_s:
+                ax.plot(xs_s, mids_s, '-o',
+                        color=s_cmap(si / max(len(STRATUM_NAMES) - 1, 1)),
+                        label=sn, lw=2, markersize=5)
+        ax.axhline(0, color='gray', ls=':', alpha=0.7, label='τ=0')
+        ax.axhline(1, color='green', ls='--', alpha=0.4, label='τ=+1 (solver-aligned)')
+        ax.axhline(-1, color='red', ls='--', alpha=0.4, label='τ=−1 (reversed)')
+        ax.set_xlabel('Training iteration')
+        ax.set_ylabel('Kendall τ (reveal vs dead-end-filling order)')
+        ax.set_title('PUMA reveal-order alignment, stratified by backbone length')
+        ax.set_ylim(-1.05, 1.05); ax.legend(loc='best', fontsize=8); ax.grid(alpha=0.3)
+        fig.tight_layout(); figs['reveal_tau_stratified'] = fig
+
     return figs
 
 
@@ -1271,38 +1693,23 @@ def run(tag=''):
     t0 = time.time()
     train_data = gen_train_data(N_TRAIN, seed=SEED, straightness_bias=STRAIGHTNESS_BIAS)
     print(f"  Train: {len(train_data)} mazes in {time.time()-t0:.1f}s")
-    # Profile corridor distribution
-    cl_dist = defaultdict(int)
+    # Training distribution profile — focus on backbone (primary extreme axis)
+    bb_dist = defaultdict(int)
     for d in train_data:
-        mcl = d['corridor_stats']['max_corridor_len']
-        if mcl <= 2: cl_dist['0-2'] += 1
-        elif mcl <= 5: cl_dist['3-5'] += 1
-        elif mcl <= 10: cl_dist['6-10'] += 1
-        elif mcl <= 20: cl_dist['11-20'] += 1
-        else: cl_dist['21+'] += 1
-    print(f"  Train corridor dist: {dict(sorted(cl_dist.items()))}")
-    # Profile dead-end distribution
-    de_dist = defaultdict(int)
-    jn_dist = defaultdict(int)
-    for d in train_data:
-        mdel = d['corridor_stats'].get('max_dead_end_len', 0)
-        if mdel <= 0: de_dist['0'] += 1
-        elif mdel <= 3: de_dist['1-3'] += 1
-        elif mdel <= 8: de_dist['4-8'] += 1
-        elif mdel <= 15: de_dist['9-15'] += 1
-        else: de_dist['16+'] += 1
-        nj = d['corridor_stats'].get('n_junctions_total', 0)
-        if nj <= 2: jn_dist['0-2'] += 1
-        elif nj <= 5: jn_dist['3-5'] += 1
-        elif nj <= 10: jn_dist['6-10'] += 1
-        else: jn_dist['11+'] += 1
-    print(f"  Train dead-end dist: {dict(sorted(de_dist.items()))}")
-    print(f"  Train junction dist: {dict(sorted(jn_dist.items()))}")
+        bb = d.get('backbone_length', 0)
+        if bb <= 5: bb_dist['0-5'] += 1
+        elif bb <= 11: bb_dist['6-11'] += 1
+        elif bb <= 17: bb_dist['12-17'] += 1
+        elif bb <= 23: bb_dist['18-23'] += 1
+        else: bb_dist['24+'] += 1
+    print(f"  Train backbone dist: {dict(sorted(bb_dist.items()))}")
 
-    print(f"\n  Generating {N_TEST} test mazes (with metadata)...")
+    # Unified test suite — all evals slice from here
+    print(f"\n  Building test suite...")
     t0 = time.time()
-    test_data = gen_test_data(N_TEST, seed=SEED + 1000)
-    print(f"  Test: {len(test_data)} mazes in {time.time()-t0:.1f}s")
+    suite = build_test_suite(tok, max_len, seed=SEED + 1000)
+    print(f"  Suite built in {time.time()-t0:.1f}s")
+    natural_entries = suite['natural']['entries']
 
     all_dyn = {}; all_final = {}
     saved_states = {}
@@ -1310,84 +1717,92 @@ def run(tag=''):
     # ── Train ──
     for mt in MASK_TYPES:
         print(f"\n{'━'*60}\n  Training: {mt}\n{'━'*60}")
-        m, dyn = train(mt, tok, train_data, test_data, max_len, device=DEVICE)
+        m, dyn = train_model(mt, tok, train_data, suite, max_len, device=DEVICE)
         all_dyn[f'dyn_{mt}'] = dyn
         saved_states[mt] = {k: v.cpu().clone() for k, v in m.state_dict().items()}
         save_checkpoint(exp_name, saved_states[mt], tag=mt)
 
-        # ── Eval: standard test ──
+        # Standard eval on natural
         for dp in DECODE_POLICIES:
-            print(f"  Eval: {mt} × {dp}")
-            ps = generate_blanks(m, tok, test_data, decode_policy=dp, device=DEVICE)
+            ps = generate_blanks(m, tok, natural_entries, decode_policy=dp, device=DEVICE)
             acc = sum(r['correct'] for r in ps) / len(ps)
             strat = stratify_by_corridor(ps)
             all_final[f'{mt}_standard_{dp}'] = {'accuracy': acc, 'n': len(ps), 'stratified': strat}
-            print(f"    standard: {acc:.4f}")
-            for sn, sv in strat.items():
-                parts = [f"{k}={v['acc']:.3f}({v['n']})" for k, v in sv.items()]
-                print(f"      {sn}: {' '.join(parts)}")
+            print(f"    standard {dp}: {acc:.4f}")
 
-        # ── Corner cases ──
-        for cat in ['pure_corridor', 'long_corridor', 'deep_path']:
-            cc = gen_corner_case_test(min(N_TEST, 500), seed=SEED + 6000, category=cat)
-            if not cc:
-                print(f"    corner/{cat}: no samples"); continue
+        # Corner cases (pure_corridor from suite)
+        for cat_key in ['pure_corridor']:
+            bucket = suite['constructed'].get(cat_key)
+            if not bucket: continue
             for dp in DECODE_POLICIES:
-                ps = generate_blanks(m, tok, cc, decode_policy=dp, device=DEVICE)
+                ps = generate_blanks(m, tok, bucket['entries'], decode_policy=dp, device=DEVICE)
                 acc = sum(r['correct'] for r in ps) / len(ps)
-                all_final[f'{mt}_corner_{cat}_{dp}'] = {'accuracy': acc, 'n': len(cc)}
-                print(f"    corner/{cat} {dp}: {acc:.4f} (n={len(cc)})")
+                all_final[f'{mt}_corner_{cat_key}_{dp}'] = {'accuracy': acc, 'n': len(ps)}
+                print(f"    corner/{cat_key} {dp}: {acc:.4f}")
 
-        # ── Corridor sweep ──
+        # Corridor sweep from suite
         print(f"  Corridor sweep...")
-        for min_cl in CORRIDOR_SWEEP:
-            if min_cl > GRID_N * 2: continue
-            cc = gen_min_corridor_test(min(500, N_TEST), seed=SEED + 6500 + min_cl,
-                                       min_corridor=min_cl)
-            if not cc: continue
+        for L in CORRIDOR_SWEEP:
+            key = f'corridor_{L}'
+            if key not in suite['constructed']: continue
+            bucket = suite['constructed'][key]
             for dp in DECODE_POLICIES:
-                ps = generate_blanks(m, tok, cc, decode_policy=dp, device=DEVICE)
+                ps = generate_blanks(m, tok, bucket['entries'], decode_policy=dp, device=DEVICE)
                 acc = sum(r['correct'] for r in ps) / len(ps)
-                all_final[f'{mt}_corridor_sweep_{min_cl}_{dp}'] = {
-                    'accuracy': acc, 'n': len(cc), 'min_corridor': min_cl}
-                print(f"    corridor>={min_cl:2d} {dp}: {acc:.4f} (n={len(cc)})")
+                all_final[f'{mt}_corridor_sweep_{L}_{dp}'] = {
+                    'accuracy': acc, 'n': len(ps), 'min_corridor': L}
+                print(f"    corridor>={L:2d} {dp}: {acc:.4f}")
 
-        # ── Dead-end sweep ──
+        # Backbone sweep (PRIMARY EXTREME AXIS) from suite
+        print(f"  Backbone sweep...")
+        for L in BACKBONE_SWEEP:
+            key = f'backbone_{L}'
+            if key not in suite['constructed']: continue
+            bucket = suite['constructed'][key]
+            for dp in DECODE_POLICIES:
+                ps = generate_blanks(m, tok, bucket['entries'], decode_policy=dp, device=DEVICE)
+                acc = sum(r['correct'] for r in ps) / len(ps)
+                all_final[f'{mt}_backbone_sweep_{L}_{dp}'] = {
+                    'accuracy': acc, 'n': len(ps), 'min_backbone': L}
+                print(f"    backbone>={L:2d} {dp}: {acc:.4f}")
+
+        # Dead-end sweep from suite
         print(f"  Dead-end sweep...")
-        for min_de in DEAD_END_SWEEP:
-            if min_de > GRID_N * 3: continue
-            cc = gen_min_dead_end_test(min(500, N_TEST), seed=SEED + 7000 + min_de,
-                                       min_dead_end=min_de)
-            if not cc: continue
+        for L in DEAD_END_SWEEP:
+            key = f'dead_end_{L}'
+            if key not in suite['constructed']: continue
+            bucket = suite['constructed'][key]
             for dp in DECODE_POLICIES:
-                ps = generate_blanks(m, tok, cc, decode_policy=dp, device=DEVICE)
+                ps = generate_blanks(m, tok, bucket['entries'], decode_policy=dp, device=DEVICE)
                 acc = sum(r['correct'] for r in ps) / len(ps)
-                all_final[f'{mt}_dead_end_sweep_{min_de}_{dp}'] = {
-                    'accuracy': acc, 'n': len(cc), 'min_dead_end': min_de}
-                print(f"    dead_end>={min_de:2d} {dp}: {acc:.4f} (n={len(cc)})")
+                all_final[f'{mt}_dead_end_sweep_{L}_{dp}'] = {
+                    'accuracy': acc, 'n': len(ps), 'min_dead_end': L}
+                print(f"    dead_end>={L:2d} {dp}: {acc:.4f}")
 
-        # ── Corridor rarity ──
-        print(f"  Corridor rarity analysis...")
-        ps_conf = generate_blanks(m, tok, test_data, decode_policy='confidence', device=DEVICE)
-        rarity = analyse_corridor_rarity(ps_conf, test_data)
+        # Corridor rarity (natural)
+        ps_conf = generate_blanks(m, tok, natural_entries, decode_policy='confidence', device=DEVICE)
+        rarity = analyse_corridor_rarity(ps_conf, natural_entries)
         all_final[f'{mt}_corridor_rarity'] = rarity
-        for bn, bd in rarity['binned'].items():
-            gap_s = f"gap={bd['acc_gap']:+.4f}" if bd.get('acc_gap') is not None else "gap=N/A"
-            print(f"      {bn}: acc={bd['accuracy']:.3f} {gap_s}")
 
-        # ── PUMA coverage (puma only) ──
-        if mt == 'puma':
-            print(f"  PUMA coverage simulation...")
-            cov = simulate_puma_coverage(m, tok, test_data, max_len, device=DEVICE)
-            all_final[f'{mt}_coverage'] = cov
-            for cn, cv in cov.items():
-                print(f"    {cn}: coverage={cv['mean_coverage']:.3f} (n={cv['n']})")
+        # Reveal trajectory on extreme backbone bucket — core failure diagnostic
+        extreme_key = None
+        for L in sorted(BACKBONE_SWEEP, reverse=True):
+            if f'backbone_{L}' in suite['constructed']:
+                extreme_key = f'backbone_{L}'; break
+        if extreme_key is not None:
+            K_for_reveal = globals().get('_PUMA_K_FINAL', REVEAL_K_DEFAULT)
+            rev = analyse_reveal_patterns(
+                m, tok, suite['constructed'][extreme_key], max_len,
+                K=K_for_reveal, tau=PUMA_TAU, device=DEVICE)
+            all_final[f'{mt}_reveal_{extreme_key}'] = rev
+            nv = sum(1 for v in rev.get('never_revealed', []) if v > 0.5)
+            print(f"    Reveal on {extreme_key}: n={rev.get('n', 0)}, "
+                  f"{nv} positions never-revealed >50% of the time")
 
-        # ── Error localization ──
-        print(f"  Error localization...")
-        el = analyse_error_localization(ps_conf, test_data)
+        # Error localization (natural)
+        el = analyse_error_localization(ps_conf, natural_entries)
         all_final[f'{mt}_error_loc'] = el
-        if el['total_errors'] > 0:
+        if el.get('total_errors', 0) > 0:
             parts = [f"{k}={v:.2f}" for k, v in el.items()
                      if k != 'total_errors' and isinstance(v, float)]
             print(f"    {el['total_errors']} errors: {' '.join(parts)}")
@@ -1406,27 +1821,28 @@ def run(tag=''):
         for src, tgt in cont_pairs:
             label = f'{src}_to_{tgt}'
             print(f"\n{'━'*60}\n▶ Continuation: {label} ({CONTINUATION_ITERS} iters)\n{'━'*60}")
-            m, d = train(tgt, tok, train_data, test_data, max_len,
-                         max_iters=CONTINUATION_ITERS,
-                         init_state=saved_states[src], device=DEVICE)
+            m, d = train_model(tgt, tok, train_data, suite, max_len,
+                               max_iters=CONTINUATION_ITERS,
+                               init_state=saved_states[src], device=DEVICE)
             all_dyn[f'dyn_{label}'] = d
 
             for dp in DECODE_POLICIES:
-                ps = generate_blanks(m, tok, test_data, decode_policy=dp, device=DEVICE)
+                ps = generate_blanks(m, tok, natural_entries, decode_policy=dp, device=DEVICE)
                 acc = sum(r['correct'] for r in ps) / len(ps)
                 all_final[f'{label}_standard_{dp}'] = {'accuracy': acc, 'n': len(ps)}
                 print(f"    standard {dp}: {acc:.4f}")
 
-            # Corridor sweep for continuation
-            for min_cl in [4, 8, 12, 15, 20]:
-                if min_cl > GRID_N * 2: continue
-                cc = gen_min_corridor_test(200, seed=SEED + 6500 + min_cl, min_corridor=min_cl)
-                if not cc: continue
+            # Backbone sweep for continuation
+            for L in BACKBONE_SWEEP:
+                key = f'backbone_{L}'
+                if key not in suite['constructed']: continue
                 for dp in ['confidence']:
-                    ps = generate_blanks(m, tok, cc, decode_policy=dp, device=DEVICE)
+                    ps = generate_blanks(m, tok, suite['constructed'][key]['entries'],
+                                          decode_policy=dp, device=DEVICE)
                     acc = sum(r['correct'] for r in ps) / len(ps)
-                    all_final[f'{label}_corridor_sweep_{min_cl}_{dp}'] = {'accuracy': acc, 'n': len(cc)}
-                    print(f"    corridor>={min_cl:2d} {dp}: {acc:.4f}")
+                    all_final[f'{label}_backbone_sweep_{L}_{dp}'] = {
+                        'accuracy': acc, 'n': len(ps)}
+                    print(f"    backbone>={L:2d} {dp}: {acc:.4f}")
 
             del m; torch.cuda.empty_cache() if torch.cuda.is_available() else None
 
@@ -1438,9 +1854,14 @@ def run(tag=''):
         'GRID_N', 'GRID_H', 'GRID_W', 'CELL_N', 'N_TRAIN', 'N_TEST', 'MAX_ITERS',
         'BATCH_SIZE', 'N_LAYER', 'N_HEAD', 'N_EMBD', 'MASK_TYPES', 'DECODE_POLICIES',
         'PUMA_K_START', 'PUMA_K_END', 'PUMA_K_STEP', 'PUMA_K_EVERY', 'PUMA_TAU',
-        'STRAIGHTNESS_BIAS', 'DEAD_END_SWEEP']}}
+        'STRAIGHTNESS_BIAS', 'BACKBONE_SWEEP', 'DEAD_END_SWEEP', 'CORRIDOR_SWEEP']}}
     for k, v in all_dyn.items():
-        sd[k] = {'checkpoints': v['checkpoints'], 'train_loss': v['train_loss']}
+        sd[k] = {
+            'checkpoints': v['checkpoints'],
+            'train_loss': v['train_loss'],
+            'stratified_loss': v.get('stratified_loss', []),
+            'stratum_names': v.get('stratum_names', []),
+        }
     for k, v in all_final.items():
         sd[f'final_{k}'] = v
     save_results(exp_name, sd, figures=figs)
@@ -1451,7 +1872,7 @@ def run(tag=''):
     for mt in MASK_TYPES: print(f" {mt:>14s}", end='')
     print()
     for dp in DECODE_POLICIES:
-        for tt in ['standard', 'corner_pure_corridor', 'corner_long_corridor', 'corner_deep_path']:
+        for tt in ['standard', 'corner_pure_corridor']:
             key_parts = [f'{mt}_{tt}_{dp}' for mt in MASK_TYPES]
             accs = [all_final.get(k, {}).get('accuracy') for k in key_parts]
             if any(a is not None for a in accs):
@@ -1459,33 +1880,14 @@ def run(tag=''):
                 for a in accs:
                     print(f" {a:>14.4f}" if a is not None else f" {'N/A':>14s}", end='')
                 print()
-        # Corridor sweep
-        for min_cl in CORRIDOR_SWEEP:
-            key_parts = [f'{mt}_corridor_sweep_{min_cl}_{dp}' for mt in MASK_TYPES]
+        for L in BACKBONE_SWEEP:
+            key_parts = [f'{mt}_backbone_sweep_{L}_{dp}' for mt in MASK_TYPES]
             accs = [all_final.get(k, {}).get('accuracy') for k in key_parts]
             if any(a is not None for a in accs):
-                print(f"  {'corridor>='+str(min_cl)+'_'+dp:<40s}", end='')
+                print(f"  {'backbone>='+str(L)+'_'+dp:<40s}", end='')
                 for a in accs:
                     print(f" {a:>14.4f}" if a is not None else f" {'N/A':>14s}", end='')
                 print()
-        # Dead-end sweep
-        for min_de in DEAD_END_SWEEP:
-            key_parts = [f'{mt}_dead_end_sweep_{min_de}_{dp}' for mt in MASK_TYPES]
-            accs = [all_final.get(k, {}).get('accuracy') for k in key_parts]
-            if any(a is not None for a in accs):
-                print(f"  {'dead_end>='+str(min_de)+'_'+dp:<40s}", end='')
-                for a in accs:
-                    print(f" {a:>14.4f}" if a is not None else f" {'N/A':>14s}", end='')
-                print()
-
-    # Error localization summary
-    print(f"\n  ── Error Localization ──")
-    for mt in MASK_TYPES:
-        el = all_final.get(f'{mt}_error_loc', {})
-        if el.get('total_errors', 0) > 0:
-            parts = [f"{k}={v:.2f}" for k, v in el.items()
-                     if k != 'total_errors' and isinstance(v, float)]
-            print(f"  {mt}: n={el['total_errors']} {' '.join(parts)}")
 
     return all_dyn, all_final
 

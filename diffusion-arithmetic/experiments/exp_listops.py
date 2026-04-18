@@ -31,7 +31,8 @@ from core.tokenizer import CharTokenizer
 from core.train_utils import (
     mount_drive, save_results, save_checkpoint, encode_samples,
     train_diffusion, puma_k_fixed, puma_k_linear, puma_k_step,
-    generate_diffusion, DEVICE,
+    generate_diffusion, simulate_reveal_trajectory, compute_reveal_vs_order_tau,
+    DEVICE,
 )
 
 EXP_NAME = 'exp_listops'
@@ -55,7 +56,9 @@ MAX_SEQ_LEN = 200       # total sequence length cap
 DEPTH_DECAY = 0.8       # training: P(target_depth=d) ∝ DEPTH_DECAY^(d-1)
 
 # Training
-N_TRAIN = 20000; N_TEST = 1000; BATCH_SIZE = 256
+N_TRAIN = 20000; N_TEST = 5000; BATCH_SIZE = 256
+# Per-bucket count for constructed test subsets (critical chain sweeps etc.)
+N_PER_BUCKET = 300
 MAX_ITERS = 400000; EVAL_EVERY = 5000; LOG_EVERY = 1000
 GEN_EVAL_EVERY = 10000; GEN_EVAL_N = 500
 MASK_TYPES = ['random', 'puma']
@@ -70,6 +73,24 @@ SEED = 42
 NO_AMP = False
 PATIENCE = 50000
 CONTINUATION_ITERS = 10000
+
+# Extreme-case axes (listops analog of addition chain / maze backbone)
+# Primary: s_chain_len = longest consecutive SUMMOD run on the critical chain.
+# SUMMOD is the only op forcing accumulated modular arithmetic (vs argmax/
+# median shortcut available for MAX/MIN/MED). A long SUMMOD run on the
+# critical chain = forced sequential accumulation = structurally hard case
+# analogous to long carry chain in addition.
+CRITICAL_CHAIN_SWEEP = [2, 3, 4, 5, 6, 7, 8]
+S_CHAIN_SWEEP = [0, 1, 2, 3, 4, 5]
+
+# Reveal trajectory / reveal-τ (PUMA only, extreme s_chain_len subset)
+# Reasoning order = post-order (inner→outer) = trace order, i.e., answer
+# position j decoded at step j. Rainbow pad positions get dummy high rank.
+REVEAL_K_DEFAULT = 8          # match PUMA K; overridden at runtime
+REVEAL_TAU_MIN_S_CHAIN = 3    # track samples with s_chain_len ≥ this
+REVEAL_TAU_N_TRACKED = 100
+REVEAL_TAU_EVERY = 20000
+REVEAL_TAU_K_THRESHOLD_FRAC = 0.7
 
 
 def parse_args():
@@ -234,6 +255,38 @@ def _critical_chain_from_trace(trace):
     return longest[root], chain
 
 
+def _summod_chain_stats(trace, crit_chain):
+    """Compute SUMMOD-concentration statistics on the critical chain.
+
+    SUMMOD (op='S') is the only listops op that requires accumulated modular
+    arithmetic rather than argmax/median shortcut. A critical chain consisting
+    entirely of SUMMOD operators forces a strict sequential accumulation —
+    the ListOps analog of a long unbroken carry chain in addition.
+
+    Returns dict with:
+      s_chain_ratio:  fraction of S ops on the critical chain
+      s_chain_len:    length of the longest consecutive S run on the chain
+      n_s_on_chain:   total S count on the chain
+    """
+    if not crit_chain:
+        return {'s_chain_ratio': 0.0, 's_chain_len': 0, 'n_s_on_chain': 0}
+    # crit_chain is root-first (trace index order: last is deepest leaf)
+    ops_on_chain = [trace[i]['op'] for i in crit_chain]
+    n_s = sum(1 for op in ops_on_chain if op == 'S')
+    # Longest consecutive S run
+    cur_run = 0; best_run = 0
+    for op in ops_on_chain:
+        if op == 'S':
+            cur_run += 1; best_run = max(best_run, cur_run)
+        else:
+            cur_run = 0
+    return {
+        's_chain_ratio': n_s / len(ops_on_chain),
+        's_chain_len': best_run,
+        'n_s_on_chain': n_s,
+    }
+
+
 def _build_dependency_pairs(trace):
     """
     Extract all (parent_idx, child_idx) dependency pairs from trace.
@@ -382,6 +435,7 @@ def _format_sample(tree):
 
     # Metadata for analysis
     crit_len, crit_chain = _critical_chain_from_trace(trace)
+    s_stats = _summod_chain_stats(trace, crit_chain)
     dep_pairs = _build_dependency_pairs(trace)
     meta = {
         'tree_depth': _tree_depth(tree) + 1,   # 1-indexed: depth 1 = flat
@@ -390,6 +444,9 @@ def _format_sample(tree):
         'max_chain': _max_chain_depth(tree),
         'critical_chain_len': crit_len,
         'critical_chain': crit_chain,
+        's_chain_ratio': s_stats['s_chain_ratio'],
+        's_chain_len': s_stats['s_chain_len'],
+        'n_s_on_chain': s_stats['n_s_on_chain'],
         'dep_pairs': dep_pairs,             # (parent_idx, child_idx) pairs
         'trace_info': trace,                # per-trace-position metadata
         'dep_contexts': [_dep_context(t) for t in trace],
@@ -472,6 +529,49 @@ def gen_min_depth_test(n, seed, min_depth):
             break
     if len(data) < n:
         print(f"    WARNING: gen_min_depth_test(d>={min_depth}): {len(data)}/{n}")
+    return data[:n], metas[:n]
+
+
+def gen_min_s_chain_test(n, seed, min_s_chain):
+    """Generate test set filtered to s_chain_len >= min_s_chain.
+
+    This is the primary extreme axis for listops: instances with a long
+    consecutive SUMMOD run on the critical chain — the analog of long
+    unbroken carry chain in addition (forced sequential accumulation).
+
+    Since s_chain_len >= 3 is structurally rare under DEPTH_DECAY
+    (most chains have short runs or mixed ops), we use a rejection
+    sampling loop.
+    """
+    rng = random.Random(seed)
+    data, metas = [], []
+    for _ in range(n * 200):   # s_chain_len is rarer than depth filter
+        tree = _gen_tree(rng, max_depth=MAX_DEPTH, must_reach_max=True)
+        s, m = _format_sample(tree)
+        if s is not None and m.get('s_chain_len', 0) >= min_s_chain:
+            data.append(s)
+            metas.append(m)
+        if len(data) >= n:
+            break
+    if len(data) < n:
+        print(f"    WARNING: gen_min_s_chain_test(s>={min_s_chain}): {len(data)}/{n}")
+    return data[:n], metas[:n]
+
+
+def gen_min_critical_chain_test(n, seed, min_crit):
+    """Generate test set filtered to critical_chain_len >= min_crit."""
+    rng = random.Random(seed)
+    data, metas = [], []
+    for _ in range(n * 100):
+        tree = _gen_tree(rng, max_depth=MAX_DEPTH, must_reach_max=True)
+        s, m = _format_sample(tree)
+        if s is not None and m.get('critical_chain_len', 0) >= min_crit:
+            data.append(s)
+            metas.append(m)
+        if len(data) >= n:
+            break
+    if len(data) < n:
+        print(f"    WARNING: gen_min_critical_chain_test(c>={min_crit}): {len(data)}/{n}")
     return data[:n], metas[:n]
 
 
@@ -596,6 +696,109 @@ def gen_depth_ood_test(n, seed, target_depth):
     if len(data) < n:
         print(f"    WARNING: gen_depth_ood(d={target_depth}): {len(data)}/{n}")
     return data[:n], metas[:n]
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Unified test suite — all analyses slice from here
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+def _bucket_from_items(samples, metas, tokenizer, max_len):
+    """Package (samples, metas) with encoded ids for batched analysis."""
+    if not samples:
+        return {'samples': [], 'metas': [],
+                'ids': torch.empty(0, max_len, dtype=torch.long),
+                'ans_starts': torch.empty(0, dtype=torch.long), 'n': 0}
+    ids, ans = encode_samples(samples, tokenizer, max_len)
+    return {
+        'samples': samples, 'metas': metas,
+        'ids': ids, 'ans_starts': ans, 'n': len(samples),
+    }
+
+
+def build_test_suite(tokenizer, max_len, seed=None):
+    """Unified test suite for listops.
+
+    Structure:
+        suite['natural']:                       N_TEST natural-distribution samples
+        suite['constructed']['critical_{L}']:   critical_chain_len ≥ L bucket
+        suite['constructed']['s_chain_{L}']:    s_chain_len ≥ L bucket (PRIMARY EXTREME)
+        suite['constructed']['depth_{D}']:      tree_depth ≥ D bucket
+        suite['constructed']['linear_chain']:   corner case (max sequential dep)
+    """
+    if seed is None:
+        seed = SEED + 1000
+    suite = {}
+    nat_s, nat_m = gen_test_data(N_TEST, seed)
+    suite['natural'] = _bucket_from_items(nat_s, nat_m, tokenizer, max_len)
+
+    suite['constructed'] = {}
+    for L in CRITICAL_CHAIN_SWEEP:
+        s, m = gen_min_critical_chain_test(N_PER_BUCKET, seed=seed + 300 + L, min_crit=L)
+        if s:
+            suite['constructed'][f'critical_{L}'] = _bucket_from_items(s, m, tokenizer, max_len)
+    for L in S_CHAIN_SWEEP:
+        if L == 0:  # all samples have s_chain >= 0 trivially; skip
+            continue
+        s, m = gen_min_s_chain_test(N_PER_BUCKET, seed=seed + 400 + L, min_s_chain=L)
+        if s:
+            suite['constructed'][f's_chain_{L}'] = _bucket_from_items(s, m, tokenizer, max_len)
+    for D in [3, 4, 5]:
+        if D > MAX_DEPTH:
+            continue
+        s, m = gen_min_depth_test(N_PER_BUCKET, seed=seed + 500 + D, min_depth=D)
+        if s:
+            suite['constructed'][f'depth_{D}'] = _bucket_from_items(s, m, tokenizer, max_len)
+    s, m = gen_corner_case_test(N_PER_BUCKET, seed=seed + 600, category='linear_chain')
+    if s:
+        suite['constructed']['linear_chain'] = _bucket_from_items(s, m, tokenizer, max_len)
+
+    print(f"  ListOps test suite built:")
+    print(f"    natural: {suite['natural']['n']}")
+    for k, v in suite['constructed'].items():
+        print(f"    constructed/{k}: {v['n']}")
+    return suite
+
+
+def filter_natural(suite, pred):
+    """Filter natural bucket by predicate on meta; returns same-shape bucket."""
+    nat = suite['natural']
+    idx = [i for i, m in enumerate(nat['metas']) if pred(m)]
+    if not idx:
+        return {'samples': [], 'metas': [],
+                'ids': torch.empty(0, nat['ids'].shape[1], dtype=torch.long),
+                'ans_starts': torch.empty(0, dtype=torch.long), 'n': 0}
+    return {
+        'samples': [nat['samples'][i] for i in idx],
+        'metas': [nat['metas'][i] for i in idx],
+        'ids': nat['ids'][idx],
+        'ans_starts': nat['ans_starts'][idx],
+        'n': len(idx),
+    }
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Training strata — by s_chain_len (primary extreme axis)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Each training sample's s_chain_len bucket drives per-stratum masked-token
+# loss logging. Paper claim: PUMA's s_chain_3+ stratum loss plateaus while
+# Random's decreases → PUMA undercovers the SUMMOD-heavy critical chain class.
+
+STRATUM_BOUNDS_SCHAIN = [(0, 1), (1, 2), (2, 3), (3, 4), (4, 999)]
+STRATUM_NAMES = ['s_chain_0', 's_chain_1', 's_chain_2', 's_chain_3', 's_chain_4plus']
+
+
+def _schain_to_stratum(s):
+    for i, (lo, hi) in enumerate(STRATUM_BOUNDS_SCHAIN):
+        if lo <= s < hi:
+            return i
+    return len(STRATUM_BOUNDS_SCHAIN) - 1
+
+
+def build_training_strata(train_metas):
+    """Per-sample stratum id by s_chain_len (SUMMOD run on critical chain)."""
+    strata = [_schain_to_stratum(m.get('s_chain_len', 0)) for m in train_metas]
+    counts = [strata.count(i) for i in range(len(STRATUM_NAMES))]
+    return torch.tensor(strata, dtype=torch.long), STRATUM_NAMES, counts
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -888,107 +1091,116 @@ def analyse_depth_rarity(per_sample, test_metas):
 
 
 @torch.no_grad()
-def simulate_puma_coverage(model, tokenizer, test_samples, test_metas, max_len,
-                           K=None, tau=None, n_samples=200, device=None):
-    """Measure PUMA chain coverage × depth condition."""
+@torch.no_grad()
+def analyse_reveal_patterns(model, tokenizer, bucket, max_len,
+                             K=REVEAL_K_DEFAULT, tau=PUMA_TAU, device=None):
+    """Analyze PUMA reveal patterns on an extreme-case bucket.
+
+    The listops-specific diagnostic asks: where on the critical chain does
+    PUMA defer decoding, and does it systematically avoid the SUMMOD-heavy
+    sub-chains (the structurally hardest positions)?
+
+    Aggregations:
+      (a) by critical-chain position rank (0 = deepest leaf, L-1 = root):
+            still-masked fraction × PUMA stage
+      (b) by op type on critical chain: S vs non-S still-masked trajectory
+      (c) never-revealed fraction per answer position
+      (d) premature-reveal rate: trace position j decoded before its turn j
+          in the oracle (post-order) schedule.
+    """
     if device is None:
         device = DEVICE
-    if K is None:
-        K = PUMA_K_END or PUMA_K
-    if tau is None:
-        tau = PUMA_TAU
-    model.eval()
-    mask_id = tokenizer.special_ids['mask']
+    if bucket['n'] == 0:
+        return {'n': 0}
 
-    N = min(len(test_samples), n_samples)
-    # Per-position: coverage for deep vs shallow trace positions
-    deep_s = torch.zeros(MAX_ANS_LEN)
-    deep_n = torch.zeros(MAX_ANS_LEN, dtype=torch.long)
-    shallow_s = torch.zeros(MAX_ANS_LEN)
-    shallow_n = torch.zeros(MAX_ANS_LEN, dtype=torch.long)
+    N = bucket['n']
+    # blank_masks = True for all trace positions (actual cells). Rainbow pad
+    # positions are True as well since the entire answer region is a diffusion
+    # target per MDM philosophy; they just don't carry solver-step semantics.
+    blank_masks = torch.ones(N, MAX_ANS_LEN, dtype=torch.bool)
 
-    for si in range(N):
-        s = test_samples[si]
-        meta = test_metas[si]
-        depths = meta['depths']
-        prefix = s.split('=')[0] + '='
-        answer = get_answer(s)
-        penc = tokenizer.encode(prefix)
-        aenc = tokenizer.encode(answer)
-        T_pre = len(penc)
-        # Pad to max_len for consistent attention patterns
-        pad_id = tokenizer.special_ids['pad']
-        seq = penc + [mask_id] * MAX_ANS_LEN
-        if len(seq) < max_len:
-            seq = seq + [pad_id] * (max_len - len(seq))
-        x = torch.tensor(seq, dtype=torch.long, device=device).unsqueeze(0)
-        x0 = torch.tensor(aenc[:MAX_ANS_LEN], dtype=torch.long, device=device)
-        is_m = torch.ones(MAX_ANS_LEN, dtype=torch.bool, device=device)
-        steps_m = torch.zeros(MAX_ANS_LEN)
-        total = 0
+    traj = simulate_reveal_trajectory(
+        model, tokenizer, bucket['ids'], bucket['ans_starts'], MAX_ANS_LEN,
+        blank_masks=blank_masks, K=K, tau=tau, device=device)
 
-        for step in range(K):
-            if not is_m.any():
-                break
-            total += 1
-            steps_m += is_m.cpu().float()
-            logits = model(x)
-            nm = is_m.sum().item()
-            nr = max(1, int(math.ceil(nm / max(K - step, 1))))
-            confs = torch.full((MAX_ANS_LEN,), -float('inf'), device=device)
-            for j in range(MAX_ANS_LEN):
-                if is_m[j]:
-                    cl = logits[0, T_pre + j].clone()
-                    cl[mask_id] = -float('inf')
-                    confs[j] = F.softmax(cl, dim=-1).max()
-            ranked = confs.argsort(descending=True)
-            reveal = torch.zeros(MAX_ANS_LEN, dtype=torch.bool, device=device)
-            for ri in range(MAX_ANS_LEN):
-                j = ranked[ri].item()
-                if not is_m[j]:
-                    continue
-                if reveal.sum() < nr or confs[j] > tau:
-                    reveal[j] = True
-            for j in range(MAX_ANS_LEN):
-                if reveal[j]:
-                    x[0, T_pre + j] = x0[j]
-                    is_m[j] = False
+    rs = traj['reveal_stage']          # [N, MAX_ANS_LEN]
+    smm = traj['still_masked_start']   # [N, K+1, MAX_ANS_LEN]
 
-        if total == 0:
+    # (a) by critical-chain rank (position along critical chain, leaf→root)
+    chain_acc = defaultdict(list)   # rank → list of [K] float tensors
+    max_chain_rank = 0
+    for i, meta in enumerate(bucket['metas']):
+        crit = meta.get('critical_chain', [])
+        if not crit:
             continue
-        frac = steps_m / total
-        for j in range(MAX_ANS_LEN):
-            is_deep = j < len(depths) and depths[j] >= 2
-            if is_deep:
-                deep_s[j] += frac[j]
-                deep_n[j] += 1
-            else:
-                shallow_s[j] += frac[j]
-                shallow_n[j] += 1
+        # crit is root-first from _critical_chain_from_trace; reverse to leaf-first
+        # so rank 0 = leaf-most (decoded first in post-order).
+        leaf_first = list(reversed(crit))
+        for rank, trace_idx in enumerate(leaf_first):
+            if 0 <= trace_idx < MAX_ANS_LEN:
+                chain_acc[rank].append(smm[i, :K, trace_idx].float())
+                max_chain_rank = max(max_chain_rank, rank)
+    by_chain_rank = []
+    for rank in range(max_chain_rank + 1):
+        xs = chain_acc.get(rank, [])
+        if xs:
+            by_chain_rank.append({
+                'rank': rank,
+                'still_masked_per_stage': torch.stack(xs).mean(dim=0).tolist(),
+                'n': len(xs),
+            })
 
-    per_pos = []
-    for j in range(MAX_ANS_LEN):
-        nd, ns = deep_n[j].item(), shallow_n[j].item()
-        cv_d = deep_s[j].item() / nd if nd > 0 else None
-        cv_s = shallow_s[j].item() / ns if ns > 0 else None
-        deficit = (cv_s - cv_d) if cv_s is not None and cv_d is not None else None
-        br = nd / max(nd + ns, 1)
-        per_pos.append({
-            'position': j, 'base_rate': br,
-            'cov_deep': cv_d, 'cov_shallow': cv_s, 'deficit': deficit,
-        })
+    # (b) by op type on critical chain: S vs non-S
+    op_acc = {'S': [], 'non_S': []}
+    for i, meta in enumerate(bucket['metas']):
+        crit = meta.get('critical_chain', [])
+        ops = meta.get('ops', [])
+        for trace_idx in crit:
+            if 0 <= trace_idx < len(ops) and trace_idx < MAX_ANS_LEN:
+                key = 'S' if ops[trace_idx] == 'S' else 'non_S'
+                op_acc[key].append(smm[i, :K, trace_idx].float())
+    by_op_on_chain = {}
+    for k, xs in op_acc.items():
+        if xs:
+            by_op_on_chain[k] = {
+                'still_masked_per_stage': torch.stack(xs).mean(dim=0).tolist(),
+                'n_positions': len(xs),
+            }
 
-    valid = [(p['base_rate'], p['deficit']) for p in per_pos if p['deficit'] is not None]
-    corr = None
-    if len(valid) >= 3:
-        brs, ds = [v[0] for v in valid], [v[1] for v in valid]
-        mb, md_v = sum(brs) / len(brs), sum(ds) / len(ds)
-        c = sum((b - mb) * (d - md_v) for b, d in zip(brs, ds))
-        sb = sum((b - mb) ** 2 for b in brs) ** 0.5
-        sd = sum((d - md_v) ** 2 for d in ds) ** 0.5
-        corr = c / (sb * sd) if sb > 0 and sd > 0 else 0.0
+    # (c) never-revealed per position
+    never = (rs >= K).float().mean(dim=0).tolist()
 
-    return {'per_position': per_pos, 'corr': corr}
+    # (d) premature-reveal rate — decoding trace pos j before its oracle step j
+    # The oracle decode schedule (post-order) = answer-position order since the
+    # data is stored leaf-to-root in the trace. Expected stage of pos j is
+    # j / max(trace_len - 1, 1) * (K - 1). Premature if revealed noticeably
+    # earlier (threshold 1 stage).
+    premature_per_bin = {'early': [0, 0], 'mid': [0, 0], 'late': [0, 0]}
+    for i, meta in enumerate(bucket['metas']):
+        tl = meta.get('trace_len', 0)
+        if tl <= 0:
+            continue
+        for j in range(min(tl, MAX_ANS_LEN)):
+            expected_stage = j / max(tl - 1, 1) * (K - 1)
+            actual_stage = float(rs[i, j])
+            is_premature = actual_stage < expected_stage - 1
+            if j < tl // 3: bin_name = 'early'
+            elif j < 2 * tl // 3: bin_name = 'mid'
+            else: bin_name = 'late'
+            premature_per_bin[bin_name][0] += int(is_premature)
+            premature_per_bin[bin_name][1] += 1
+    premature_rate = {
+        b: {'rate': c / max(t, 1), 'n': t}
+        for b, (c, t) in premature_per_bin.items() if t > 0
+    }
+
+    return {
+        'n': N, 'K': K, 'tau': tau,
+        'by_chain_rank': by_chain_rank,
+        'by_op_on_chain': by_op_on_chain,
+        'never_revealed': never,
+        'premature_rate': premature_rate,
+    }
 
 
 def analyse_error_localization(per_sample):
@@ -1265,9 +1477,17 @@ def _quick_gen(model, tokenizer, test_samples, test_metas, max_len, decode_polic
 # Training wrapper
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-def train_model(mask_type, tokenizer, train_samples, test_samples, test_metas,
-                max_len, max_iters=None, init_state=None, device=None):
-    """Wrapper around train_diffusion for ListOps experiment."""
+def train_model(mask_type, tokenizer, train_samples, train_metas,
+                test_samples, test_metas, max_len,
+                max_iters=None, init_state=None, device=None):
+    """Wrapper around train_diffusion for ListOps experiment.
+
+    Training-side diagnostics added:
+      - per-s_chain_len stratum training-loss trajectory
+      - reveal-vs-reasoning Kendall τ on a tracked extreme-subset (PUMA only).
+        Reasoning order = post-order = trace index order, so reasoning_rank[j] = j
+        for actual trace positions (rainbow pad gets dummy high rank).
+    """
     if device is None:
         device = DEVICE
     if max_iters is None:
@@ -1275,6 +1495,58 @@ def train_model(mask_type, tokenizer, train_samples, test_samples, test_metas,
 
     train_ids, train_ans = encode_samples(train_samples, tokenizer, max_len)
     train_ids, train_ans = train_ids.to(device), train_ans.to(device)
+
+    # Training strata (s_chain_len buckets)
+    sample_strata, stratum_names, stratum_counts = build_training_strata(train_metas)
+    print(f"  Training strata counts: " +
+          ', '.join(f"{n}={c}" for n, c in zip(stratum_names, stratum_counts)))
+
+    # Reveal-τ tracked subset (PUMA only). We track samples from each
+    # s_chain_len stratum so that the τ distribution can be decomposed —
+    # s_chain_0-2 should trend toward post-order alignment (τ > 0) while
+    # s_chain_3+ should show misalignment (τ ≈ 0 or lower). This is the
+    # sharpest training-time diagnostic for the paper's central claim.
+    reveal_tracked_ids = None
+    reveal_tracked_ans = None
+    reveal_reasoning_order = None
+    reveal_blanks = None
+    reveal_tracked_strata = None   # [N_tr] long — which stratum each tracked sample belongs to
+    if mask_type == 'puma':
+        # Per-stratum tracked indices (cap per stratum)
+        per_stratum_cap = max(REVEAL_TAU_N_TRACKED // len(STRATUM_NAMES), 10)
+        tracked_by_stratum = {sn: [] for sn in STRATUM_NAMES}
+        for i, m in enumerate(train_metas):
+            si = _schain_to_stratum(m.get('s_chain_len', 0))
+            sn = STRATUM_NAMES[si]
+            if len(tracked_by_stratum[sn]) < per_stratum_cap:
+                tracked_by_stratum[sn].append((i, si))
+        tracked_flat = [t for v in tracked_by_stratum.values() for t in v]
+        # Keep only strata with enough samples for a meaningful trajectory
+        strata_counts = {sn: len(v) for sn, v in tracked_by_stratum.items()}
+        if sum(strata_counts.values()) >= 30:
+            tracked = [t[0] for t in tracked_flat]
+            tracked_strata = [t[1] for t in tracked_flat]
+            reveal_tracked_ids = train_ids[tracked]
+            reveal_tracked_ans = train_ans[tracked]
+            reveal_tracked_strata = torch.tensor(tracked_strata, dtype=torch.long)
+            N_tr = len(tracked)
+            # Reasoning rank for listops: trace position j has rank j (post-order).
+            ro = torch.full((N_tr, MAX_ANS_LEN), MAX_ANS_LEN, dtype=torch.long)
+            bm = torch.zeros(N_tr, MAX_ANS_LEN, dtype=torch.bool)
+            for i, idx in enumerate(tracked):
+                tl = train_metas[idx].get('trace_len', 0)
+                tl = min(tl, MAX_ANS_LEN)
+                for j in range(tl):
+                    ro[i, j] = j
+                bm[i, :tl] = True
+            reveal_reasoning_order = ro
+            reveal_blanks = bm
+            print(f"  Reveal-τ tracking (stratified): "
+                  f"total={N_tr}, by stratum: " +
+                  ', '.join(f"{sn}={c}" for sn, c in strata_counts.items() if c > 0))
+        else:
+            print(f"  Reveal-τ tracking: SKIPPED "
+                  f"(total tracked < 30: {strata_counts})")
 
     # PUMA K schedule
     k_sched = None
@@ -1293,8 +1565,8 @@ def train_model(mask_type, tokenizer, train_samples, test_samples, test_metas,
         else:
             k_sched = puma_k_fixed(PUMA_K)
             print(f"  PUMA K: fixed {PUMA_K}")
+    K_final_for_tau = k_sched(max_iters) if k_sched else None
 
-    # Eval callback
     def eval_fn(model, it, tg):
         probe = probe_per_position(model, tokenizer, test_samples, test_metas,
                                    max_len, device)
@@ -1310,6 +1582,52 @@ def train_model(mask_type, tokenizer, train_samples, test_samples, test_metas,
                 print(f"        in={ex['input'][:50]} gold={ex['gold'][:ex['trace_len']]}|{ex['gold'][ex['trace_len']:ex['trace_len']+3]}.. pred={ex['pred'][:ex['trace_len']]}|{ex['pred'][ex['trace_len']:ex['trace_len']+3]}.. {'✓' if ex['trace_ok'] else '✗'}")
             probe['gen_acc_full'] = r['accuracy']
             probe['gen_acc_trace'] = r['trace_accuracy']
+
+        # Reveal-τ (PUMA only, past K threshold) — stratified by s_chain_len
+        if (reveal_tracked_ids is not None and it > 0
+                and it % REVEAL_TAU_EVERY == 0 and K_final_for_tau is not None):
+            K_cur = k_sched(it)
+            if K_cur >= K_final_for_tau * REVEAL_TAU_K_THRESHOLD_FRAC:
+                traj = simulate_reveal_trajectory(
+                    model, tokenizer, reveal_tracked_ids, reveal_tracked_ans,
+                    MAX_ANS_LEN,
+                    blank_masks=reveal_blanks, K=K_cur, tau=PUMA_TAU,
+                    batch_size=64, device=device)
+                taus = compute_reveal_vs_order_tau(
+                    traj['reveal_stage'], reveal_reasoning_order, reveal_blanks)
+                import numpy as _np
+                valid_mask = ~_np.isnan(taus)
+                stratum_np = reveal_tracked_strata.cpu().numpy()
+                # Aggregate overall + per-stratum
+                per_stratum = {}
+                for si, sn in enumerate(STRATUM_NAMES):
+                    m = valid_mask & (stratum_np == si)
+                    vs = taus[m]
+                    if len(vs) >= 3:
+                        per_stratum[sn] = {
+                            'n': int(len(vs)),
+                            'mean': float(vs.mean()),
+                            'q25': float(_np.percentile(vs, 25)),
+                            'q50': float(_np.percentile(vs, 50)),
+                            'q75': float(_np.percentile(vs, 75)),
+                        }
+                valid = taus[valid_mask]
+                if len(valid) > 0:
+                    probe['reveal_tau'] = {
+                        'K_cur': K_cur, 'n': int(len(valid)),
+                        'mean': float(valid.mean()),
+                        'q25': float(_np.percentile(valid, 25)),
+                        'q50': float(_np.percentile(valid, 50)),
+                        'q75': float(_np.percentile(valid, 75)),
+                        'min': float(valid.min()), 'max': float(valid.max()),
+                        'per_stratum': per_stratum,
+                    }
+                    # Pretty print: overall median + per-stratum medians
+                    strata_str = ' | '.join(
+                        f"{sn}={d['q50']:+.2f}(n{d['n']})"
+                        for sn, d in per_stratum.items())
+                    print(f"      [reveal-τ] K={K_cur} overall={probe['reveal_tau']['q50']:+.3f} "
+                          f"| {strata_str}")
         return probe
 
     model, dynamics = train_diffusion(
@@ -1325,6 +1643,7 @@ def train_model(mask_type, tokenizer, train_samples, test_samples, test_metas,
         grad_clip=GRAD_CLIP, weight_decay=WEIGHT_DECAY, ema_decay=EMA_DECAY,
         eval_fn=eval_fn, eval_every=EVAL_EVERY, log_every=LOG_EVERY,
         patience=PATIENCE,
+        sample_strata=sample_strata, stratum_names=stratum_names,
         init_state=init_state, device=device,
         use_amp=False if NO_AMP else None,
     )
@@ -1406,6 +1725,158 @@ def make_figures(all_dyn, all_final):
     fig.tight_layout()
     figs['depth_rarity'] = fig
 
+    COLORS = {'random': '#3498db', 'puma': '#8e44ad'}
+
+    # Fig: s_chain_len sweep — primary extreme axis
+    for dp in DECODE_POLICIES:
+        fig, ax = plt.subplots(figsize=(9, 5))
+        any_data = False
+        for mt, col, mk in [('random', COLORS['random'], 'o'),
+                             ('puma', COLORS['puma'], 's')]:
+            xs, ys = [], []
+            for L in S_CHAIN_SWEEP:
+                if L == 0:
+                    continue
+                r = all_final.get(f'{mt}_s_chain_sweep_{L}_{dp}')
+                if r is not None:
+                    xs.append(L); ys.append(r['accuracy'])
+            if xs:
+                ax.plot(xs, ys, f'-{mk}', color=col, label=mt, lw=2, markersize=9)
+                any_data = True
+        if any_data:
+            ax.set_xlabel('Min SUMMOD run length on critical chain')
+            ax.set_ylabel('Accuracy')
+            ax.set_title(f's_chain_len sweep — {dp} decode')
+            ax.legend(); ax.grid(alpha=0.3); ax.set_ylim(-0.05, 1.05)
+            fig.tight_layout(); figs[f's_chain_sweep_{dp}'] = fig
+        else:
+            plt.close(fig)
+
+    # Fig: Stratum loss trajectory
+    mts_with_strat = [mt for mt in MASK_TYPES
+                      if all_dyn.get(mt, {}).get('stratified_loss')]
+    if mts_with_strat:
+        nm = len(mts_with_strat)
+        fig, axes = plt.subplots(1, nm, figsize=(7 * nm, 5), squeeze=False)
+        axes = axes[0]
+        s_cmap = plt.cm.viridis
+        for ai, mt in enumerate(mts_with_strat):
+            dyn = all_dyn[mt]
+            sl = dyn['stratified_loss']
+            names = dyn.get('stratum_names', [])
+            S = len(names) if names else (len(sl[0]['per_stratum_loss']) if sl else 0)
+            ax = axes[ai]
+            xs = [e['iter'] for e in sl]
+            for si in range(S):
+                ys = [e['per_stratum_loss'][si] if e['per_stratum_n'][si] > 0 else None
+                      for e in sl]
+                label = names[si] if si < len(names) else f's{si}'
+                valid = [(x, y) for x, y in zip(xs, ys) if y is not None]
+                if valid:
+                    ax.plot([p[0] for p in valid], [p[1] for p in valid],
+                            '-', color=s_cmap(si / max(S - 1, 1)), label=label, lw=1.5)
+            ax.set_xlabel('Iteration'); ax.set_ylabel('Masked-token loss (training)')
+            ax.set_title(f'{mt}: stratum loss trajectory'); ax.set_yscale('log')
+            ax.legend(fontsize=8); ax.grid(alpha=0.3)
+        fig.suptitle('Training-time loss by s_chain_len stratum', y=1.02)
+        fig.tight_layout(); figs['stratum_loss'] = fig
+
+    # Fig: Stratified reveal-τ trajectory (PUMA only)
+    # Central diagnostic: alignment of PUMA's confidence-induced order with
+    # post-order, decomposed by how SUMMOD-heavy the critical chain is.
+    # s_chain_0-1 should trend toward +1 (post-order learned); s_chain_3+
+    # predicted to remain near 0 (misalignment = PUMA's failure mode).
+    puma_dyn = all_dyn.get('puma', {})
+    tau_pts = [c for c in puma_dyn.get('checkpoints', []) if 'reveal_tau' in c]
+    if tau_pts:
+        fig, ax = plt.subplots(figsize=(10, 5))
+        # Overall trajectory (shaded with IQR)
+        xs = [c['iter'] for c in tau_pts]
+        mids = [c['reveal_tau']['q50'] for c in tau_pts]
+        q25s = [c['reveal_tau']['q25'] for c in tau_pts]
+        q75s = [c['reveal_tau']['q75'] for c in tau_pts]
+        ax.fill_between(xs, q25s, q75s, alpha=0.2, color='#8e44ad', label='overall IQR')
+        ax.plot(xs, mids, '--', color='#5e2d6e', lw=1.5, label='overall median')
+        # Per-stratum trajectories
+        s_cmap = plt.cm.plasma
+        for si, sn in enumerate(STRATUM_NAMES):
+            xs_s, mids_s = [], []
+            for c in tau_pts:
+                ps = c['reveal_tau'].get('per_stratum', {}).get(sn)
+                if ps is not None:
+                    xs_s.append(c['iter'])
+                    mids_s.append(ps['q50'])
+            if xs_s:
+                ax.plot(xs_s, mids_s, '-o', color=s_cmap(si / max(len(STRATUM_NAMES) - 1, 1)),
+                        label=sn, lw=2, markersize=5)
+        ax.axhline(0, color='gray', ls=':', alpha=0.7, label='τ=0')
+        ax.axhline(1, color='green', ls='--', alpha=0.4, label='τ=+1 (post-order)')
+        ax.axhline(-1, color='red', ls='--', alpha=0.4, label='τ=−1 (reversed)')
+        ax.set_xlabel('Training iteration')
+        ax.set_ylabel('Kendall τ (reveal vs post-order), median per stratum')
+        ax.set_title('PUMA reveal-order alignment, stratified by s_chain_len')
+        ax.set_ylim(-1.05, 1.05); ax.legend(loc='best', fontsize=8); ax.grid(alpha=0.3)
+        fig.tight_layout(); figs['reveal_tau_stratified'] = fig
+
+    # Fig: Reveal by op on critical chain — S vs non-S
+    # Shows explicitly that PUMA defers SUMMOD positions relative to others.
+    extreme_key = None
+    for L in sorted(S_CHAIN_SWEEP, reverse=True):
+        if L == 0: continue
+        if any(f'{mt}_reveal_s_chain_{L}' in all_final for mt in MASK_TYPES):
+            extreme_key = f's_chain_{L}'; break
+    if extreme_key is None:
+        for L in sorted(CRITICAL_CHAIN_SWEEP, reverse=True):
+            if any(f'{mt}_reveal_critical_{L}' in all_final for mt in MASK_TYPES):
+                extreme_key = f'critical_{L}'; break
+    if extreme_key is not None:
+        mts_with_rev = [mt for mt in MASK_TYPES
+                        if f'{mt}_reveal_{extreme_key}' in all_final]
+        if mts_with_rev:
+            fig, axes = plt.subplots(1, len(mts_with_rev), figsize=(6 * len(mts_with_rev), 4),
+                                     squeeze=False)
+            axes = axes[0]
+            for ai, mt in enumerate(mts_with_rev):
+                rev = all_final[f'{mt}_reveal_{extreme_key}']
+                bop = rev.get('by_op_on_chain', {})
+                if not bop: continue
+                K = rev.get('K', REVEAL_K_DEFAULT)
+                ax = axes[ai]
+                stages = list(range(K))
+                for op_key, col in [('S', '#e74c3c'), ('non_S', '#2ecc71')]:
+                    if op_key in bop:
+                        ax.plot(stages, bop[op_key]['still_masked_per_stage'],
+                                '-o', color=col, lw=2, markersize=5,
+                                label=f"{op_key} (n={bop[op_key]['n_positions']})")
+                ax.set_xlabel(f'PUMA stage (K={K})')
+                ax.set_ylabel('Fraction still masked')
+                ax.set_title(f'{mt}: critical-chain reveal by op (N={rev["n"]})')
+                ax.set_ylim(-0.02, 1.02); ax.legend(); ax.grid(alpha=0.3)
+            fig.suptitle(f'Reveal trajectory on critical chain — {extreme_key}', y=1.02)
+            fig.tight_layout(); figs[f'reveal_by_op_{extreme_key}'] = fig
+
+        # Fig: Premature-reveal rate
+        fig, ax = plt.subplots(figsize=(8, 5))
+        bins_order = ['early', 'mid', 'late']
+        x = np.arange(len(bins_order)) if 'np' in dir() else [0, 1, 2]
+        # Fallback w/o numpy
+        import numpy as _np
+        x = _np.arange(len(bins_order))
+        width = 0.35
+        for mi, mt in enumerate(mts_with_rev):
+            rev = all_final[f'{mt}_reveal_{extreme_key}']
+            pr = rev.get('premature_rate', {})
+            rates = [pr.get(b, {}).get('rate', 0) for b in bins_order]
+            offset = -width / 2 + mi * width if len(mts_with_rev) == 2 else 0
+            ax.bar(x + offset, rates, width, label=mt,
+                   color=COLORS.get(mt, 'gray'), alpha=0.8)
+        ax.set_xticks(x); ax.set_xticklabels(bins_order)
+        ax.set_xlabel('Trace position bin')
+        ax.set_ylabel('Premature-reveal rate')
+        ax.set_title(f'Fraction of trace positions revealed before expected stage ({extreme_key})')
+        ax.legend(); ax.grid(alpha=0.3, axis='y'); ax.set_ylim(0, 1.05)
+        fig.tight_layout(); figs[f'premature_rate_{extreme_key}'] = fig
+
     return figs
 
 
@@ -1429,18 +1900,36 @@ def run(tag=''):
     print(f"{'=' * 70}\n")
 
     train_data, train_metas = gen_train_data(N_TRAIN, seed=SEED)
-    test_data, test_metas = gen_test_data(N_TEST, seed=SEED + 1000)
-    max_len = max(len(tok.encode(s)) for s in train_data + test_data)
+    max_len = max(len(tok.encode(s)) for s in train_data)
 
     # Print distribution info
     train_depths = [m['tree_depth'] for m in train_metas]
     train_traces = [m['trace_len'] for m in train_metas]
-    test_depths = [m['tree_depth'] for m in test_metas]
+    train_s_chains = [m.get('s_chain_len', 0) for m in train_metas]
     print(f"  Train depth dist: {dict(sorted(defaultdict(int, {d: train_depths.count(d) for d in set(train_depths)}).items()))}")
     print(f"  Train trace len: mean={sum(train_traces)/len(train_traces):.1f}, "
           f"max={max(train_traces)}, min={min(train_traces)}")
-    print(f"  Test depth dist:  {dict(sorted(defaultdict(int, {d: test_depths.count(d) for d in set(test_depths)}).items()))}")
-    print(f"  max_len={max_len}, vocab={tok.vocab_size}")
+    # s_chain_len distribution — the primary extreme axis. Paper argument rests
+    # on this distribution being skewed toward short runs, making long-run
+    # instances rare in training (analog of long carry chain rarity).
+    s_dist = defaultdict(int)
+    for s in train_s_chains:
+        if s >= 4: s_dist['4+'] += 1
+        else: s_dist[str(s)] += 1
+    print(f"  Train s_chain_len dist: {dict(sorted(s_dist.items()))}")
+    print(f"  vocab={tok.vocab_size}, max_len={max_len}")
+
+    # Unified test suite
+    suite = build_test_suite(tok, max_len, seed=SEED + 1000)
+    natural_samples = suite['natural']['samples']
+    natural_metas = suite['natural']['metas']
+    # Back-compat aliases for downstream code still using old names
+    test_data = natural_samples
+    test_metas = natural_metas
+    # Ensure max_len covers test suite too
+    suite_max = max(len(tok.encode(s)) for s in natural_samples) if natural_samples else 0
+    if suite_max > max_len:
+        print(f"  WARNING: suite samples exceed train max_len ({suite_max} > {max_len})")
 
     all_dyn = {}
     all_final = {}
@@ -1449,7 +1938,8 @@ def run(tag=''):
     # ── Main training ──
     for mt in MASK_TYPES:
         print(f"\n{'━' * 60}\n▶ {mt}\n{'━' * 60}")
-        m, d = train_model(mt, tok, train_data, test_data, test_metas, max_len)
+        m, d = train_model(mt, tok, train_data, train_metas,
+                           natural_samples, natural_metas, max_len)
         all_dyn[mt] = d
         saved_states[mt] = {k: v.cpu().clone() for k, v in m.state_dict().items()}
         save_checkpoint(exp_name, saved_states[mt], tag=mt)
@@ -1492,6 +1982,39 @@ def run(tag=''):
                     'accuracy': acc, 'n': len(cc),
                 }
                 print(f"    depth>={min_d} {dp}: {acc:.4f}")
+
+        # s_chain_len sweep from suite — primary extreme axis
+        print(f"  s_chain_len sweep...")
+        for L in S_CHAIN_SWEEP:
+            if L == 0: continue
+            key = f's_chain_{L}'
+            if key not in suite['constructed']:
+                continue
+            bucket = suite['constructed'][key]
+            for dp in DECODE_POLICIES:
+                ps = gen_eval_with_stats(m, tok, bucket['samples'], bucket['metas'],
+                                         max_len, decode_policy=dp, device=DEVICE)
+                acc = sum(r['trace_correct'] for r in ps) / len(ps)
+                all_final[f'{mt}_s_chain_sweep_{L}_{dp}'] = {
+                    'accuracy': acc, 'n': len(ps),
+                }
+                print(f"    s_chain>={L} {dp}: {acc:.4f}")
+
+        # Critical chain sweep from suite
+        print(f"  critical_chain sweep...")
+        for L in CRITICAL_CHAIN_SWEEP:
+            key = f'critical_{L}'
+            if key not in suite['constructed']:
+                continue
+            bucket = suite['constructed'][key]
+            for dp in DECODE_POLICIES:
+                ps = gen_eval_with_stats(m, tok, bucket['samples'], bucket['metas'],
+                                         max_len, decode_policy=dp, device=DEVICE)
+                acc = sum(r['trace_correct'] for r in ps) / len(ps)
+                all_final[f'{mt}_critical_sweep_{L}_{dp}'] = {
+                    'accuracy': acc, 'n': len(ps),
+                }
+                print(f"    critical>={L} {dp}: {acc:.4f}")
 
         # Depth OOD (beyond training distribution)
         print(f"  Depth OOD...")
@@ -1567,13 +2090,31 @@ def run(tag=''):
         print(f"    Rarity corr: {rarity['corr']:.3f}"
               if rarity['corr'] else "    Rarity corr: N/A")
 
-        # PUMA coverage (puma only)
-        if mt == 'puma':
-            cov = simulate_puma_coverage(m, tok, test_data, test_metas, max_len,
-                                         device=DEVICE)
-            all_final[f'{mt}_coverage'] = cov
-            print(f"    Coverage corr: {cov['corr']:.3f}"
-                  if cov['corr'] else "    Coverage corr: N/A")
+        # Reveal trajectory on extreme s_chain bucket — PUMA failure diagnostic.
+        # Pick the highest available s_chain bucket.
+        extreme_key = None
+        for L in sorted(S_CHAIN_SWEEP, reverse=True):
+            if f's_chain_{L}' in suite['constructed']:
+                extreme_key = f's_chain_{L}'
+                break
+        if extreme_key is None:
+            # fallback to longest critical chain
+            for L in sorted(CRITICAL_CHAIN_SWEEP, reverse=True):
+                if f'critical_{L}' in suite['constructed']:
+                    extreme_key = f'critical_{L}'
+                    break
+        if extreme_key is not None:
+            K_for_reveal = PUMA_K_END if PUMA_K_END else PUMA_K
+            rev = analyse_reveal_patterns(
+                m, tok, suite['constructed'][extreme_key], max_len,
+                K=K_for_reveal, tau=PUMA_TAU, device=DEVICE)
+            all_final[f'{mt}_reveal_{extreme_key}'] = rev
+            if 'premature_rate' in rev:
+                parts = [f"{b}={rev['premature_rate'][b]['rate']:.3f}"
+                         for b in ['early', 'mid', 'late']
+                         if b in rev['premature_rate']]
+                print(f"    Reveal on {extreme_key}: n={rev.get('n', 0)}, "
+                      f"premature {' '.join(parts)}")
 
         # Confidence calibration
         cal = analyse_confidence_calibration(m, tok, test_data, test_metas, max_len,
@@ -1597,7 +2138,8 @@ def run(tag=''):
             label = f'{src}_to_{tgt}'
             print(f"\n{'━' * 60}\n▶ Continuation: {label} "
                   f"({CONTINUATION_ITERS} iters)\n{'━' * 60}")
-            m, d = train_model(tgt, tok, train_data, test_data, test_metas,
+            m, d = train_model(tgt, tok, train_data, train_metas,
+                               test_data, test_metas,
                                max_len, max_iters=CONTINUATION_ITERS,
                                init_state=saved_states[src])
             all_dyn[label] = d
@@ -1638,8 +2180,12 @@ def run(tag=''):
         ]},
     }
     for k, v in all_dyn.items():
-        sd[f'dyn_{k}'] = {'checkpoints': v['checkpoints'],
-                          'train_loss': v['train_loss']}
+        sd[f'dyn_{k}'] = {
+            'checkpoints': v['checkpoints'],
+            'train_loss': v['train_loss'],
+            'stratified_loss': v.get('stratified_loss', []),
+            'stratum_names': v.get('stratum_names', []),
+        }
     for k, v in all_final.items():
         sd[f'final_{k}'] = v
     save_results(exp_name, sd, figures=figs)

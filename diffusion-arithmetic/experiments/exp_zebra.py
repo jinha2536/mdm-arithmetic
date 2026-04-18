@@ -44,7 +44,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 from core.train_utils import (
     mount_drive, save_results, save_checkpoint,
     train_diffusion, puma_k_fixed, puma_k_linear, puma_k_step,
-    generate_diffusion, DEVICE,
+    generate_diffusion, simulate_reveal_trajectory, compute_reveal_vs_order_tau,
+    DEVICE,
 )
 
 EXP_NAME = 'exp_zebra'
@@ -60,6 +61,8 @@ MAX_SEQ_LEN = 600           # total sequence length cap (same as Shah et al.)
 # Training
 N_TRAIN = None              # None = use all
 N_TEST = 2000; BATCH_SIZE = 64
+# Per-bucket count for constructed test subsets (puzzle size, solver-difficulty)
+N_PER_BUCKET = 500
 MAX_ITERS = 500000; EVAL_EVERY = 5000; LOG_EVERY = 1000
 GEN_EVAL_EVERY = 20000; GEN_EVAL_N = 500
 MASK_TYPES = ['random', 'puma']
@@ -82,12 +85,27 @@ DATA_DIR = 'experiments/data'
 TRAIN_FILE = 'zebra-train-data.pkl'
 TEST_FILE = 'zebra-test-data.pkl'
 
-# Rainbow padding tokens (word-level)
-RAINBOW_WORDS = [f'R{i}' for i in range(16)]  # R0, R1, ..., R15
+# Rainbow padding — reduced from 16 → 7 per empirical observation (Dueun):
+# small word counts (5~7) are sufficient for LLaDA-scale vocabularies;
+# more yields little improvement. With 7 rainbow words, each pad position
+# token repeats ~13×/sample in 3×3 puzzles (93 pads / 7), enough for the
+# model to learn the padding pattern without overwhelming actual cell training.
+N_RAINBOW = 7
+RAINBOW_WORDS = [f'R{i}' for i in range(N_RAINBOW)]
 EOS_WORD = 'EOS'
 MASK_WORD = '[MASK]'
 PAD_WORD = '[PAD]'
 ANSWER_WORD = 'ANSWER'
+
+# Reveal trajectory / reveal-τ diagnostic (PUMA only, extreme-puzzle subset)
+# Reasoning order for zebra = solver order (item[2] from data). τ measures
+# whether PUMA's confidence-induced reveal order aligns with the deduction
+# order a symbolic solver would follow.
+REVEAL_K_DEFAULT = 16         # overridden to PUMA K_final at runtime
+REVEAL_TAU_MIN_SIZE = 5       # track puzzles with n_houses >= this (harder instances)
+REVEAL_TAU_N_TRACKED = 100
+REVEAL_TAU_EVERY = 20000
+REVEAL_TAU_K_THRESHOLD_FRAC = 0.7
 
 
 def parse_args():
@@ -289,7 +307,15 @@ def format_samples(raw_samples, max_ans_tokens=None):
 
     Returns:
         formatted: list of word-token lists (clue + ANSWER + solution_padded)
-        metas: list of metadata dicts
+        metas: list of metadata dicts.
+
+    Note on solver order:
+        The dataset's solution_tokens are already laid out in solver order.
+        Each cell's 3 tokens (row, col, val) share the same solver step rank.
+        We store `reasoning_rank[j]` = floor(j/3) for j < n_sol, and a high
+        dummy rank (max_ans_tokens) for padding — downstream reveal-τ uses
+        blank_masks to exclude padding anyway, but the dummy fill keeps
+        tensor shapes regular.
     """
     if max_ans_tokens is None:
         max_ans_tokens = MAX_ANS_TOKENS
@@ -306,21 +332,20 @@ def format_samples(raw_samples, max_ans_tokens=None):
         # Position types for answer region: loc (row/col) vs val
         n_sol = len(s['solution_tokens'])
         pos_types = []
+        reasoning_rank = []
         for ci in range(max_ans_tokens):
             if ci < n_sol:
                 pos_in_triplet = ci % 3  # 0=row, 1=col, 2=val
                 pos_types.append('loc' if pos_in_triplet < 2 else 'val')
+                reasoning_rank.append(ci // 3)  # cell index (= solver step)
             else:
                 pos_types.append('pad')
+                reasoning_rank.append(max_ans_tokens)  # dummy high rank
 
-        # Solver step for each answer token (which cell, in order)
-        solver_steps = []
-        for ci in range(max_ans_tokens):
-            if ci < n_sol:
-                cell_idx = ci // 3   # which cell (0-based)
-                solver_steps.append(cell_idx)
-            else:
-                solver_steps.append(-1)
+        # Solver step for each answer token (which cell, in order).
+        # Same as reasoning_rank but with -1 for padding.
+        solver_steps = [(ci // 3) if ci < n_sol else -1
+                        for ci in range(max_ans_tokens)]
 
         meta = {
             'n_houses': s['n_houses'],
@@ -329,8 +354,9 @@ def format_samples(raw_samples, max_ans_tokens=None):
             'n_sol_tokens': n_sol,
             'solution_grid': s['solution_grid'],
             'solver_order': s['solver_order'],
-            'pos_types': pos_types,       # 'loc' | 'val' | 'pad'
-            'solver_steps': solver_steps,  # cell index per token
+            'pos_types': pos_types,             # 'loc' | 'val' | 'pad'
+            'solver_steps': solver_steps,        # cell index per token, -1 for pad
+            'reasoning_rank': reasoning_rank,    # [max_ans_tokens] — solver step rank per answer pos
             'triplets': s['triplets'],
             'clue_len': len(s['clue_tokens']),
         }
@@ -352,6 +378,15 @@ def encode_zebra_samples(formatted_samples, tokenizer, max_len):
     Returns:
         ids: (N, max_len) int64 tensor
         ans_starts: (N,) int64 tensor — index of first answer token
+
+    Note on padding philosophy:
+        The answer region (length MAX_ANS_TOKENS, fixed) is entirely part of
+        the diffusion target. Rainbow padding fills the region after the
+        actual solution with diverse tokens (EOS, R0, R1, ..., RAINBOW_WORDS[-1])
+        so that padding does not concentrate probability mass on a single
+        learnable-by-position constant. This matches the PUMA paper's
+        treatment where EOS is identified with PAD and the whole fixed-length
+        answer region participates in masking/restoration.
     """
     pad_id = tokenizer.special_ids['pad']
     N = len(formatted_samples)
@@ -369,6 +404,106 @@ def encode_zebra_samples(formatted_samples, tokenizer, max_len):
                 ans_starts[i] = j + 1
                 break
     return ids, ans_starts
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Unified test suite — all analyses slice from here
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+def _bucket_from_items(formatted, metas, tokenizer, max_len):
+    """Package a (formatted, metas) pair with encoded ids for batched analysis."""
+    if not formatted:
+        return {'formatted': [], 'metas': [],
+                'ids': torch.empty(0, max_len, dtype=torch.long),
+                'ans_starts': torch.empty(0, dtype=torch.long), 'n': 0}
+    ids, ans = encode_zebra_samples(formatted, tokenizer, max_len)
+    return {
+        'formatted': formatted, 'metas': metas,
+        'ids': ids, 'ans_starts': ans, 'n': len(formatted),
+    }
+
+
+def build_test_suite(formatted_all, metas_all, tokenizer, max_len):
+    """Unified test suite for zebra: slices from the full test set.
+
+    Structure:
+        suite['natural']:                 all test samples (up to N_TEST)
+        suite['constructed']['size_N']:   puzzles with n_houses == N
+        suite['constructed']['hard']:     largest puzzle size (n_houses=MAX_N)
+                                          or difficulty-filtered if available
+    All slicing is index-based (no regeneration), preserving the same samples
+    across analyses for cross-referencing.
+    """
+    n_full = min(len(formatted_all), N_TEST)
+    suite = {
+        'natural': _bucket_from_items(
+            formatted_all[:n_full], metas_all[:n_full], tokenizer, max_len),
+        'constructed': {},
+    }
+
+    # Per-size buckets
+    for size in [3, 4, 5, 6]:
+        idx = [i for i, m in enumerate(metas_all[:n_full])
+               if m['n_houses'] == size]
+        if not idx:
+            continue
+        idx = idx[:N_PER_BUCKET]
+        suite['constructed'][f'size_{size}'] = _bucket_from_items(
+            [formatted_all[i] for i in idx],
+            [metas_all[i] for i in idx],
+            tokenizer, max_len)
+
+    # Hardest bucket: largest puzzles (primary extreme axis for zebra)
+    for size in [MAX_N, MAX_N - 1]:
+        key = f'size_{size}'
+        if key in suite['constructed'] and suite['constructed'][key]['n'] >= 50:
+            suite['constructed']['hard'] = suite['constructed'][key]
+            break
+
+    print(f"  Zebra test suite built:")
+    print(f"    natural: {suite['natural']['n']}")
+    for k, v in suite['constructed'].items():
+        print(f"    constructed/{k}: {v['n']}")
+    return suite
+
+
+def filter_natural(suite, pred):
+    """Filter natural bucket by predicate on meta; return same-shape bucket."""
+    nat = suite['natural']
+    idx = [i for i, m in enumerate(nat['metas']) if pred(m)]
+    if not idx:
+        return {'formatted': [], 'metas': [],
+                'ids': torch.empty(0, nat['ids'].shape[1], dtype=torch.long),
+                'ans_starts': torch.empty(0, dtype=torch.long), 'n': 0}
+    return {
+        'formatted': [nat['formatted'][i] for i in idx],
+        'metas': [nat['metas'][i] for i in idx],
+        'ids': nat['ids'][idx],
+        'ans_starts': nat['ans_starts'][idx],
+        'n': len(idx),
+    }
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Training strata — by puzzle size (proxy for difficulty)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+STRATUM_BOUNDS_SIZE = [(3, 4), (4, 5), (5, 6), (6, 7)]
+STRATUM_NAMES = ['size_3', 'size_4', 'size_5', 'size_6']
+
+
+def _size_to_stratum(n_houses):
+    for i, (lo, hi) in enumerate(STRATUM_BOUNDS_SIZE):
+        if lo <= n_houses < hi:
+            return i
+    return len(STRATUM_BOUNDS_SIZE) - 1
+
+
+def build_training_strata(train_metas):
+    """Per-sample stratum id by puzzle size (n_houses)."""
+    strata = [_size_to_stratum(m['n_houses']) for m in train_metas]
+    counts = [strata.count(i) for i in range(len(STRATUM_NAMES))]
+    return torch.tensor(strata, dtype=torch.long), STRATUM_NAMES, counts
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -568,6 +703,117 @@ def probe_per_position(model, tokenizer, formatted_samples, metas,
     for k, (c, t) in step_acc.items():
         result[f'acc_step_{k}'] = c / max(t, 1)
     return result
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Reveal trajectory analysis — PUMA-specific failure diagnostic
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+@torch.no_grad()
+def analyse_reveal_patterns(model, tokenizer, bucket, max_len,
+                             K=REVEAL_K_DEFAULT, tau=PUMA_TAU, device=None):
+    """Analyze PUMA reveal patterns on extreme puzzles.
+
+    Aggregates over answer-region positions:
+      (a) still-masked fraction per PUMA stage, by solver-step bin (early/mid/late)
+      (b) per-solver-step mean reveal stage
+      (c) never-revealed fraction per answer position
+      (d) premature-reveal rate: fraction of (example, cell) where the cell is
+          revealed BEFORE its solver step is reached.
+
+    The premature-reveal rate is the central zebra diagnostic: solver orders
+    are instance-specific, so a model that reveals cells before the solver
+    would have deduced them is committing on insufficient evidence.
+    """
+    if device is None:
+        device = DEVICE
+    if bucket['n'] == 0:
+        return {'n': 0}
+
+    # blank_masks = all True for zebra (full answer region is diffusion target)
+    N = bucket['n']
+    blank_masks = torch.ones(N, MAX_ANS_TOKENS, dtype=torch.bool)
+
+    traj = simulate_reveal_trajectory(
+        model, tokenizer, bucket['ids'], bucket['ans_starts'], MAX_ANS_TOKENS,
+        blank_masks=blank_masks, K=K, tau=tau, device=device)
+
+    rs = traj['reveal_stage']           # [N, MAX_ANS_TOKENS]
+    smm = traj['still_masked_start']    # [N, K+1, MAX_ANS_TOKENS]
+
+    # (a) still-masked per stage, binned by solver-step third (early/mid/late)
+    bins_acc = {'early': [], 'mid': [], 'late': [], 'pad': []}
+    for i, meta in enumerate(bucket['metas']):
+        n_cells = meta['n_cells']
+        solver_steps = meta['solver_steps']
+        for j in range(MAX_ANS_TOKENS):
+            cell_idx = solver_steps[j]
+            if cell_idx < 0:
+                bins_acc['pad'].append(smm[i, :K, j].float())
+            elif cell_idx < n_cells // 3:
+                bins_acc['early'].append(smm[i, :K, j].float())
+            elif cell_idx < 2 * n_cells // 3:
+                bins_acc['mid'].append(smm[i, :K, j].float())
+            else:
+                bins_acc['late'].append(smm[i, :K, j].float())
+    by_step_bin = {}
+    for b, xs in bins_acc.items():
+        if xs:
+            by_step_bin[b] = {
+                'still_masked_per_stage': torch.stack(xs).mean(dim=0).tolist(),
+                'n_positions': len(xs),
+            }
+
+    # (b) per-solver-step mean reveal stage, indexed by solver step rank
+    # (x = solver step rank, y = avg PUMA stage at which that cell gets revealed)
+    step_reveals = defaultdict(list)   # solver_step → list of reveal stages
+    for i, meta in enumerate(bucket['metas']):
+        solver_steps = meta['solver_steps']
+        for j in range(MAX_ANS_TOKENS):
+            cs = solver_steps[j]
+            if cs >= 0:
+                step_reveals[cs].append(float(rs[i, j]))
+    solver_to_reveal = [
+        {'solver_step': k, 'mean_reveal_stage': sum(v) / len(v), 'n': len(v)}
+        for k, v in sorted(step_reveals.items())
+    ]
+
+    # (c) never-revealed per position
+    never = (rs >= K).float().mean(dim=0).tolist()
+
+    # (d) premature-reveal rate — fraction of cells revealed before solver
+    # would have deduced them. For each (example, cell), premature if the
+    # reveal stage of any cell token is earlier than expected given solver step.
+    # Normalize expected stage as solver_step / n_cells * K.
+    premature_per_bin = {'early': [0, 0], 'mid': [0, 0], 'late': [0, 0]}
+    for i, meta in enumerate(bucket['metas']):
+        n_cells = meta['n_cells']
+        solver_steps = meta['solver_steps']
+        for j in range(MAX_ANS_TOKENS):
+            cs = solver_steps[j]
+            if cs < 0:
+                continue
+            expected_stage = cs / max(n_cells - 1, 1) * (K - 1)
+            actual_stage = float(rs[i, j])
+            # Premature: decoded noticeably before expected (threshold: 1 stage early)
+            is_premature = actual_stage < expected_stage - 1
+            if cs < n_cells // 3: bin_name = 'early'
+            elif cs < 2 * n_cells // 3: bin_name = 'mid'
+            else: bin_name = 'late'
+            premature_per_bin[bin_name][0] += int(is_premature)
+            premature_per_bin[bin_name][1] += 1
+    premature_rate = {
+        b: {'rate': c / max(t, 1), 'n': t}
+        for b, (c, t) in premature_per_bin.items() if t > 0
+    }
+
+    return {
+        'n': N, 'K': K, 'tau': tau,
+        'by_solver_step_bin': by_step_bin,
+        'solver_to_reveal': solver_to_reveal,
+        'never_revealed': never,
+        'premature_rate': premature_rate,
+    }
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -818,9 +1064,16 @@ def eval_selective_mask(model, tokenizer, formatted_samples, metas, max_len,
 # Training wrapper
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-def train_model(mask_type, tokenizer, train_formatted, test_formatted, test_metas,
-                max_len, max_iters=None, init_state=None, device=None):
-    """Wrapper around train_diffusion for Zebra experiment."""
+def train_model(mask_type, tokenizer, train_formatted, train_metas,
+                test_formatted, test_metas, max_len,
+                max_iters=None, init_state=None, device=None):
+    """Wrapper around train_diffusion for Zebra experiment.
+
+    Adds training-side diagnostics:
+      - per-puzzle-size stratum training-loss trajectory (both mask types)
+      - reveal-vs-solver-order Kendall τ on a tracked extreme-puzzle subset
+        (PUMA only, activated once K_cur reaches ~70% of K_final)
+    """
     if device is None:
         device = DEVICE
     if max_iters is None:
@@ -828,6 +1081,60 @@ def train_model(mask_type, tokenizer, train_formatted, test_formatted, test_meta
 
     train_ids, train_ans = encode_zebra_samples(train_formatted, tokenizer, max_len)
     train_ids, train_ans = train_ids.to(device), train_ans.to(device)
+
+    # Training strata (puzzle size buckets)
+    sample_strata, stratum_names, stratum_counts = build_training_strata(train_metas)
+    print(f"  Training strata counts: " +
+          ', '.join(f"{n}={c}" for n, c in zip(stratum_names, stratum_counts)))
+
+    # ── Reveal-τ tracked subset (PUMA only) ──
+    # Pick tracked samples from the LARGEST puzzle size present in train set.
+    # Reasoning order = solver order, which is exactly the answer-position
+    # order since solution tokens are laid out in solver order by the dataset.
+    # Each cell's 3 tokens share the same reasoning rank (cell index = j // 3).
+    reveal_tracked_ids = None
+    reveal_tracked_ans = None
+    reveal_reasoning_order = None
+    reveal_blanks = None
+    reveal_tracked_strata = None
+    if mask_type == 'puma':
+        # Per-stratum tracked indices — one trajectory per puzzle size.
+        # Paper claim: size_3 (easiest) should converge toward τ ≈ +1 (solver
+        # order learned); size_6 (hardest) should plateau near τ ≈ 0 (the 0%
+        # PUMA case, solver order unlearnable due to instance-specific nature).
+        per_stratum_cap = max(REVEAL_TAU_N_TRACKED // len(STRATUM_NAMES), 10)
+        tracked_by_stratum = {sn: [] for sn in STRATUM_NAMES}
+        for i, m in enumerate(train_metas):
+            si = _size_to_stratum(m['n_houses'])
+            sn = STRATUM_NAMES[si]
+            if len(tracked_by_stratum[sn]) < per_stratum_cap:
+                tracked_by_stratum[sn].append((i, si))
+        tracked_flat = [t for v in tracked_by_stratum.values() for t in v]
+        strata_counts = {sn: len(v) for sn, v in tracked_by_stratum.items()}
+        if sum(strata_counts.values()) >= 30:
+            tracked = [t[0] for t in tracked_flat]
+            tracked_strata = [t[1] for t in tracked_flat]
+            reveal_tracked_ids = train_ids[tracked]
+            reveal_tracked_ans = train_ans[tracked]
+            reveal_tracked_strata = torch.tensor(tracked_strata, dtype=torch.long)
+            N_tr = len(tracked)
+            ro = torch.full((N_tr, MAX_ANS_TOKENS), MAX_ANS_TOKENS, dtype=torch.long)
+            bm = torch.zeros(N_tr, MAX_ANS_TOKENS, dtype=torch.bool)
+            for i, idx in enumerate(tracked):
+                meta = train_metas[idx]
+                rr = meta['reasoning_rank']
+                for j in range(MAX_ANS_TOKENS):
+                    ro[i, j] = rr[j]
+                # Only include actual solution tokens (not rainbow pad).
+                n_sol = meta['n_sol_tokens']
+                bm[i, :min(n_sol, MAX_ANS_TOKENS)] = True
+            reveal_reasoning_order = ro
+            reveal_blanks = bm
+            print(f"  Reveal-τ tracking (stratified): total={N_tr}, by stratum: " +
+                  ', '.join(f"{sn}={c}" for sn, c in strata_counts.items() if c > 0))
+        else:
+            print(f"  Reveal-τ tracking: SKIPPED "
+                  f"(total tracked < 30: {strata_counts})")
 
     # PUMA K schedule
     k_sched = None
@@ -846,6 +1153,7 @@ def train_model(mask_type, tokenizer, train_formatted, test_formatted, test_meta
         else:
             k_sched = puma_k_fixed(PUMA_K)
             print(f"  PUMA K: fixed {PUMA_K}")
+    K_final_for_tau = k_sched(max_iters) if k_sched else None
 
     def eval_fn(model, it, tg):
         probe = probe_per_position(model, tokenizer, test_formatted, test_metas,
@@ -862,7 +1170,6 @@ def train_model(mask_type, tokenizer, train_formatted, test_formatted, test_meta
                   f"tok={r['token_accuracy']:.3f}")
             if 'concordance_l2r' in r:
                 print(f"      [conc] L2R={r['concordance_l2r']:.3f}")
-            # Per-size breakdown
             for n_h in [3, 4, 5, 6]:
                 k = f'acc_size_{n_h}'
                 if k in r:
@@ -870,6 +1177,49 @@ def train_model(mask_type, tokenizer, train_formatted, test_formatted, test_meta
             probe['gen_accuracy'] = r['accuracy']
             probe['gen_cell_accuracy'] = r['cell_accuracy']
             probe['gen_concordance_l2r'] = r.get('concordance_l2r')
+
+        # Reveal-τ (PUMA only, past K threshold) — stratified by puzzle size
+        if (reveal_tracked_ids is not None and it > 0
+                and it % REVEAL_TAU_EVERY == 0 and K_final_for_tau is not None):
+            K_cur = k_sched(it)
+            if K_cur >= K_final_for_tau * REVEAL_TAU_K_THRESHOLD_FRAC:
+                traj = simulate_reveal_trajectory(
+                    model, tokenizer, reveal_tracked_ids, reveal_tracked_ans,
+                    MAX_ANS_TOKENS,
+                    blank_masks=reveal_blanks, K=K_cur, tau=PUMA_TAU,
+                    batch_size=32, device=device)
+                taus = compute_reveal_vs_order_tau(
+                    traj['reveal_stage'], reveal_reasoning_order, reveal_blanks)
+                valid_mask = ~np.isnan(taus)
+                stratum_np = reveal_tracked_strata.cpu().numpy()
+                per_stratum = {}
+                for si, sn in enumerate(STRATUM_NAMES):
+                    m = valid_mask & (stratum_np == si)
+                    vs = taus[m]
+                    if len(vs) >= 3:
+                        per_stratum[sn] = {
+                            'n': int(len(vs)),
+                            'mean': float(vs.mean()),
+                            'q25': float(np.percentile(vs, 25)),
+                            'q50': float(np.percentile(vs, 50)),
+                            'q75': float(np.percentile(vs, 75)),
+                        }
+                valid = taus[valid_mask]
+                if len(valid) > 0:
+                    probe['reveal_tau'] = {
+                        'K_cur': K_cur, 'n': int(len(valid)),
+                        'mean': float(valid.mean()),
+                        'q25': float(np.percentile(valid, 25)),
+                        'q50': float(np.percentile(valid, 50)),
+                        'q75': float(np.percentile(valid, 75)),
+                        'min': float(valid.min()), 'max': float(valid.max()),
+                        'per_stratum': per_stratum,
+                    }
+                    strata_str = ' | '.join(
+                        f"{sn}={d['q50']:+.2f}(n{d['n']})"
+                        for sn, d in per_stratum.items())
+                    print(f"      [reveal-τ] K={K_cur} overall={probe['reveal_tau']['q50']:+.3f} "
+                          f"| {strata_str}")
         return probe
 
     model, dynamics = train_diffusion(
@@ -885,6 +1235,7 @@ def train_model(mask_type, tokenizer, train_formatted, test_formatted, test_meta
         grad_clip=GRAD_CLIP, weight_decay=WEIGHT_DECAY, ema_decay=EMA_DECAY,
         eval_fn=eval_fn, eval_every=EVAL_EVERY, log_every=LOG_EVERY,
         patience=PATIENCE,
+        sample_strata=sample_strata, stratum_names=stratum_names,
         init_state=init_state, device=device,
         use_amp=False if NO_AMP else None,
     )
@@ -892,8 +1243,168 @@ def train_model(mask_type, tokenizer, train_formatted, test_formatted, test_meta
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# Main run
+# Figures
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+def make_figures(all_dyn, all_final):
+    """Generate zebra-specific figures.
+
+    Fig 1: Accuracy × puzzle size (per decode policy) — primary extreme axis
+    Fig 2: Stratum loss trajectory — training-side diagnostic
+    Fig 3: Reveal heatmap on hard bucket, by solver-step bin × PUMA stage
+    Fig 4: Reveal-vs-solver-order Kendall τ trajectory (PUMA only)
+    Fig 5: Premature-reveal rate by solver-step bin
+    """
+    figs = {}
+    COLORS = {'random': '#3498db', 'puma': '#8e44ad'}
+
+    # Fig 1: Accuracy × puzzle size (primary extreme axis)
+    for dp in DECODE_POLICIES:
+        fig, ax = plt.subplots(figsize=(9, 5))
+        sizes = [3, 4, 5, 6]
+        for mt, col, mk in [('random', COLORS['random'], 'o'),
+                             ('puma', COLORS['puma'], 's')]:
+            r = all_final.get(f'{mt}_{dp}')
+            if r is None: continue
+            xs, ys, cs = [], [], []
+            for sz in sizes:
+                acc_key = f'acc_size_{sz}'
+                cell_key = f'cell_acc_size_{sz}'
+                if acc_key in r:
+                    xs.append(sz); ys.append(r[acc_key])
+                    cs.append(r.get(cell_key))
+            if xs:
+                ax.plot(xs, ys, f'-{mk}', color=col, label=f'{mt} (full puzzle)',
+                        lw=2, markersize=10)
+                # Cell-level accuracy as dashed line on same axes
+                if all(c is not None for c in cs):
+                    ax.plot(xs, cs, f'--{mk}', color=col, alpha=0.5,
+                            label=f'{mt} (cell)', lw=1.5, markersize=8)
+        ax.set_xlabel('Puzzle size (n_houses)')
+        ax.set_ylabel('Accuracy')
+        ax.set_title(f'Accuracy × puzzle size — {dp} decode')
+        ax.set_xticks(sizes); ax.set_ylim(-0.05, 1.05)
+        ax.legend(fontsize=9); ax.grid(alpha=0.3)
+        fig.tight_layout(); figs[f'size_sweep_{dp}'] = fig
+
+    # Fig 2: Stratum loss trajectory — training-side
+    mts_with_strat = [mt for mt in MASK_TYPES
+                      if all_dyn.get(mt, {}).get('stratified_loss')]
+    if mts_with_strat:
+        nm = len(mts_with_strat)
+        fig, axes = plt.subplots(1, nm, figsize=(7 * nm, 5), squeeze=False)
+        axes = axes[0]
+        s_cmap = plt.cm.viridis
+        for ai, mt in enumerate(mts_with_strat):
+            dyn = all_dyn[mt]
+            sl = dyn['stratified_loss']
+            names = dyn.get('stratum_names', [])
+            S = len(names) if names else (len(sl[0]['per_stratum_loss']) if sl else 0)
+            ax = axes[ai]
+            xs = [e['iter'] for e in sl]
+            for si in range(S):
+                ys = [e['per_stratum_loss'][si] if e['per_stratum_n'][si] > 0 else None
+                      for e in sl]
+                label = names[si] if si < len(names) else f's{si}'
+                valid = [(x, y) for x, y in zip(xs, ys) if y is not None]
+                if valid:
+                    ax.plot([p[0] for p in valid], [p[1] for p in valid],
+                            '-', color=s_cmap(si / max(S - 1, 1)), label=label, lw=1.5)
+            ax.set_xlabel('Iteration'); ax.set_ylabel('Masked-token loss (training)')
+            ax.set_title(f'{mt}: stratum loss trajectory'); ax.set_yscale('log')
+            ax.legend(fontsize=8); ax.grid(alpha=0.3)
+        fig.suptitle('Training-time loss by puzzle-size stratum', y=1.02)
+        fig.tight_layout(); figs['stratum_loss'] = fig
+
+    # Fig 3: Reveal heatmap on hard bucket, by solver-step bin × PUMA stage
+    # For each mask type, aggregate still-masked fraction per (bin, stage) cell.
+    mts_with_rev = [mt for mt in MASK_TYPES
+                    if f'{mt}_reveal_hard' in all_final
+                    and all_final[f'{mt}_reveal_hard'].get('by_solver_step_bin')]
+    if mts_with_rev:
+        nm = len(mts_with_rev)
+        fig, axes = plt.subplots(1, nm, figsize=(6 * nm, 4), squeeze=False)
+        axes = axes[0]
+        bins_order = ['early', 'mid', 'late', 'pad']
+        for ai, mt in enumerate(mts_with_rev):
+            rev = all_final[f'{mt}_reveal_hard']
+            bsb = rev['by_solver_step_bin']
+            K = rev.get('K', REVEAL_K_DEFAULT)
+            rows = [b for b in bins_order if b in bsb]
+            if not rows: continue
+            mat = np.array([bsb[b]['still_masked_per_stage'] for b in rows])
+            ax = axes[ai]
+            im = ax.imshow(mat, aspect='auto', origin='lower', cmap='Reds',
+                           vmin=0, vmax=1, interpolation='nearest')
+            ax.set_yticks(range(len(rows))); ax.set_yticklabels(rows)
+            ax.set_xlabel(f'PUMA stage (K={K})')
+            ax.set_ylabel('Solver-step bin')
+            ax.set_title(f'{mt}: still-masked (hard bucket, N={rev["n"]})')
+            plt.colorbar(im, ax=ax, label='still masked')
+        fig.suptitle('Reveal trajectory — hard bucket (largest puzzle size)', y=1.02)
+        fig.tight_layout(); figs['reveal_hard'] = fig
+
+    # Fig 4: Reveal-vs-solver-order Kendall τ trajectory (PUMA only)
+    # Fig 4: Reveal-vs-solver-order Kendall τ trajectory (PUMA only, stratified).
+    # Central training-time diagnostic for zebra. Paper claim:
+    #   size_3 (easy)  → τ trending toward +1 (solver order learned)
+    #   size_6 (hard)  → τ staying near 0 (solver order unlearnable, the 0% case)
+    # When both are on one figure, the gap directly visualizes "PUMA fails
+    # at the extreme case" — the reviewer sees the failure class.
+    puma_dyn = all_dyn.get('puma', {})
+    tau_pts = [c for c in puma_dyn.get('checkpoints', []) if 'reveal_tau' in c]
+    if tau_pts:
+        fig, ax = plt.subplots(figsize=(10, 5))
+        # Overall IQR shaded
+        xs = [c['iter'] for c in tau_pts]
+        mids = [c['reveal_tau']['q50'] for c in tau_pts]
+        q25s = [c['reveal_tau']['q25'] for c in tau_pts]
+        q75s = [c['reveal_tau']['q75'] for c in tau_pts]
+        ax.fill_between(xs, q25s, q75s, alpha=0.2, color=COLORS['puma'], label='overall IQR')
+        ax.plot(xs, mids, '--', color='#5e2d6e', lw=1.5, label='overall median')
+        # Per-stratum (puzzle size) trajectories
+        s_cmap = plt.cm.plasma
+        for si, sn in enumerate(STRATUM_NAMES):
+            xs_s, mids_s = [], []
+            for c in tau_pts:
+                ps = c['reveal_tau'].get('per_stratum', {}).get(sn)
+                if ps is not None:
+                    xs_s.append(c['iter']); mids_s.append(ps['q50'])
+            if xs_s:
+                ax.plot(xs_s, mids_s, '-o',
+                        color=s_cmap(si / max(len(STRATUM_NAMES) - 1, 1)),
+                        label=sn, lw=2, markersize=5)
+        ax.axhline(0, color='gray', ls=':', alpha=0.7, label='τ=0')
+        ax.axhline(1, color='green', ls='--', alpha=0.4, label='τ=+1 (solver-aligned)')
+        ax.axhline(-1, color='red', ls='--', alpha=0.4, label='τ=−1 (reversed)')
+        ax.set_xlabel('Training iteration')
+        ax.set_ylabel('Kendall τ (reveal vs solver order)')
+        ax.set_title('PUMA reveal-order alignment with solver order, stratified by puzzle size')
+        ax.set_ylim(-1.05, 1.05); ax.legend(loc='best', fontsize=8); ax.grid(alpha=0.3)
+        fig.tight_layout(); figs['reveal_tau_stratified'] = fig
+
+    # Fig 5: Premature-reveal rate by solver-step bin
+    if mts_with_rev:
+        fig, ax = plt.subplots(figsize=(8, 5))
+        bins_order = ['early', 'mid', 'late']
+        x = np.arange(len(bins_order))
+        width = 0.35
+        for mi, mt in enumerate(mts_with_rev):
+            rev = all_final[f'{mt}_reveal_hard']
+            pr = rev.get('premature_rate', {})
+            rates = [pr.get(b, {}).get('rate', 0) for b in bins_order]
+            offset = -width / 2 + mi * width if len(mts_with_rev) == 2 else 0
+            ax.bar(x + offset, rates, width, label=mt,
+                   color=COLORS.get(mt, 'gray'), alpha=0.8)
+        ax.set_xticks(x); ax.set_xticklabels(bins_order)
+        ax.set_xlabel('Solver-step bin')
+        ax.set_ylabel('Premature-reveal rate')
+        ax.set_title('Fraction of cells revealed before expected solver stage (hard bucket)')
+        ax.legend(); ax.grid(alpha=0.3, axis='y'); ax.set_ylim(0, 1.05)
+        fig.tight_layout(); figs['premature_reveal_rate'] = fig
+
+    return figs
+
 
 def run(tag=''):
     torch.manual_seed(SEED)
@@ -940,6 +1451,10 @@ def run(tag=''):
 
     max_len = MAX_SEQ_LEN
 
+    # Unified test suite
+    print("Building test suite...")
+    suite = build_test_suite(test_formatted, test_metas, tokenizer, max_len)
+
     # Train
     all_dyn, all_final = {}, {}
     models = {}
@@ -950,12 +1465,13 @@ def run(tag=''):
         print(f"{'─'*60}")
 
         model, dynamics = train_model(
-            mask_type, tokenizer, train_formatted, test_formatted, test_metas,
+            mask_type, tokenizer, train_formatted, train_metas,
+            test_formatted, test_metas,
             max_len, device=DEVICE)
         models[mask_type] = model
         all_dyn[mask_type] = dynamics
 
-        # Final evaluation
+        # Final evaluation — use full test set for headline metrics
         for dp in DECODE_POLICIES:
             print(f"\n  Evaluating: {mask_type} × {dp}")
             r = gen_eval(model, tokenizer, test_formatted, test_metas,
@@ -981,6 +1497,23 @@ def run(tag=''):
             print(f"    selective reveal={frac:.0%}: "
                   f"masked_acc={sm['masked_accuracy']:.3f}")
 
+        # Reveal trajectory analysis on hard bucket — PUMA failure mechanism
+        hard_bucket = suite['constructed'].get('hard')
+        if hard_bucket and hard_bucket['n'] > 0:
+            K_for_reveal = PUMA_K_END if PUMA_K_END else PUMA_K
+            # Match actual final K if schedule was step
+            if PUMA_K_START is not None and PUMA_K_END is not None:
+                K_for_reveal = PUMA_K_END
+            rev = analyse_reveal_patterns(
+                model, tokenizer, hard_bucket, max_len,
+                K=K_for_reveal, tau=PUMA_TAU, device=DEVICE)
+            all_final[f'{mask_type}_reveal_hard'] = rev
+            if 'premature_rate' in rev:
+                parts = [f"{b}={rev['premature_rate'][b]['rate']:.3f}"
+                         for b in ['early', 'mid', 'late']
+                         if b in rev['premature_rate']]
+                print(f"    premature_rate (hard): {' '.join(parts)}")
+
     # Continuation: PUMA → random
     args = parse_args()
     if not getattr(args, 'no_continuation', False) and 'puma' in models:
@@ -989,9 +1522,11 @@ def run(tag=''):
         print(f"{'─'*60}")
         puma_state = models['puma'].state_dict()
         cont_model, cont_dyn = train_model(
-            'random', tokenizer, train_formatted, test_formatted, test_metas,
+            'random', tokenizer, train_formatted, train_metas,
+            test_formatted, test_metas,
             max_len, max_iters=CONTINUATION_ITERS,
             init_state=puma_state, device=DEVICE)
+        all_dyn['cont_puma2random'] = cont_dyn
         for dp in DECODE_POLICIES[:2]:
             r = gen_eval(cont_model, tokenizer, test_formatted, test_metas,
                          max_len, dp, device=DEVICE)
@@ -1020,20 +1555,27 @@ def run(tag=''):
                     print(f" {v:>12.4f}" if v is not None else f" {'N/A':>12s}", end='')
                 print()
 
+    # Figures
+    figs = make_figures(all_dyn, all_final)
+
     # Save
     sd = {'config': {k: globals()[k] for k in [
         'MAX_ANS_TOKENS', 'MAX_SEQ_LEN', 'N_LAYER', 'N_HEAD', 'N_EMBD',
         'MASK_TYPES', 'DECODE_POLICIES', 'MAX_ITERS', 'BATCH_SIZE',
-        'PUMA_K', 'SEED']}}
+        'PUMA_K', 'N_RAINBOW', 'SEED']}}
     for k, v in all_dyn.items():
-        sd[f'dyn_{k}'] = v
+        sd[f'dyn_{k}'] = {
+            'checkpoints': v.get('checkpoints', []),
+            'train_loss': v.get('train_loss', []),
+            'stratified_loss': v.get('stratified_loss', []),
+            'stratum_names': v.get('stratum_names', []),
+        }
     for k, v in all_final.items():
-        # Remove non-serializable items
         if isinstance(v, dict):
             v = {kk: vv for kk, vv in v.items()
                  if not isinstance(vv, (np.ndarray, torch.Tensor))}
         sd[f'final_{k}'] = v
-    save_results(exp_name, sd)
+    save_results(exp_name, sd, figures=figs)
     return all_dyn, all_final
 
 
