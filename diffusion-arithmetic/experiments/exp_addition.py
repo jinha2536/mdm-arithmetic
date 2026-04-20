@@ -52,7 +52,7 @@ REVEAL_K_DEFAULT = 16
 REVEAL_TAU_N_TRACKED = 100        # total cap across strata (per-stratum = cap/num_strata)
 REVEAL_TAU_EVERY = 20000           # less frequent than eval; trajectory is slow-changing
 REVEAL_TAU_K_THRESHOLD_FRAC = 0.7  # only run once K_cur >= K_final * this
-MASK_TYPES = ['random', 'puma']
+MASK_TYPES = ['random', 'papl', 'puma']  # spectrum of confidence-alignment intervention
 DECODE_POLICIES = ['confidence', 'lsb']
 N_LAYER = 3; N_HEAD = 3; N_EMBD = 192; DROPOUT = 0.1; POS_ENC = 'absolute'
 LR = 1e-3; MIN_LR = 1e-4; WARMUP_ITERS = 2000; GRAD_CLIP = 1.0
@@ -65,6 +65,9 @@ PUMA_TAU = 0.9; PUMA_K = 8  # fixed K (unused when K_START is set)
 # For addition (ans_len=33): K=3 → 11 tokens/step, K=16 → ~2 tokens/step.
 PUMA_K_START = 3; PUMA_K_END = 16
 PUMA_K_STEP = 3; PUMA_K_EVERY = None  # None = auto (ramp over first 1/3 of training)
+# PAPL (Peng et al. 2025, arXiv:2509.23405): paper defaults τ=1, α=1. α up to 5
+# is safe for protein; we follow the recommended starting point.
+PAPL_TAU = 1.0; PAPL_ALPHA = 1.0
 SEED = 42
 NO_AMP = False
 DATA_MODE = 'natural'
@@ -95,6 +98,8 @@ def parse_args():
     p.add_argument('--puma-k-end', type=int)
     p.add_argument('--puma-k-step', type=int)
     p.add_argument('--puma-k-every', type=int)
+    p.add_argument('--papl-tau', type=float)
+    p.add_argument('--papl-alpha', type=float)
     p.add_argument('--masks', nargs='+'); p.add_argument('--decode', nargs='+')
     p.add_argument('--data-mode', choices=['balanced', 'natural'])
     p.add_argument('--continuation-iters', type=int)
@@ -116,6 +121,7 @@ def parse_args():
                    'puma_k': 'PUMA_K', 'puma_k_start': 'PUMA_K_START',
                    'puma_k_end': 'PUMA_K_END', 'puma_k_step': 'PUMA_K_STEP',
                    'puma_k_every': 'PUMA_K_EVERY',
+                   'papl_tau': 'PAPL_TAU', 'papl_alpha': 'PAPL_ALPHA',
                    'seed': 'SEED', 'no_amp': 'NO_AMP', 'continuation_iters': 'CONTINUATION_ITERS'}.items():
         v = getattr(args, a, None)
         if v is not None: g[gl] = v
@@ -1052,6 +1058,7 @@ def train_model(mask_type, tokenizer, train_samples, suite, max_len,
         train_ids=train_ids, train_ans=train_ans, ans_len=ANS_LEN, tokenizer=tokenizer,
         mask_type=mask_type, blank_masks=None,
         puma_tau=PUMA_TAU, puma_k_schedule=k_sched,
+        papl_tau=PAPL_TAU, papl_alpha=PAPL_ALPHA,
         n_layer=N_LAYER, n_head=N_HEAD, n_embd=N_EMBD, dropout=DROPOUT, pos_enc=POS_ENC,
         max_iters=max_iters, batch_size=BATCH_SIZE,
         lr=LR, min_lr=MIN_LR, warmup_iters=WARMUP_ITERS,
