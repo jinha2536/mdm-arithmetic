@@ -125,11 +125,19 @@ def train_diffusion(
     ans_len,            # int
     tokenizer,
     # Masking
-    mask_type='random',     # 'random' or 'puma'
+    mask_type='random',     # 'random', 'papl', or 'puma'
     blank_masks=None,       # [N, ans_len] bool — None = all positions maskable
     # PUMA
     puma_tau=0.9,
     puma_k_schedule=None,   # callable(it) → K; required if mask_type='puma'
+    # PAPL (Planner-Aware Path Learning; Peng et al. 2025, arXiv:2509.23405)
+    # PAPL uses uniform random masking (like 'random') but reweights per-token
+    # loss by planner weights w^i ∝ exp((1/τ) log P(x_0^i | x_k)), softmax over
+    # masked positions. Final weight per position: (1/(L-k)) * (1 + α * w^i).
+    # The weights are detached — no gradient through the "planner" term.
+    # α=0 recovers vanilla random masking; paper defaults τ=1, α=1.
+    papl_tau=1.0,
+    papl_alpha=1.0,
     # Architecture
     n_layer=4, n_head=4, n_embd=128, dropout=0.1, pos_enc='absolute',
     # Training
@@ -363,7 +371,15 @@ def train_diffusion(
                 m = (buf_z == mask_id)
             with ctx:
                 logits = model(buf_z)
-                loss = F.cross_entropy(logits[m], buf_x0[m])
+                # Per-sample-mean formulation (matches 'random'/'papl' modes).
+                # For PUMA's streaming buffer, each row has its own #masked and
+                # the per-sample mean equals weighted token-level NLL inside sample.
+                log_probs = F.log_softmax(logits.float(), dim=-1)
+                tlp = log_probs.gather(-1, buf_x0.unsqueeze(-1)).squeeze(-1)
+                nll = -tlp
+                n_masked = m.sum(dim=-1).clamp_min(1).float()
+                per_sample = (nll * m.float()).sum(dim=-1) / n_masked
+                loss = per_sample.mean()
             tg += m.sum().item()
         else:
             idx = _next_batch()
@@ -390,7 +406,27 @@ def train_diffusion(
                 logits = model(xm)
                 if m.sum() == 0:
                     continue
-                loss = F.cross_entropy(logits[m], ids[m])
+                # Per-sample-mean formulation (matches PAPL paper Eq. 7 with α=0,
+                # which is the standard DLM ELBO Eq. 1). Each sample's loss is
+                # 1/(L-k) · Σ_i NLL_i over masked positions; then averaged over
+                # batch. This is fair to both 'random' and 'papl' modes (α=0
+                # recovers random exactly).
+                log_probs = F.log_softmax(logits.float(), dim=-1)
+                tlp = log_probs.gather(-1, ids.unsqueeze(-1)).squeeze(-1)  # [B,T]
+                nll = -tlp                                                  # [B,T]
+                n_masked = m.sum(dim=-1).clamp_min(1).float()               # [B]
+                if mask_type == 'papl':
+                    # PAPL: w^i ∝ exp((1/τ) log P(x_0^i | x_k)), softmax over masked
+                    det = (tlp.detach() / papl_tau).masked_fill(~m, float('-inf'))
+                    w_papl = F.softmax(det, dim=-1)                         # [B,T]
+                    base_w = (1.0 / n_masked).unsqueeze(-1)                 # [B,1]
+                    weights = base_w * (1.0 + papl_alpha * w_papl)          # [B,T]
+                    per_sample = (weights * nll * m.float()).sum(dim=-1)
+                    loss = per_sample.mean()
+                else:
+                    # 'random': per-sample mean of masked NLL, batch mean
+                    per_sample = (nll * m.float()).sum(dim=-1) / n_masked
+                    loss = per_sample.mean()
             tg += m.sum().item()
 
         optimizer.zero_grad(set_to_none=True)
