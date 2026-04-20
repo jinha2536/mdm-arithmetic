@@ -45,10 +45,11 @@ MAX_ITERS = 400000; EVAL_EVERY = 5000; LOG_EVERY = 1000
 GEN_EVAL_EVERY = 10000; GEN_EVAL_N = 500
 # Reveal trajectory: K stages, match PUMA K_END for apples-to-apples
 REVEAL_K_DEFAULT = 16
-# Reveal-vs-reasoning tau diagnostic (PUMA-only, extreme training subset only)
-# Track training samples with max_chain_len >= this; skip if too few.
-REVEAL_TAU_MIN_CHAIN = 20
-REVEAL_TAU_N_TRACKED = 100        # cap on tracked extreme training samples
+# Reveal-vs-reasoning tau diagnostic (PUMA-only, stratified across chain length).
+# Per-stratum cap ensures all chain-length buckets present in training data are
+# represented in the tracked subset; the final τ is decomposed by stratum so
+# easy/hard cases can be compared separately.
+REVEAL_TAU_N_TRACKED = 100        # total cap across strata (per-stratum = cap/num_strata)
 REVEAL_TAU_EVERY = 20000           # less frequent than eval; trajectory is slow-changing
 REVEAL_TAU_K_THRESHOLD_FRAC = 0.7  # only run once K_cur >= K_final * this
 MASK_TYPES = ['random', 'puma']
@@ -56,11 +57,14 @@ DECODE_POLICIES = ['confidence', 'lsb']
 N_LAYER = 3; N_HEAD = 3; N_EMBD = 192; DROPOUT = 0.1; POS_ENC = 'absolute'
 LR = 1e-3; MIN_LR = 1e-4; WARMUP_ITERS = 2000; GRAD_CLIP = 1.0
 WEIGHT_DECAY = 0.1; EMA_DECAY = 0.9999
-PUMA_TAU = 0.9; PUMA_K = 8  # fixed K (default)
-# Step schedule (PUMA paper §4.1): K_START, +K_STEP every K_EVERY iters, cap K_END
-# Set K_START to activate step schedule instead of fixed K
-PUMA_K_START = None; PUMA_K_END = None
-PUMA_K_STEP = 3; PUMA_K_EVERY = None  # None = auto (ramp over first 1/3)
+PUMA_TAU = 0.9; PUMA_K = 8  # fixed K (unused when K_START is set)
+# Step schedule: K_START, +K_STEP every K_EVERY iters, cap K_END. The K range
+# is chosen so reveal-per-step = ans_len/K aligns with confidence informativeness:
+# start at ~10 tokens/step (random-like, confidence rank uninformative early in
+# training) and ramp to ~2 tokens/step (fine-grained once confidence is reliable).
+# For addition (ans_len=33): K=3 → 11 tokens/step, K=16 → ~2 tokens/step.
+PUMA_K_START = 3; PUMA_K_END = 16
+PUMA_K_STEP = 3; PUMA_K_EVERY = None  # None = auto (ramp over first 1/3 of training)
 SEED = 42
 NO_AMP = False
 DATA_MODE = 'natural'
@@ -864,10 +868,13 @@ def _quick_gen(model, tokenizer, test_samples, max_len, decode_policy='confidenc
 # Training stratum construction
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-# Chain-length stratum boundaries (upper-exclusive). Adjust by ND if needed.
-# Each training sample gets a stratum id based on its max_chain_len.
-STRATUM_BOUNDS = [(0, 4), (4, 8), (8, 16), (16, 24), (24, ND + 1)]
-STRATUM_NAMES = ['chain_0_3', 'chain_4_7', 'chain_8_15', 'chain_16_23', 'chain_24plus']
+# Chain-length stratum boundaries (upper-exclusive).
+# Natural uniform ND=32 distribution puts ~0 samples at chain≥24, so we use 4
+# strata instead of 5 and let the extreme bucket (chain_16plus) catch the long
+# tail — that's where the coverage-deficit prediction is most testable without
+# requiring constructive (synthetic) training data.
+STRATUM_BOUNDS = [(0, 4), (4, 8), (8, 16), (16, ND + 1)]
+STRATUM_NAMES = ['chain_0_3', 'chain_4_7', 'chain_8_15', 'chain_16plus']
 
 
 def _chain_to_stratum(max_chain):

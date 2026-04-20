@@ -757,13 +757,19 @@ def simulate_reveal_trajectory(
 
 
 def compute_reveal_vs_order_tau(reveal_stage, reasoning_order, blank_masks=None):
-    """Per-example Kendall tau between PUMA's reveal order and a canonical
+    """Per-example rank correlation between PUMA's reveal order and a canonical
     reasoning order. Used as training-time diagnostic: measures whether the
     model's confidence-induced unmasking order matches the task's logical
     deduction order.
 
-    Positions sharing a reveal stage are treated as tied (scipy handles ties).
-    Only positions where blank_masks is True are included (answer region).
+    Handles ties robustly via a fallback chain:
+      1. Kendall τ-b (scipy default, ties-aware)
+      2. Kendall τ-c (for categorical/heavily-tied data)
+      3. Spearman ρ (if both τ variants fail — e.g. all-tied edge case)
+      4. NaN only as last resort
+    The ties edge case is real: PUMA reveals many positions in a single stage
+    on easy examples, inflating ties. In earlier runs, scipy's default
+    kendalltau returned NaN for such cases, discarding valid signal.
 
     Args:
         reveal_stage:    tensor/array [N, L] — stage at which each position
@@ -773,11 +779,12 @@ def compute_reveal_vs_order_tau(reveal_stage, reasoning_order, blank_masks=None)
         blank_masks:     optional bool [N, L] — maskable positions only.
                          If None, all L positions included.
 
-    Returns: numpy array [N] — per-example Kendall tau (NaN if <2 maskable
-             positions, which shouldn't occur in practice).
+    Returns: numpy array [N] — per-example correlation (NaN only if too few
+             maskable positions or if all positions have identical rank in
+             either reveal_stage or reasoning_order).
     """
     import numpy as np
-    from scipy.stats import kendalltau
+    from scipy.stats import kendalltau, spearmanr
 
     rs = reveal_stage.cpu().numpy() if hasattr(reveal_stage, 'cpu') else np.asarray(reveal_stage)
     ro = reasoning_order.cpu().numpy() if hasattr(reasoning_order, 'cpu') else np.asarray(reasoning_order)
@@ -793,7 +800,28 @@ def compute_reveal_vs_order_tau(reveal_stage, reasoning_order, blank_masks=None)
         m = bm[i]
         if m.sum() < 2:
             continue
-        t, _ = kendalltau(rs[i][m], ro[i][m])
+        x = rs[i][m]
+        y = ro[i][m]
+        # If either side is constant (all same), correlation is undefined;
+        # skip early rather than firing scipy warnings.
+        if np.unique(x).size < 2 or np.unique(y).size < 2:
+            continue
+
+        # Primary: Kendall τ-b (ties adjustment)
+        t, _ = kendalltau(x, y, variant='b')
         if t is not None and not np.isnan(t):
-            taus[i] = float(t)
+            taus[i] = float(t); continue
+
+        # Fallback 1: Kendall τ-c (for categorical with ties)
+        t, _ = kendalltau(x, y, variant='c')
+        if t is not None and not np.isnan(t):
+            taus[i] = float(t); continue
+
+        # Fallback 2: Spearman ρ (average ranks, robust to ties)
+        rho, _ = spearmanr(x, y)
+        if rho is not None and not np.isnan(rho):
+            taus[i] = float(rho); continue
+
+        # Last resort: leave NaN (truly degenerate)
     return taus
+

@@ -66,9 +66,11 @@ DECODE_POLICIES = ['confidence', 'l2r', 'random']   # l2r = oracle (inner→oute
 N_LAYER = 3; N_HEAD = 3; N_EMBD = 192; DROPOUT = 0.1; POS_ENC = 'absolute'
 LR = 1e-3; MIN_LR = 1e-4; WARMUP_ITERS = 2000; GRAD_CLIP = 1.0
 WEIGHT_DECAY = 0.1; EMA_DECAY = 0.9999
-PUMA_TAU = 0.9; PUMA_K = 8
-PUMA_K_START = None; PUMA_K_END = None
-PUMA_K_STEP = 3; PUMA_K_EVERY = None
+PUMA_TAU = 0.9; PUMA_K = 8  # fixed K (unused when K_START is set)
+# K range chosen for reveal-per-step alignment (see addition for rationale).
+# ListOps ans_len=20: K=2 → 10 tokens/step, K=10 → 2 tokens/step.
+PUMA_K_START = 2; PUMA_K_END = 10
+PUMA_K_STEP = 2; PUMA_K_EVERY = None
 SEED = 42
 NO_AMP = False
 PATIENCE = 50000
@@ -176,6 +178,14 @@ def _evaluate(node):
     Post-order evaluation. Returns (result, trace).
     trace: list of dicts, one per operator, in evaluation order (inner→outer).
     Each trace entry includes children_indices for DAG analysis.
+
+    NOTE on index hygiene: when a sub-tree's trace `t` is extended into the
+    parent trace, each entry in `t` has `children_indices` relative to `t`'s
+    local start (0). After extension, those local indices become wrong by
+    the parent's current offset. We fix this by shifting `t`'s internal
+    children_indices by `offset` before extending. Without this shift,
+    children_indices end up pointing to sibling-subtree positions, inflating
+    critical chain length (observed: chain=8 with MAX_DEPTH=5 trees).
     """
     if isinstance(node, int):
         return node, []
@@ -186,8 +196,12 @@ def _evaluate(node):
         r, t = _evaluate(arg)
         child_results.append(r)
         if isinstance(arg, dict):
-            # Sub-expression's root is at end of its sub-trace
-            children_indices.append(len(trace) + len(t) - 1)
+            offset = len(trace)  # where t will start in the merged trace
+            # Shift t's own internal children_indices into the merged frame
+            for entry in t:
+                entry['children_indices'] = [ci + offset for ci in entry['children_indices']]
+            # Sub-expression's root is at end of its (now-shifted) sub-trace
+            children_indices.append(offset + len(t) - 1)
         trace.extend(t)
     result = _eval_op(node['op'], child_results)
     n_subexpr = sum(1 for a in node['args'] if isinstance(a, dict))
@@ -527,8 +541,10 @@ def gen_min_depth_test(n, seed, min_depth):
             metas.append(m)
         if len(data) >= n:
             break
-    if len(data) < n:
-        print(f"    WARNING: gen_min_depth_test(d>={min_depth}): {len(data)}/{n}")
+    if len(data) == 0:
+        print(f"    WARNING: gen_min_depth_test(d>={min_depth}) empty — depth unreachable?")
+    elif len(data) < n:
+        print(f"    info: gen_min_depth_test(d>={min_depth}): {len(data)}/{n}")
     return data[:n], metas[:n]
 
 
@@ -553,8 +569,11 @@ def gen_min_s_chain_test(n, seed, min_s_chain):
             metas.append(m)
         if len(data) >= n:
             break
-    if len(data) < n:
-        print(f"    WARNING: gen_min_s_chain_test(s>={min_s_chain}): {len(data)}/{n}")
+    if len(data) == 0:
+        print(f"    WARNING: gen_min_s_chain_test(s>={min_s_chain}) empty — chain unreachable at MAX_DEPTH={MAX_DEPTH}?")
+    elif len(data) < n:
+        print(f"    info: gen_min_s_chain_test(s>={min_s_chain}): {len(data)}/{n} "
+              f"(rare class)")
     return data[:n], metas[:n]
 
 
@@ -570,8 +589,11 @@ def gen_min_critical_chain_test(n, seed, min_crit):
             metas.append(m)
         if len(data) >= n:
             break
-    if len(data) < n:
-        print(f"    WARNING: gen_min_critical_chain_test(c>={min_crit}): {len(data)}/{n}")
+    if len(data) == 0:
+        print(f"    WARNING: gen_min_critical_chain_test(c>={min_crit}) empty — chain unreachable at MAX_DEPTH={MAX_DEPTH}?")
+    elif len(data) < n:
+        print(f"    info: gen_min_critical_chain_test(c>={min_crit}): {len(data)}/{n} "
+              f"(may be limited by MAX_SEQ_LEN={MAX_SEQ_LEN} rejection)")
     return data[:n], metas[:n]
 
 
@@ -732,24 +754,32 @@ def build_test_suite(tokenizer, max_len, seed=None):
     suite['natural'] = _bucket_from_items(nat_s, nat_m, tokenizer, max_len)
 
     suite['constructed'] = {}
+    # Critical chain sweep — cap at MAX_DEPTH (structural upper bound).
+    # gen_min_critical_chain_test also rejects trees exceeding MAX_SEQ_LEN,
+    # so the effective cap in practice may be slightly lower.
+    MIN_BUCKET_SIZE = 30  # skip buckets too small for reliable stats
     for L in CRITICAL_CHAIN_SWEEP:
+        if L > MAX_DEPTH:
+            continue
         s, m = gen_min_critical_chain_test(N_PER_BUCKET, seed=seed + 300 + L, min_crit=L)
-        if s:
+        if len(s) >= MIN_BUCKET_SIZE:
             suite['constructed'][f'critical_{L}'] = _bucket_from_items(s, m, tokenizer, max_len)
     for L in S_CHAIN_SWEEP:
         if L == 0:  # all samples have s_chain >= 0 trivially; skip
             continue
+        if L > MAX_DEPTH:   # s_chain_len is bounded by critical_chain_len ≤ MAX_DEPTH
+            continue
         s, m = gen_min_s_chain_test(N_PER_BUCKET, seed=seed + 400 + L, min_s_chain=L)
-        if s:
+        if len(s) >= MIN_BUCKET_SIZE:
             suite['constructed'][f's_chain_{L}'] = _bucket_from_items(s, m, tokenizer, max_len)
     for D in [3, 4, 5]:
         if D > MAX_DEPTH:
             continue
         s, m = gen_min_depth_test(N_PER_BUCKET, seed=seed + 500 + D, min_depth=D)
-        if s:
+        if len(s) >= MIN_BUCKET_SIZE:
             suite['constructed'][f'depth_{D}'] = _bucket_from_items(s, m, tokenizer, max_len)
     s, m = gen_corner_case_test(N_PER_BUCKET, seed=seed + 600, category='linear_chain')
-    if s:
+    if len(s) >= MIN_BUCKET_SIZE:
         suite['constructed']['linear_chain'] = _bucket_from_items(s, m, tokenizer, max_len)
 
     print(f"  ListOps test suite built:")
@@ -783,8 +813,8 @@ def filter_natural(suite, pred):
 # loss logging. Paper claim: PUMA's s_chain_3+ stratum loss plateaus while
 # Random's decreases → PUMA undercovers the SUMMOD-heavy critical chain class.
 
-STRATUM_BOUNDS_SCHAIN = [(0, 1), (1, 2), (2, 3), (3, 4), (4, 999)]
-STRATUM_NAMES = ['s_chain_0', 's_chain_1', 's_chain_2', 's_chain_3', 's_chain_4plus']
+STRATUM_BOUNDS_SCHAIN = [(0, 1), (1, 2), (2, 3), (3, 999)]
+STRATUM_NAMES = ['s_chain_0', 's_chain_1', 's_chain_2', 's_chain_3plus']
 
 
 def _schain_to_stratum(s):
@@ -1900,7 +1930,14 @@ def run(tag=''):
     print(f"{'=' * 70}\n")
 
     train_data, train_metas = gen_train_data(N_TRAIN, seed=SEED)
-    max_len = max(len(tok.encode(s)) for s in train_data)
+    # Use MAX_SEQ_LEN as the model's position-embedding size. Training data's
+    # actual max length is typically smaller (deep trees are rare under
+    # DEPTH_DECAY), but the test suite includes constructively-generated deep
+    # trees that approach MAX_SEQ_LEN. Using the declared cap ensures the model
+    # embeddings cover the full possible range — no test-time truncation.
+    max_len = MAX_SEQ_LEN
+    train_actual_max = max(len(tok.encode(s)) for s in train_data)
+    print(f"  Train actual max_len: {train_actual_max}, using MAX_SEQ_LEN={MAX_SEQ_LEN}")
 
     # Print distribution info
     train_depths = [m['tree_depth'] for m in train_metas]
@@ -1926,10 +1963,6 @@ def run(tag=''):
     # Back-compat aliases for downstream code still using old names
     test_data = natural_samples
     test_metas = natural_metas
-    # Ensure max_len covers test suite too
-    suite_max = max(len(tok.encode(s)) for s in natural_samples) if natural_samples else 0
-    if suite_max > max_len:
-        print(f"  WARNING: suite samples exceed train max_len ({suite_max} > {max_len})")
 
     all_dyn = {}
     all_final = {}

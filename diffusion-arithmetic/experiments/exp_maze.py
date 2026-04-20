@@ -61,9 +61,12 @@ LR = 3e-4; MIN_LR = 1e-5; WARMUP_ITERS = 2000; GRAD_CLIP = 1.0
 WEIGHT_DECAY = 0.01; EMA_DECAY = 0.9999
 
 PUMA_TAU = 0.9
-# PUMA K schedule (following PUMA paper §4.1: TinyGSM uses K=12→42, +3 every 30k)
-# K_END=None → auto: target ~7 cells/step at final K (matching paper's TinyGSM granularity)
-# K_EVERY=None → auto: ramp over first 1/3 of training (matching paper)
+# PUMA K schedule. K range chosen so reveal-per-step aligns with confidence
+# strategy: coarse start when model is random (~10 cells/step) → finer at the
+# end when confidence is informative (~5 cells/step for maze, which has longer
+# ans_len than addition so we don't go as fine as 2 per step).
+# K_END=None → auto: target ~5 cells/step at final K.
+# K_EVERY=None → auto: ramp over first 1/3 of training.
 PUMA_K_START = 12; PUMA_K_END = None; PUMA_K_STEP = 3; PUMA_K_EVERY = None
 SEED = 42
 NO_AMP = False
@@ -1370,7 +1373,9 @@ def train_model(mask_type, tokenizer, train_data, suite, max_len,
         if PUMA_K_END is not None:
             k_end = PUMA_K_END
         else:
-            k_raw = avg_blanks / 7.0
+            # Target ~5 cells revealed per step at final K (see config comment
+            # for rationale: reveal-per-step alignment with confidence strategy)
+            k_raw = avg_blanks / 5.0
             k_end = max(PUMA_K_START, int(round(k_raw / PUMA_K_STEP) * PUMA_K_STEP))
             k_end = min(k_end, int(avg_blanks) // 3)
         n_increments = max(1, (k_end - PUMA_K_START) // PUMA_K_STEP)
@@ -1381,7 +1386,7 @@ def train_model(mask_type, tokenizer, train_data, suite, max_len,
         k_sched = puma_k_step(PUMA_K_START, k_end, PUMA_K_STEP, k_every)
         final_k = k_sched(max_iters)
         print(f"  PUMA K: {PUMA_K_START} → {final_k} (+{PUMA_K_STEP} every {k_every//1000}k, "
-              f"cap={k_end}, avg blanks={avg_blanks:.0f})")
+              f"cap={k_end}, avg blanks={avg_blanks:.0f}, target ~{avg_blanks/final_k:.1f} cells/step)")
         globals()['_PUMA_K_FINAL'] = final_k
     K_final_for_tau = k_sched(max_iters) if k_sched else None
 

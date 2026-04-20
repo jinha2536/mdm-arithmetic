@@ -72,8 +72,10 @@ DECODE_POLICIES = ['confidence', 'l2r', 'random']
 N_LAYER = 3; N_HEAD = 12; N_EMBD = 384; DROPOUT = 0.0; POS_ENC = 'absolute'
 LR = 3e-4; MIN_LR = 1e-5; WARMUP_ITERS = 1000; GRAD_CLIP = 1.0
 WEIGHT_DECAY = 0.01; EMA_DECAY = 0.9999
-PUMA_TAU = 0.9; PUMA_K = 10
-PUMA_K_START = None; PUMA_K_END = None
+PUMA_TAU = 0.9; PUMA_K = 10  # fixed K (unused when K_START is set)
+# K range chosen for reveal-per-step alignment. Zebra ans_len=120 (rainbow pad
+# included): K=12 → 10 tokens/step, K=60 → 2 tokens/step.
+PUMA_K_START = 12; PUMA_K_END = 60
 PUMA_K_STEP = 3; PUMA_K_EVERY = None
 SEED = 42
 NO_AMP = False
