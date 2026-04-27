@@ -53,8 +53,11 @@ N_PER_BUCKET = 300
 MAX_ITERS = 200000; EVAL_EVERY = 5000; LOG_EVERY = 1000
 GEN_EVAL_EVERY = 10000; GEN_EVAL_N = 200
 
-MASK_TYPES = ['random', 'puma']
-DECODE_POLICIES = ['confidence', 'bfs_oracle', 'dead_end_filling', 'random']
+MASK_TYPES = ['random', 'papl', 'puma']  # spectrum of confidence-alignment intervention
+DECODE_POLICIES = ['confidence', 'dead_end_filling', 'random']
+# dead_end_filling = canonical oracle: corridors fill toward backbone last,
+# matching the human-style maze-solving heuristic. bfs_oracle (BFS-from-start)
+# was redundant and didn't capture the backbone/corridor decomposition.
 
 N_LAYER = 4; N_HEAD = 4; N_EMBD = 128; DROPOUT = 0.1; POS_ENC = 'absolute'
 LR = 3e-4; MIN_LR = 1e-5; WARMUP_ITERS = 2000; GRAD_CLIP = 1.0
@@ -68,6 +71,8 @@ PUMA_TAU = 0.9
 # K_END=None → auto: target ~5 cells/step at final K.
 # K_EVERY=None → auto: ramp over first 1/3 of training.
 PUMA_K_START = 12; PUMA_K_END = None; PUMA_K_STEP = 3; PUMA_K_EVERY = None
+# PAPL (Peng et al. 2025, arXiv:2509.23405): paper defaults τ=1, α=1.
+PAPL_TAU = 1.0; PAPL_ALPHA = 1.0
 SEED = 42
 NO_AMP = False
 STRAIGHTNESS_BIAS = 0.0  # 0.0=normal DFS, higher=longer corridors in training
@@ -111,10 +116,13 @@ def parse_args():
     p.add_argument('--puma-tau', type=float)
     p.add_argument('--puma-k-start', type=int); p.add_argument('--puma-k-end', type=int)
     p.add_argument('--puma-k-step', type=int); p.add_argument('--puma-k-every', type=int)
+    p.add_argument('--papl-tau', type=float); p.add_argument('--papl-alpha', type=float)
     p.add_argument('--masks', nargs='+'); p.add_argument('--decode', nargs='+')
     p.add_argument('--straightness-bias', type=float)
     p.add_argument('--continuation-iters', type=int)
     p.add_argument('--patience', type=int)
+    p.add_argument('--no-patience', action='store_true',
+                   help='Disable early stopping for fair comparison across mask types')
     p.add_argument('--no-continuation', action='store_true')
     p.add_argument('--no-amp', action='store_true')
     p.add_argument('--tag', type=str, default=''); p.add_argument('--seed', type=int)
@@ -131,6 +139,7 @@ def parse_args():
                    'lr': 'LR', 'puma_tau': 'PUMA_TAU',
                    'puma_k_start': 'PUMA_K_START', 'puma_k_end': 'PUMA_K_END',
                    'puma_k_step': 'PUMA_K_STEP', 'puma_k_every': 'PUMA_K_EVERY',
+                   'papl_tau': 'PAPL_TAU', 'papl_alpha': 'PAPL_ALPHA',
                    'seed': 'SEED', 'no_amp': 'NO_AMP', 'straightness_bias': 'STRAIGHTNESS_BIAS',
                    'continuation_iters': 'CONTINUATION_ITERS',
                    'patience': 'PATIENCE'}.items():
@@ -142,6 +151,7 @@ def parse_args():
         g['CELL_N'] = g['GRID_H'] * g['GRID_W']; g['ANS_LEN'] = g['CELL_N']
     if args.masks: g['MASK_TYPES'] = args.masks
     if args.decode: g['DECODE_POLICIES'] = args.decode
+    if getattr(args, 'no_patience', False): g['PATIENCE'] = None
     return args
 
 
@@ -1329,42 +1339,43 @@ def train_model(mask_type, tokenizer, train_data, suite, max_len,
     reveal_reasoning_order = None
     reveal_blanks = None
     reveal_tracked_strata = None
-    if mask_type == 'puma':
-        per_stratum_cap = max(REVEAL_TAU_N_TRACKED // len(STRATUM_NAMES), 10)
-        tracked_by_stratum = {sn: [] for sn in STRATUM_NAMES}
-        for i, e in enumerate(train_data):
-            bb = e.get('backbone_length', 0)
-            si = _backbone_to_stratum(bb)
-            sn = STRATUM_NAMES[si]
-            if len(tracked_by_stratum[sn]) < per_stratum_cap:
-                tracked_by_stratum[sn].append((i, si))
-        tracked_flat = [t for v in tracked_by_stratum.values() for t in v]
-        strata_counts = {sn: len(v) for sn, v in tracked_by_stratum.items()}
-        if sum(strata_counts.values()) >= 30:
-            tracked = [t[0] for t in tracked_flat]
-            tracked_strata = [t[1] for t in tracked_flat]
-            reveal_tracked_ids = train_ids[tracked]
-            reveal_tracked_ans = train_ans[tracked]
-            reveal_tracked_strata = torch.tensor(tracked_strata, dtype=torch.long)
-            N_tr = len(tracked)
-            ro = torch.full((N_tr, ANS_LEN), ANS_LEN, dtype=torch.long)
-            bm = torch.zeros(N_tr, ANS_LEN, dtype=torch.bool)
-            for i, idx in enumerate(tracked):
-                ent = train_data[idx]
-                de_order = ent.get('de_filling_order', {})
-                if not de_order:
-                    continue
-                for j in range(ANS_LEN):
-                    if j in de_order:
-                        ro[i, j] = de_order[j]
-                bm[i] = blank_masks[idx]
-            reveal_reasoning_order = ro
-            reveal_blanks = bm
-            print(f"  Reveal-τ tracking (stratified): total={N_tr}, by stratum: " +
-                  ', '.join(f"{sn}={c}" for sn, c in strata_counts.items() if c > 0))
-        else:
-            print(f"  Reveal-τ tracking: SKIPPED "
-                  f"(total tracked < 30: {strata_counts})")
+    # Build tracked subset for ALL mask_types (diagnostic measures confidence-greedy
+    # reveal order regardless of how model was trained)
+    per_stratum_cap = max(REVEAL_TAU_N_TRACKED // len(STRATUM_NAMES), 10)
+    tracked_by_stratum = {sn: [] for sn in STRATUM_NAMES}
+    for i, e in enumerate(train_data):
+        bb = e.get('backbone_length', 0)
+        si = _backbone_to_stratum(bb)
+        sn = STRATUM_NAMES[si]
+        if len(tracked_by_stratum[sn]) < per_stratum_cap:
+            tracked_by_stratum[sn].append((i, si))
+    tracked_flat = [t for v in tracked_by_stratum.values() for t in v]
+    strata_counts = {sn: len(v) for sn, v in tracked_by_stratum.items()}
+    if sum(strata_counts.values()) >= 30:
+        tracked = [t[0] for t in tracked_flat]
+        tracked_strata = [t[1] for t in tracked_flat]
+        reveal_tracked_ids = train_ids[tracked]
+        reveal_tracked_ans = train_ans[tracked]
+        reveal_tracked_strata = torch.tensor(tracked_strata, dtype=torch.long)
+        N_tr = len(tracked)
+        ro = torch.full((N_tr, ANS_LEN), ANS_LEN, dtype=torch.long)
+        bm = torch.zeros(N_tr, ANS_LEN, dtype=torch.bool)
+        for i, idx in enumerate(tracked):
+            ent = train_data[idx]
+            de_order = ent.get('de_filling_order', {})
+            if not de_order:
+                continue
+            for j in range(ANS_LEN):
+                if j in de_order:
+                    ro[i, j] = de_order[j]
+            bm[i] = blank_masks[idx]
+        reveal_reasoning_order = ro
+        reveal_blanks = bm
+        print(f"  Reveal-τ tracking (stratified, [{mask_type}]): total={N_tr}, by stratum: " +
+              ', '.join(f"{sn}={c}" for sn, c in strata_counts.items() if c > 0))
+    else:
+        print(f"  Reveal-τ tracking: SKIPPED "
+              f"(total tracked < 30: {strata_counts})")
 
     # PUMA K schedule
     k_sched = None
@@ -1388,7 +1399,17 @@ def train_model(mask_type, tokenizer, train_data, suite, max_len,
         print(f"  PUMA K: {PUMA_K_START} → {final_k} (+{PUMA_K_STEP} every {k_every//1000}k, "
               f"cap={k_end}, avg blanks={avg_blanks:.0f}, target ~{avg_blanks/final_k:.1f} cells/step)")
         globals()['_PUMA_K_FINAL'] = final_k
-    K_final_for_tau = k_sched(max_iters) if k_sched else None
+    # Diagnostic K for reveal-τ simulation. PUMA uses its live k_sched. Random/PAPL
+    # have no training K — use PUMA_K_END (or a sensible default) as the fixed
+    # inference-time reveal granularity so all three methods are compared under
+    # the same decoding condition.
+    if k_sched:
+        K_final_for_tau = k_sched(max_iters)
+    elif PUMA_K_END is not None:
+        K_final_for_tau = PUMA_K_END
+    else:
+        # Default fallback: target ~5 cells/step with avg blanks
+        K_final_for_tau = max(1, int((blank_masks.sum(dim=1).float().mean().item()) / 5))
 
     def eval_fn(model, it, tg):
         probe = probe_per_cell(model, tokenizer, natural_entries, max_len, device)
@@ -1399,11 +1420,16 @@ def train_model(mask_type, tokenizer, train_data, suite, max_len,
         print(f"    [eval it {it}] loss={probe['overall_loss']:.4f} "
               f"acc={probe['overall_acc']:.4f} {' '.join(parts)}")
 
-        # Reveal-τ (PUMA only, past K threshold) — stratified by backbone stratum
+        # Reveal-τ (all mask_types; per-type K and eligibility)
         if (reveal_tracked_ids is not None and it > 0
                 and it % REVEAL_TAU_EVERY == 0 and K_final_for_tau is not None):
-            K_cur = k_sched(it)
-            if K_cur >= K_final_for_tau * REVEAL_TAU_K_THRESHOLD_FRAC:
+            if mask_type == 'puma' and k_sched is not None:
+                K_cur = k_sched(it)
+                eligible = K_cur >= K_final_for_tau * REVEAL_TAU_K_THRESHOLD_FRAC
+            else:
+                K_cur = K_final_for_tau
+                eligible = it >= max(max_iters // 4, 10000)
+            if eligible:
                 traj = simulate_reveal_trajectory(
                     model, tokenizer, reveal_tracked_ids, reveal_tracked_ans, ANS_LEN,
                     blank_masks=reveal_blanks, K=K_cur, tau=PUMA_TAU,
@@ -1447,6 +1473,7 @@ def train_model(mask_type, tokenizer, train_data, suite, max_len,
         train_ids=train_ids, train_ans=train_ans, ans_len=ANS_LEN, tokenizer=tokenizer,
         mask_type=mask_type, blank_masks=blank_masks,
         puma_tau=PUMA_TAU, puma_k_schedule=k_sched,
+        papl_tau=PAPL_TAU, papl_alpha=PAPL_ALPHA,
         n_layer=N_LAYER, n_head=N_HEAD, n_embd=N_EMBD, dropout=DROPOUT, pos_enc=POS_ENC,
         max_iters=max_iters, batch_size=BATCH_SIZE,
         lr=LR, min_lr=MIN_LR, warmup_iters=WARMUP_ITERS,

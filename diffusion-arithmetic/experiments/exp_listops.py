@@ -61,8 +61,11 @@ N_TRAIN = 20000; N_TEST = 5000; BATCH_SIZE = 256
 N_PER_BUCKET = 300
 MAX_ITERS = 400000; EVAL_EVERY = 5000; LOG_EVERY = 1000
 GEN_EVAL_EVERY = 10000; GEN_EVAL_N = 500
-MASK_TYPES = ['random', 'puma']
-DECODE_POLICIES = ['confidence', 'l2r', 'random']   # l2r = oracle (inner→outer)
+MASK_TYPES = ['random', 'papl', 'puma']  # spectrum of confidence-alignment intervention
+DECODE_POLICIES = ['confidence', 'layered_oracle', 'random']
+# layered_oracle = true tree oracle: child positions before parent, ties (same-
+# layer siblings) broken by confidence. Replaces l2r which imposed spurious
+# order between independent sibling subtrees.
 N_LAYER = 3; N_HEAD = 3; N_EMBD = 192; DROPOUT = 0.1; POS_ENC = 'absolute'
 LR = 1e-3; MIN_LR = 1e-4; WARMUP_ITERS = 2000; GRAD_CLIP = 1.0
 WEIGHT_DECAY = 0.1; EMA_DECAY = 0.9999
@@ -71,6 +74,8 @@ PUMA_TAU = 0.9; PUMA_K = 8  # fixed K (unused when K_START is set)
 # ListOps ans_len=20: K=2 → 10 tokens/step, K=10 → 2 tokens/step.
 PUMA_K_START = 2; PUMA_K_END = 10
 PUMA_K_STEP = 2; PUMA_K_EVERY = None
+# PAPL (Peng et al. 2025, arXiv:2509.23405): paper defaults τ=1, α=1.
+PAPL_TAU = 1.0; PAPL_ALPHA = 1.0
 SEED = 42
 NO_AMP = False
 PATIENCE = 50000
@@ -108,9 +113,12 @@ def parse_args():
     p.add_argument('--n-embd', type=int); p.add_argument('--dropout', type=float)
     p.add_argument('--lr', type=float); p.add_argument('--weight-decay', type=float)
     p.add_argument('--patience', type=int)
+    p.add_argument('--no-patience', action='store_true',
+                   help='Disable early stopping for fair comparison across mask types')
     p.add_argument('--puma-tau', type=float); p.add_argument('--puma-k', type=int)
     p.add_argument('--puma-k-start', type=int); p.add_argument('--puma-k-end', type=int)
     p.add_argument('--puma-k-step', type=int); p.add_argument('--puma-k-every', type=int)
+    p.add_argument('--papl-tau', type=float); p.add_argument('--papl-alpha', type=float)
     p.add_argument('--masks', nargs='+'); p.add_argument('--decode', nargs='+')
     p.add_argument('--continuation-iters', type=int)
     p.add_argument('--no-continuation', action='store_true')
@@ -134,6 +142,7 @@ def parse_args():
         'patience': 'PATIENCE', 'puma_tau': 'PUMA_TAU', 'puma_k': 'PUMA_K',
         'puma_k_start': 'PUMA_K_START', 'puma_k_end': 'PUMA_K_END',
         'puma_k_step': 'PUMA_K_STEP', 'puma_k_every': 'PUMA_K_EVERY',
+        'papl_tau': 'PAPL_TAU', 'papl_alpha': 'PAPL_ALPHA',
         'seed': 'SEED', 'no_amp': 'NO_AMP', 'continuation_iters': 'CONTINUATION_ITERS',
     }.items():
         v = getattr(args, a, None)
@@ -143,6 +152,8 @@ def parse_args():
         g['MASK_TYPES'] = args.masks
     if args.decode:
         g['DECODE_POLICIES'] = args.decode
+    if getattr(args, 'no_patience', False):
+        g['PATIENCE'] = None
     return args
 
 
@@ -985,9 +996,27 @@ def gen_eval_with_stats(model, tokenizer, test_samples, test_metas, max_len,
             # All same length (pl), no padding between = and MASK
             pids = torch.tensor(penc, dtype=torch.long)
 
+            # Build layered ranks for layered_oracle decode
+            r_rank = None
+            if decode_policy == 'layered_oracle':
+                r_rank = torch.full((B, MAX_ANS_LEN), MAX_ANS_LEN, dtype=torch.long)
+                for bi, m in enumerate(batch_m):
+                    tl = min(m.get('trace_len', 0), MAX_ANS_LEN)
+                    ci_list = m.get('children_indices', [])
+                    ranks = [0] * tl
+                    for j in range(tl):
+                        if j < len(ci_list) and ci_list[j]:
+                            valid = [c for c in ci_list[j] if 0 <= c < j]
+                            if valid:
+                                ranks[j] = 1 + max(ranks[c] for c in valid)
+                    for j in range(tl):
+                        r_rank[bi, j] = ranks[j]
+                    # Past trace: ranks already MAX_ANS_LEN (= +inf treatment)
+
             gen, _, info = generate_diffusion(
                 model, pids, MAX_ANS_LEN, mask_id,
                 policy=decode_policy, greedy=True,
+                reasoning_rank=r_rank,
                 pad_to=max_len, pad_id=pad_id, device=device)
             pred_ids = gen[:, pl:pl + MAX_ANS_LEN]
             batch_orders = info.get('orders')
@@ -1541,42 +1570,55 @@ def train_model(mask_type, tokenizer, train_samples, train_metas,
     reveal_reasoning_order = None
     reveal_blanks = None
     reveal_tracked_strata = None   # [N_tr] long — which stratum each tracked sample belongs to
-    if mask_type == 'puma':
-        # Per-stratum tracked indices (cap per stratum)
-        per_stratum_cap = max(REVEAL_TAU_N_TRACKED // len(STRATUM_NAMES), 10)
-        tracked_by_stratum = {sn: [] for sn in STRATUM_NAMES}
-        for i, m in enumerate(train_metas):
-            si = _schain_to_stratum(m.get('s_chain_len', 0))
-            sn = STRATUM_NAMES[si]
-            if len(tracked_by_stratum[sn]) < per_stratum_cap:
-                tracked_by_stratum[sn].append((i, si))
-        tracked_flat = [t for v in tracked_by_stratum.values() for t in v]
-        # Keep only strata with enough samples for a meaningful trajectory
-        strata_counts = {sn: len(v) for sn, v in tracked_by_stratum.items()}
-        if sum(strata_counts.values()) >= 30:
-            tracked = [t[0] for t in tracked_flat]
-            tracked_strata = [t[1] for t in tracked_flat]
-            reveal_tracked_ids = train_ids[tracked]
-            reveal_tracked_ans = train_ans[tracked]
-            reveal_tracked_strata = torch.tensor(tracked_strata, dtype=torch.long)
-            N_tr = len(tracked)
-            # Reasoning rank for listops: trace position j has rank j (post-order).
-            ro = torch.full((N_tr, MAX_ANS_LEN), MAX_ANS_LEN, dtype=torch.long)
-            bm = torch.zeros(N_tr, MAX_ANS_LEN, dtype=torch.bool)
-            for i, idx in enumerate(tracked):
-                tl = train_metas[idx].get('trace_len', 0)
-                tl = min(tl, MAX_ANS_LEN)
-                for j in range(tl):
-                    ro[i, j] = j
-                bm[i, :tl] = True
-            reveal_reasoning_order = ro
-            reveal_blanks = bm
-            print(f"  Reveal-τ tracking (stratified): "
-                  f"total={N_tr}, by stratum: " +
-                  ', '.join(f"{sn}={c}" for sn, c in strata_counts.items() if c > 0))
-        else:
-            print(f"  Reveal-τ tracking: SKIPPED "
-                  f"(total tracked < 30: {strata_counts})")
+    # Build tracked subset for ALL mask_types (diagnostic measures confidence-greedy
+    # reveal order regardless of how model was trained)
+    per_stratum_cap = max(REVEAL_TAU_N_TRACKED // len(STRATUM_NAMES), 10)
+    tracked_by_stratum = {sn: [] for sn in STRATUM_NAMES}
+    for i, m in enumerate(train_metas):
+        si = _schain_to_stratum(m.get('s_chain_len', 0))
+        sn = STRATUM_NAMES[si]
+        if len(tracked_by_stratum[sn]) < per_stratum_cap:
+            tracked_by_stratum[sn].append((i, si))
+    tracked_flat = [t for v in tracked_by_stratum.values() for t in v]
+    strata_counts = {sn: len(v) for sn, v in tracked_by_stratum.items()}
+    if sum(strata_counts.values()) >= 30:
+        tracked = [t[0] for t in tracked_flat]
+        tracked_strata = [t[1] for t in tracked_flat]
+        reveal_tracked_ids = train_ids[tracked]
+        reveal_tracked_ans = train_ans[tracked]
+        reveal_tracked_strata = torch.tensor(tracked_strata, dtype=torch.long)
+        N_tr = len(tracked)
+        # Reasoning rank for listops: LAYERED post-order. Position j gets
+        # rank = 1 + max(rank[c] for c in children_indices[j]); leaves rank 0.
+        # Same-layer positions (sibling subtrees, parallel-decodable) get TIED
+        # ranks. This is the semantically correct ordering — strict trace
+        # index ordering would impose spurious order between independent
+        # siblings. Kendall τ-b naturally handles ties, with Spearman ρ
+        # fallback for degenerate cases (see compute_reveal_vs_order_tau).
+        ro = torch.full((N_tr, MAX_ANS_LEN), MAX_ANS_LEN, dtype=torch.long)
+        bm = torch.zeros(N_tr, MAX_ANS_LEN, dtype=torch.bool)
+        for i, idx in enumerate(tracked):
+            tl = train_metas[idx].get('trace_len', 0)
+            tl = min(tl, MAX_ANS_LEN)
+            ci_list = train_metas[idx].get('children_indices', [])
+            # Compute layered rank (= 1 + max child rank, leaves get 0)
+            ranks = [0] * tl
+            for j in range(tl):
+                if j < len(ci_list) and ci_list[j]:
+                    valid_children = [c for c in ci_list[j] if 0 <= c < j]
+                    if valid_children:
+                        ranks[j] = 1 + max(ranks[c] for c in valid_children)
+            for j in range(tl):
+                ro[i, j] = ranks[j]
+            bm[i, :tl] = True
+        reveal_reasoning_order = ro
+        reveal_blanks = bm
+        print(f"  Reveal-τ tracking (stratified, [{mask_type}]): "
+              f"total={N_tr}, by stratum: " +
+              ', '.join(f"{sn}={c}" for sn, c in strata_counts.items() if c > 0))
+    else:
+        print(f"  Reveal-τ tracking: SKIPPED "
+              f"(total tracked < 30: {strata_counts})")
 
     # PUMA K schedule
     k_sched = None
@@ -1595,7 +1637,9 @@ def train_model(mask_type, tokenizer, train_samples, train_metas,
         else:
             k_sched = puma_k_fixed(PUMA_K)
             print(f"  PUMA K: fixed {PUMA_K}")
-    K_final_for_tau = k_sched(max_iters) if k_sched else None
+    # Diagnostic K: use k_sched(max_iters) for PUMA, or PUMA_K_END as fixed K for
+    # random/PAPL so all methods compared under identical decoding granularity.
+    K_final_for_tau = k_sched(max_iters) if k_sched else (PUMA_K_END or PUMA_K)
 
     def eval_fn(model, it, tg):
         probe = probe_per_position(model, tokenizer, test_samples, test_metas,
@@ -1613,11 +1657,16 @@ def train_model(mask_type, tokenizer, train_samples, train_metas,
             probe['gen_acc_full'] = r['accuracy']
             probe['gen_acc_trace'] = r['trace_accuracy']
 
-        # Reveal-τ (PUMA only, past K threshold) — stratified by s_chain_len
+        # Reveal-τ (all mask_types, per-type K and eligibility) — stratified by s_chain_len
         if (reveal_tracked_ids is not None and it > 0
                 and it % REVEAL_TAU_EVERY == 0 and K_final_for_tau is not None):
-            K_cur = k_sched(it)
-            if K_cur >= K_final_for_tau * REVEAL_TAU_K_THRESHOLD_FRAC:
+            if mask_type == 'puma' and k_sched is not None:
+                K_cur = k_sched(it)
+                eligible = K_cur >= K_final_for_tau * REVEAL_TAU_K_THRESHOLD_FRAC
+            else:
+                K_cur = K_final_for_tau
+                eligible = it >= max(max_iters // 4, 20000)
+            if eligible:
                 traj = simulate_reveal_trajectory(
                     model, tokenizer, reveal_tracked_ids, reveal_tracked_ans,
                     MAX_ANS_LEN,
@@ -1666,6 +1715,7 @@ def train_model(mask_type, tokenizer, train_samples, train_metas,
         mask_type=mask_type, blank_masks=None,
         puma_tau=PUMA_TAU,
         puma_k_schedule=k_sched,
+        papl_tau=PAPL_TAU, papl_alpha=PAPL_ALPHA,
         n_layer=N_LAYER, n_head=N_HEAD, n_embd=N_EMBD,
         dropout=DROPOUT, pos_enc=POS_ENC,
         max_iters=max_iters, batch_size=BATCH_SIZE,

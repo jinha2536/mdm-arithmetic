@@ -84,10 +84,9 @@ MAX_SEQ_LEN = 60
 N_TRAIN = None; N_TEST = 1000; BATCH_SIZE = 256
 MAX_ITERS = 400000; EVAL_EVERY = 5000; LOG_EVERY = 1000
 GEN_EVAL_EVERY = 10000; GEN_EVAL_N = 500
-MASK_TYPES = ['random', 'puma']
-# step_seq = structural oracle (complete step i before step i+1)
-# l2r = token-level left-to-right (partial oracle for chain_depth=1 samples)
-DECODE_POLICIES = ['confidence', 'step_seq', 'l2r', 'random']
+MASK_TYPES = ['random', 'papl', 'puma']  # spectrum of confidence-alignment intervention
+# step_seq = structural oracle (complete step i before step i+1, plan→calc deps)
+DECODE_POLICIES = ['confidence', 'step_seq', 'random']
 
 N_LAYER = 3; N_HEAD = 12; N_EMBD = 384; DROPOUT = 0.0; POS_ENC = 'absolute'
 LR = 3e-4; MIN_LR = 1e-5; WARMUP_ITERS = 1000; GRAD_CLIP = 1.0
@@ -95,6 +94,8 @@ WEIGHT_DECAY = 0.01; EMA_DECAY = 0.9999
 PUMA_TAU = 0.9; PUMA_K = 8
 PUMA_K_START = None; PUMA_K_END = None
 PUMA_K_STEP = 3; PUMA_K_EVERY = None
+# PAPL (Peng et al. 2025, arXiv:2509.23405): paper defaults τ=1, α=1.
+PAPL_TAU = 1.0; PAPL_ALPHA = 1.0
 SEED = 42
 NO_AMP = False
 PATIENCE = 50000
@@ -122,9 +123,12 @@ def parse_args():
     p.add_argument('--n-embd', type=int); p.add_argument('--dropout', type=float)
     p.add_argument('--lr', type=float); p.add_argument('--weight-decay', type=float)
     p.add_argument('--patience', type=int)
+    p.add_argument('--no-patience', action='store_true',
+                   help='Disable early stopping for fair comparison across mask types')
     p.add_argument('--puma-tau', type=float); p.add_argument('--puma-k', type=int)
     p.add_argument('--puma-k-start', type=int); p.add_argument('--puma-k-end', type=int)
     p.add_argument('--puma-k-step', type=int); p.add_argument('--puma-k-every', type=int)
+    p.add_argument('--papl-tau', type=float); p.add_argument('--papl-alpha', type=float)
     p.add_argument('--masks', nargs='+'); p.add_argument('--decode', nargs='+')
     p.add_argument('--continuation-iters', type=int)
     p.add_argument('--no-continuation', action='store_true')
@@ -152,6 +156,7 @@ def parse_args():
         'patience': 'PATIENCE', 'puma_tau': 'PUMA_TAU', 'puma_k': 'PUMA_K',
         'puma_k_start': 'PUMA_K_START', 'puma_k_end': 'PUMA_K_END',
         'puma_k_step': 'PUMA_K_STEP', 'puma_k_every': 'PUMA_K_EVERY',
+        'papl_tau': 'PAPL_TAU', 'papl_alpha': 'PAPL_ALPHA',
         'seed': 'SEED', 'no_amp': 'NO_AMP',
         'continuation_iters': 'CONTINUATION_ITERS',
         'corner_ood_n': 'CORNER_OOD_N',
@@ -163,6 +168,8 @@ def parse_args():
         g['MASK_TYPES'] = args.masks
     if args.decode:
         g['DECODE_POLICIES'] = args.decode
+    if getattr(args, 'no_patience', False):
+        g['PATIENCE'] = None
     return args
 
 
@@ -1181,6 +1188,7 @@ def train_model(mask_type, tokenizer, train_samples, test_samples, test_metas,
         mask_type=mask_type, blank_masks=None,
         puma_tau=PUMA_TAU,
         puma_k_schedule=k_sched,
+        papl_tau=PAPL_TAU, papl_alpha=PAPL_ALPHA,
         n_layer=N_LAYER, n_head=N_HEAD, n_embd=N_EMBD,
         dropout=DROPOUT, pos_enc=POS_ENC,
         max_iters=max_iters, batch_size=BATCH_SIZE,

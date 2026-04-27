@@ -64,11 +64,13 @@ GRAD_CLIP = 1.0; WEIGHT_DECAY = 0.01
 EMA_DECAY = 0.9999
 EVAL_EVERY = 8000; LOG_EVERY = 2000; GEN_EVAL_EVERY = 20000; GEN_EVAL_N = 100
 
-MASK_TYPES = ['random', 'puma']
+MASK_TYPES = ['random', 'papl', 'puma']  # spectrum of confidence-alignment intervention
 DECODE_POLICIES = ['confidence', 'oracle_solver', 'oracle_technique', 'random']
 PUMA_TAU = 0.9; PUMA_K = 8
 PUMA_K_START = None; PUMA_K_END = None
 PUMA_K_STEP = 5; PUMA_K_EVERY = None
+# PAPL (Peng et al. 2025, arXiv:2509.23405): paper defaults τ=1, α=1.
+PAPL_TAU = 1.0; PAPL_ALPHA = 1.0
 SEED = 42
 NO_AMP = False
 
@@ -109,8 +111,12 @@ def parse_args():
     p.add_argument('--puma-k-step', type=int, default=None)
     p.add_argument('--puma-k-every', type=int, default=None)
     p.add_argument('--puma-tau', type=float, default=None)
+    p.add_argument('--papl-tau', type=float, default=None)
+    p.add_argument('--papl-alpha', type=float, default=None)
     p.add_argument('--continuation-iters', type=int, default=None)
     p.add_argument('--patience', type=int, default=None)
+    p.add_argument('--no-patience', action='store_true',
+                   help='Disable early stopping for fair comparison across mask types')
     p.add_argument('--no-continuation', action='store_true')
     p.add_argument('--no-amp', action='store_true')
     p.add_argument('--tag', type=str, default='')
@@ -128,6 +134,7 @@ def parse_args():
                    'puma_k': 'PUMA_K', 'puma_tau': 'PUMA_TAU',
                    'puma_k_start': 'PUMA_K_START', 'puma_k_end': 'PUMA_K_END',
                    'puma_k_step': 'PUMA_K_STEP', 'puma_k_every': 'PUMA_K_EVERY',
+                   'papl_tau': 'PAPL_TAU', 'papl_alpha': 'PAPL_ALPHA',
                    'seed': 'SEED', 'no_amp': 'NO_AMP',
                    'difficulty_decay': 'DIFFICULTY_DECAY',
                    'continuation_iters': 'CONTINUATION_ITERS',
@@ -136,6 +143,7 @@ def parse_args():
         if v is not None: g[gl] = v
     if args.masks: g['MASK_TYPES'] = args.masks
     if args.decode: g['DECODE_POLICIES'] = args.decode
+    if getattr(args, 'no_patience', False): g['PATIENCE'] = None
     return args
 
 
@@ -832,27 +840,31 @@ def load_hf_data(n_test, decay=None, seed=42, cache_dir='.sudoku_cache'):
         print(f"    p{p}: {sorted_r[idx]}")
 
     # Auto-determine tier boundaries based on actual data
-    # Keep easy=0, then split non-zero into meaningful groups
+    # Keep easy=0, then split non-zero into groups with progressively-rare tiers.
+    # Boundaries placed at p50/p80/p95/p99 (was p50/p75/p90/p99) so the upper
+    # tiers (very_hard, extreme, top1pct) capture progressively rarer puzzles.
+    # This better aligns with the paper's "rare patterns" framing — the hardest
+    # tier should be a genuine minority (~4% extreme, ~1% top1pct).
     global RATING_TIERS
     nonzero = [r for r in all_ratings if r > 0]
     if nonzero:
         nonzero_sorted = sorted(nonzero)
         nn = len(nonzero_sorted)
         p50 = nonzero_sorted[nn//2]
-        p75 = nonzero_sorted[int(nn*0.75)]
-        p90 = nonzero_sorted[int(nn*0.90)]
+        p80 = nonzero_sorted[int(nn*0.80)]
+        p95 = nonzero_sorted[min(int(nn*0.95), nn-1)]
         p99 = nonzero_sorted[min(int(nn*0.99), nn-1)]
         RATING_TIERS = {
             'easy': (0, 0),
             'medium': (1, max(p50, 1)),
-            'hard': (max(p50, 1)+1, p75),
-            'very_hard': (p75+1, p90),
-            'extreme': (p90+1, p99),
+            'hard': (max(p50, 1)+1, p80),
+            'very_hard': (p80+1, p95),
+            'extreme': (p95+1, p99),
             'top1pct': (p99+1, r_max),
         }
         # Remove empty tiers
         RATING_TIERS = {k: v for k, v in RATING_TIERS.items() if v[0] <= v[1]}
-        print(f"    Auto-determined tiers:")
+        print(f"    Auto-determined tiers (rebalanced — extreme/top1pct made rarer):")
         for tn, (lo, hi) in RATING_TIERS.items():
             cnt = sum(1 for r in all_ratings if lo <= r <= hi)
             print(f"      {tn}: [{lo}, {hi}] → {cnt:,} train samples")
@@ -1222,6 +1234,7 @@ def train(mask_type, tokenizer, train_data, test_data_dict, max_len,
         train_ids=train_ids, train_ans=train_ans, ans_len=ANS_LEN, tokenizer=tokenizer,
         mask_type=mask_type, blank_masks=blank_masks,
         puma_tau=PUMA_TAU, puma_k_schedule=k_sched,
+        papl_tau=PAPL_TAU, papl_alpha=PAPL_ALPHA,
         n_layer=N_LAYER, n_head=N_HEAD, n_embd=N_EMBD, dropout=DROPOUT, pos_enc=POS_ENC,
         max_iters=max_iters, batch_size=BATCH_SIZE,
         lr=LR, min_lr=MIN_LR, warmup_iters=WARMUP_ITERS,
@@ -1373,9 +1386,14 @@ def generate_blanks(model, tokenizer, test_data, decode_policy='confidence',
             ps = tokenizer.decode(pred_ids[i].cpu().tolist())
             gs = batch[i]['string'].split('=')[1]
             pc = [ps[j] == gs[j] if j < len(ps) else False for j in range(len(gs))]
+            # Decode order for blank cells: list of cell indices in the order
+            # they were decoded (extracted from decode_orders tensor)
+            do = decode_orders[i].cpu().tolist()
+            decode_order_blanks = [c for c in do if c >= 0]
             results.append({'correct': ps==gs, 'pos_correct': pc,
                            'meta': batch[i]['meta'], 'n_blanks': batch[i]['n_blanks'],
-                           'rating': batch[i].get('rating', 0)})
+                           'rating': batch[i].get('rating', 0),
+                           'decode_order_blanks': decode_order_blanks})
     return results
 
 
@@ -1456,6 +1474,98 @@ def evaluate(model, tokenizer, test_data, decode_policy='confidence',
             'category_accuracy': cat_acc, 'guess_accuracy': guess_acc,
             'technique_accuracy': tech_acc,
             'rating_accuracy': rating_acc, 'blanks_accuracy': blanks_acc}
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Solver-confidence disagreement analysis (GPT Experiment A)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+def analyse_solver_confidence_disagreement(model, tokenizer, test_data,
+                                           batch_size=16, device=None):
+    """For each blank cell, compute (solver rank, confidence rank) and classify
+    into 4 groups based on whether each rank is in early-half or late-half of
+    that puzzle's blanks:
+
+      Type 1: solver early / confidence early — mutual easy
+      Type 2: solver late  / confidence early — Transformer-friendly global pattern
+      Type 3: solver early / confidence late  — bookkeeping easy but model unsure
+      Type 4: solver late  / confidence late  — true extreme
+
+    Returns per-puzzle counts and aggregate distribution.
+    Paper claim:
+      - Sudoku: dense-symmetric → Type 2 cells dominant (confidence early
+        because constraint propagation already makes posterior sharp)
+      - Addition/listops/maze: sparse-directional → Type 4 cells dominant
+        (sequential dependency means hard cells stay hard until predecessors
+        resolved)
+    """
+    if device is None:
+        device = DEVICE
+
+    # Get confidence rank by running confidence-decode
+    conf_results = generate_blanks(model, tokenizer, test_data,
+                                   decode_policy='confidence',
+                                   batch_size=batch_size, device=device)
+    # Get solver rank from metadata (puzzle's solve_order is precomputed)
+    classification = []
+    aggregate = {1: 0, 2: 0, 3: 0, 4: 0}
+    for puzzle, conf_r in zip(test_data, conf_results):
+        meta = puzzle['meta']
+        blanks = [j for j in range(ANS_LEN) if not meta[j]['is_given']]
+        n_b = len(blanks)
+        if n_b < 4:
+            continue
+        # Confidence rank: order in which model decoded each cell (from conf_r)
+        decode_order = conf_r.get('decode_order_blanks')
+        if decode_order is None:
+            continue
+        conf_rank = {}
+        for rank_idx, cell_idx in enumerate(decode_order):
+            conf_rank[cell_idx] = rank_idx
+        # Solver rank: from metadata
+        solver_rank = {}
+        for j in blanks:
+            sr = meta[j].get('solve_order', None)
+            if sr is None:
+                continue
+            solver_rank[j] = sr
+        # Classify each blank
+        per_puzzle = {1: 0, 2: 0, 3: 0, 4: 0}
+        median_rank = n_b / 2
+        for j in blanks:
+            if j not in conf_rank or j not in solver_rank:
+                continue
+            cf_early = conf_rank[j] < median_rank
+            sv_early = solver_rank[j] < median_rank
+            if sv_early and cf_early:
+                t = 1
+            elif not sv_early and cf_early:
+                t = 2
+            elif sv_early and not cf_early:
+                t = 3
+            else:
+                t = 4
+            per_puzzle[t] += 1
+            aggregate[t] += 1
+        classification.append({
+            'rating': puzzle.get('rating', 0),
+            'n_blanks': n_b,
+            'counts': per_puzzle,
+            'fraction': {t: c / max(n_b, 1) for t, c in per_puzzle.items()},
+        })
+    total = sum(aggregate.values())
+    aggregate_frac = {t: c / max(total, 1) for t, c in aggregate.items()}
+    return {
+        'per_puzzle': classification,
+        'aggregate_counts': aggregate,
+        'aggregate_fraction': aggregate_frac,
+        'description': (
+            'Type 1: solver early / conf early (mutual easy);  '
+            'Type 2: solver late / conf early (Transformer-friendly);  '
+            'Type 3: solver early / conf late (deceptive bookkeeping);  '
+            'Type 4: solver late / conf late (true extreme).'
+        ),
+    }
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -2133,6 +2243,24 @@ def run(tag=''):
                 print(f"CANDIDATE COUNT (ρ={best[1]:+.3f}) > prop_depth (ρ={rho_depth:+.3f})")
             else:
                 print(f"CP-LIKE (prop_depth ρ={rho_depth:+.3f})")
+
+        # ── Solver-confidence disagreement (GPT Experiment A) ──
+        # Per-cell classification of (solver early/late × confidence early/late).
+        # Paper claim: Sudoku is dense-symmetric so Type 2 (Transformer-friendly:
+        # solver late, confidence early) should dominate, contrasting with
+        # addition/listops where Type 4 (true sequential dependency) dominates.
+        print(f"  Solver-confidence disagreement analysis...")
+        try:
+            disagreement = analyse_solver_confidence_disagreement(
+                model, tok, all_test[:300], batch_size=16, device=DEVICE)
+            all_results[f'{mt}_disagreement'] = disagreement
+            agf = disagreement['aggregate_fraction']
+            print(f"    Type1 (mutual easy):   {agf[1]:.3f}")
+            print(f"    Type2 (T-friendly):    {agf[2]:.3f}")
+            print(f"    Type3 (deceptive):     {agf[3]:.3f}")
+            print(f"    Type4 (true extreme):  {agf[4]:.3f}")
+        except Exception as e:
+            print(f"    SKIPPED: {e}")
 
         # ── PUMA coverage (puma model only) ──
         if mt == 'puma':

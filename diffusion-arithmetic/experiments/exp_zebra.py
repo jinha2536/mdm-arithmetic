@@ -65,8 +65,12 @@ N_TEST = 2000; BATCH_SIZE = 64
 N_PER_BUCKET = 500
 MAX_ITERS = 500000; EVAL_EVERY = 5000; LOG_EVERY = 1000
 GEN_EVAL_EVERY = 20000; GEN_EVAL_N = 500
-MASK_TYPES = ['random', 'puma']
-DECODE_POLICIES = ['confidence', 'l2r', 'random']
+MASK_TYPES = ['random', 'papl', 'puma']  # spectrum of confidence-alignment intervention
+DECODE_POLICIES = ['confidence', 'layered_oracle', 'random']
+# layered_oracle = cell-level solver order with row/col/val triplet ties broken
+# by confidence. This is the true oracle (vs strict l2r which forces a spurious
+# order within each triplet). Replaces the previous 'l2r' which was approximately
+# but not exactly oracle.
 
 # Model (He et al. tiny: 3L/384D/12H, ~6M params)
 N_LAYER = 3; N_HEAD = 12; N_EMBD = 384; DROPOUT = 0.0; POS_ENC = 'absolute'
@@ -77,6 +81,8 @@ PUMA_TAU = 0.9; PUMA_K = 10  # fixed K (unused when K_START is set)
 # included): K=12 → 10 tokens/step, K=60 → 2 tokens/step.
 PUMA_K_START = 12; PUMA_K_END = 60
 PUMA_K_STEP = 3; PUMA_K_EVERY = None
+# PAPL (Peng et al. 2025, arXiv:2509.23405): paper defaults τ=1, α=1.
+PAPL_TAU = 1.0; PAPL_ALPHA = 1.0
 SEED = 42
 NO_AMP = False
 PATIENCE = 80000
@@ -123,9 +129,12 @@ def parse_args():
     p.add_argument('--n-embd', type=int); p.add_argument('--dropout', type=float)
     p.add_argument('--lr', type=float); p.add_argument('--weight-decay', type=float)
     p.add_argument('--patience', type=int)
+    p.add_argument('--no-patience', action='store_true',
+                   help='Disable early stopping for fair comparison across mask types')
     p.add_argument('--puma-tau', type=float); p.add_argument('--puma-k', type=int)
     p.add_argument('--puma-k-start', type=int); p.add_argument('--puma-k-end', type=int)
     p.add_argument('--puma-k-step', type=int); p.add_argument('--puma-k-every', type=int)
+    p.add_argument('--papl-tau', type=float); p.add_argument('--papl-alpha', type=float)
     p.add_argument('--masks', nargs='+'); p.add_argument('--decode', nargs='+')
     p.add_argument('--continuation-iters', type=int)
     p.add_argument('--no-continuation', action='store_true')
@@ -148,6 +157,7 @@ def parse_args():
         'patience': 'PATIENCE', 'puma_tau': 'PUMA_TAU', 'puma_k': 'PUMA_K',
         'puma_k_start': 'PUMA_K_START', 'puma_k_end': 'PUMA_K_END',
         'puma_k_step': 'PUMA_K_STEP', 'puma_k_every': 'PUMA_K_EVERY',
+        'papl_tau': 'PAPL_TAU', 'papl_alpha': 'PAPL_ALPHA',
         'seed': 'SEED', 'no_amp': 'NO_AMP',
         'continuation_iters': 'CONTINUATION_ITERS',
     }.items():
@@ -158,6 +168,8 @@ def parse_args():
         g['MASK_TYPES'] = args.masks
     if args.decode:
         g['DECODE_POLICIES'] = args.decode
+    if getattr(args, 'no_patience', False):
+        g['PATIENCE'] = None
     return args
 
 
@@ -865,6 +877,10 @@ def gen_eval(model, tokenizer, formatted_samples, metas, max_len,
             gen, _, info = generate_diffusion(
                 model, pids, MAX_ANS_TOKENS, mask_id,
                 policy=decode_policy, greedy=True,
+                reasoning_rank=(
+                    torch.tensor([m['reasoning_rank'] for m in batch_metas],
+                                 dtype=torch.long)
+                    if decode_policy == 'layered_oracle' else None),
                 pad_to=max_len, pad_id=pad_id, device=device)
 
             pred_ans_ids = gen[:, max_prefix_len:max_prefix_len + MAX_ANS_TOKENS]
@@ -1099,44 +1115,42 @@ def train_model(mask_type, tokenizer, train_formatted, train_metas,
     reveal_reasoning_order = None
     reveal_blanks = None
     reveal_tracked_strata = None
-    if mask_type == 'puma':
-        # Per-stratum tracked indices — one trajectory per puzzle size.
-        # Paper claim: size_3 (easiest) should converge toward τ ≈ +1 (solver
-        # order learned); size_6 (hardest) should plateau near τ ≈ 0 (the 0%
-        # PUMA case, solver order unlearnable due to instance-specific nature).
-        per_stratum_cap = max(REVEAL_TAU_N_TRACKED // len(STRATUM_NAMES), 10)
-        tracked_by_stratum = {sn: [] for sn in STRATUM_NAMES}
-        for i, m in enumerate(train_metas):
-            si = _size_to_stratum(m['n_houses'])
-            sn = STRATUM_NAMES[si]
-            if len(tracked_by_stratum[sn]) < per_stratum_cap:
-                tracked_by_stratum[sn].append((i, si))
-        tracked_flat = [t for v in tracked_by_stratum.values() for t in v]
-        strata_counts = {sn: len(v) for sn, v in tracked_by_stratum.items()}
-        if sum(strata_counts.values()) >= 30:
-            tracked = [t[0] for t in tracked_flat]
-            tracked_strata = [t[1] for t in tracked_flat]
-            reveal_tracked_ids = train_ids[tracked]
-            reveal_tracked_ans = train_ans[tracked]
-            reveal_tracked_strata = torch.tensor(tracked_strata, dtype=torch.long)
-            N_tr = len(tracked)
-            ro = torch.full((N_tr, MAX_ANS_TOKENS), MAX_ANS_TOKENS, dtype=torch.long)
-            bm = torch.zeros(N_tr, MAX_ANS_TOKENS, dtype=torch.bool)
-            for i, idx in enumerate(tracked):
-                meta = train_metas[idx]
-                rr = meta['reasoning_rank']
-                for j in range(MAX_ANS_TOKENS):
-                    ro[i, j] = rr[j]
-                # Only include actual solution tokens (not rainbow pad).
-                n_sol = meta['n_sol_tokens']
-                bm[i, :min(n_sol, MAX_ANS_TOKENS)] = True
-            reveal_reasoning_order = ro
-            reveal_blanks = bm
-            print(f"  Reveal-τ tracking (stratified): total={N_tr}, by stratum: " +
-                  ', '.join(f"{sn}={c}" for sn, c in strata_counts.items() if c > 0))
-        else:
-            print(f"  Reveal-τ tracking: SKIPPED "
-                  f"(total tracked < 30: {strata_counts})")
+    # Build tracked subset for ALL mask_types (diagnostic measures confidence-greedy
+    # reveal order regardless of how model was trained). Per-stratum tracked
+    # indices — one trajectory per puzzle size.
+    per_stratum_cap = max(REVEAL_TAU_N_TRACKED // len(STRATUM_NAMES), 10)
+    tracked_by_stratum = {sn: [] for sn in STRATUM_NAMES}
+    for i, m in enumerate(train_metas):
+        si = _size_to_stratum(m['n_houses'])
+        sn = STRATUM_NAMES[si]
+        if len(tracked_by_stratum[sn]) < per_stratum_cap:
+            tracked_by_stratum[sn].append((i, si))
+    tracked_flat = [t for v in tracked_by_stratum.values() for t in v]
+    strata_counts = {sn: len(v) for sn, v in tracked_by_stratum.items()}
+    if sum(strata_counts.values()) >= 30:
+        tracked = [t[0] for t in tracked_flat]
+        tracked_strata = [t[1] for t in tracked_flat]
+        reveal_tracked_ids = train_ids[tracked]
+        reveal_tracked_ans = train_ans[tracked]
+        reveal_tracked_strata = torch.tensor(tracked_strata, dtype=torch.long)
+        N_tr = len(tracked)
+        ro = torch.full((N_tr, MAX_ANS_TOKENS), MAX_ANS_TOKENS, dtype=torch.long)
+        bm = torch.zeros(N_tr, MAX_ANS_TOKENS, dtype=torch.bool)
+        for i, idx in enumerate(tracked):
+            meta = train_metas[idx]
+            rr = meta['reasoning_rank']
+            for j in range(MAX_ANS_TOKENS):
+                ro[i, j] = rr[j]
+            # Only include actual solution tokens (not rainbow pad).
+            n_sol = meta['n_sol_tokens']
+            bm[i, :min(n_sol, MAX_ANS_TOKENS)] = True
+        reveal_reasoning_order = ro
+        reveal_blanks = bm
+        print(f"  Reveal-τ tracking (stratified, [{mask_type}]): total={N_tr}, by stratum: " +
+              ', '.join(f"{sn}={c}" for sn, c in strata_counts.items() if c > 0))
+    else:
+        print(f"  Reveal-τ tracking: SKIPPED "
+              f"(total tracked < 30: {strata_counts})")
 
     # PUMA K schedule
     k_sched = None
@@ -1155,7 +1169,8 @@ def train_model(mask_type, tokenizer, train_formatted, train_metas,
         else:
             k_sched = puma_k_fixed(PUMA_K)
             print(f"  PUMA K: fixed {PUMA_K}")
-    K_final_for_tau = k_sched(max_iters) if k_sched else None
+    # Diagnostic K: PUMA uses live k_sched, random/PAPL use PUMA_K_END as fixed K.
+    K_final_for_tau = k_sched(max_iters) if k_sched else (PUMA_K_END or PUMA_K)
 
     def eval_fn(model, it, tg):
         probe = probe_per_position(model, tokenizer, test_formatted, test_metas,
@@ -1180,11 +1195,16 @@ def train_model(mask_type, tokenizer, train_formatted, train_metas,
             probe['gen_cell_accuracy'] = r['cell_accuracy']
             probe['gen_concordance_l2r'] = r.get('concordance_l2r')
 
-        # Reveal-τ (PUMA only, past K threshold) — stratified by puzzle size
+        # Reveal-τ (all mask_types, per-type K and eligibility) — stratified by puzzle size
         if (reveal_tracked_ids is not None and it > 0
                 and it % REVEAL_TAU_EVERY == 0 and K_final_for_tau is not None):
-            K_cur = k_sched(it)
-            if K_cur >= K_final_for_tau * REVEAL_TAU_K_THRESHOLD_FRAC:
+            if mask_type == 'puma' and k_sched is not None:
+                K_cur = k_sched(it)
+                eligible = K_cur >= K_final_for_tau * REVEAL_TAU_K_THRESHOLD_FRAC
+            else:
+                K_cur = K_final_for_tau
+                eligible = it >= max(max_iters // 4, 30000)
+            if eligible:
                 traj = simulate_reveal_trajectory(
                     model, tokenizer, reveal_tracked_ids, reveal_tracked_ans,
                     MAX_ANS_TOKENS,
@@ -1230,6 +1250,7 @@ def train_model(mask_type, tokenizer, train_formatted, train_metas,
         mask_type=mask_type, blank_masks=None,
         puma_tau=PUMA_TAU,
         puma_k_schedule=k_sched,
+        papl_tau=PAPL_TAU, papl_alpha=PAPL_ALPHA,
         n_layer=N_LAYER, n_head=N_HEAD, n_embd=N_EMBD,
         dropout=DROPOUT, pos_enc=POS_ENC,
         max_iters=max_iters, batch_size=BATCH_SIZE,

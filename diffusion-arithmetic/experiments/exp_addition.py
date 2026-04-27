@@ -92,6 +92,8 @@ def parse_args():
     p.add_argument('--lr', type=float)
     p.add_argument('--weight-decay', type=float)
     p.add_argument('--patience', type=int)
+    p.add_argument('--no-patience', action='store_true',
+                   help='Disable early stopping for fair comparison across mask types')
     p.add_argument('--puma-tau', type=float)
     p.add_argument('--puma-k', type=int)
     p.add_argument('--puma-k-start', type=int)
@@ -130,6 +132,7 @@ def parse_args():
     if args.masks: g['MASK_TYPES'] = args.masks
     if args.decode: g['DECODE_POLICIES'] = args.decode
     if args.data_mode: g['DATA_MODE'] = args.data_mode
+    if getattr(args, 'no_patience', False): g['PATIENCE'] = None
     return args
 
 
@@ -931,49 +934,50 @@ def train_model(mask_type, tokenizer, train_samples, suite, max_len,
 
     # ── Reveal-vs-reasoning tau diagnostic setup (PUMA only) ──
     # Track a fixed subset of extreme training samples (long carry chains) and,
-    # at late-training checkpoints where K has grown large, compare PUMA's
-    # confidence-induced reveal order against the canonical reasoning order (r2l).
-    # This is the central zebra-inspired diagnostic — does what PUMA *learns* to
-    # unmask first actually align with the direction that logical reasoning would
-    # proceed?
+    # Reveal-vs-reasoning tau diagnostic (all mask types — the central thesis test)
+    # Track a stratified subset of training samples. At late-training checkpoints,
+    # simulate confidence-greedy reveal trajectories (using a fixed K tied to the
+    # PUMA final K so all methods are compared under identical inference conditions)
+    # and compare against the canonical reasoning order (r2l for addition).
+    # Key prediction: Random trains on all patterns uniformly, so even extreme
+    # chains end up with τ ≈ +1 (r2l learned). PUMA/PAPL amplify confident
+    # positions and miss extreme patterns, yielding τ ≈ 0 on chain_16plus.
     reveal_tracked_ids = None
     reveal_tracked_ans = None
     reveal_reasoning_order = None
     reveal_blanks = None
     reveal_tracked_strata = None
-    if mask_type == 'puma':
-        # Per-stratum tracked indices: gather up to per_stratum_cap samples
-        # from each chain-length stratum. This lets us decompose the τ
-        # trajectory — e.g. chain_0_3 should trend toward τ ≈ +1 (r2l learned)
-        # while chain_24plus should remain near τ ≈ 0 (extreme case misalign).
-        per_stratum_cap = max(REVEAL_TAU_N_TRACKED // len(STRATUM_NAMES), 10)
-        tracked_by_stratum = {sn: [] for sn in STRATUM_NAMES}
-        for i, s in enumerate(train_samples):
-            cl = _max_chain_len(*_parse_operands(s))
-            si = _chain_to_stratum(cl)
-            sn = STRATUM_NAMES[si]
-            if len(tracked_by_stratum[sn]) < per_stratum_cap:
-                tracked_by_stratum[sn].append((i, si))
-        tracked_flat = [t for v in tracked_by_stratum.values() for t in v]
-        strata_counts = {sn: len(v) for sn, v in tracked_by_stratum.items()}
-        if sum(strata_counts.values()) >= 30:
-            tracked_idx = [t[0] for t in tracked_flat]
-            tracked_strata = [t[1] for t in tracked_flat]
-            reveal_tracked_ids = train_ids[tracked_idx]
-            reveal_tracked_ans = train_ans[tracked_idx]
-            reveal_tracked_strata = torch.tensor(tracked_strata, dtype=torch.long)
-            N_tr = len(tracked_idx)
-            # Reasoning order for addition: r2l — LSB (answer position ANS_LEN-1)
-            # decoded first, MSB (answer position 0) last. Rank[j] = ANS_LEN-1-j.
-            reveal_reasoning_order = torch.arange(
-                ANS_LEN - 1, -1, -1, dtype=torch.long).unsqueeze(0).expand(
-                N_tr, -1).contiguous()
-            reveal_blanks = torch.ones(N_tr, ANS_LEN, dtype=torch.bool)
-            print(f"  Reveal-τ tracking (stratified): total={N_tr}, by stratum: " +
-                  ', '.join(f"{sn}={c}" for sn, c in strata_counts.items() if c > 0))
-        else:
-            print(f"  Reveal-τ tracking: SKIPPED "
-                  f"(total tracked < 30: {strata_counts})")
+    # Per-stratum tracked indices: gather up to per_stratum_cap samples from
+    # each chain-length stratum. Shared across all mask_types so comparisons
+    # are on the same sample set.
+    per_stratum_cap = max(REVEAL_TAU_N_TRACKED // len(STRATUM_NAMES), 10)
+    tracked_by_stratum = {sn: [] for sn in STRATUM_NAMES}
+    for i, s in enumerate(train_samples):
+        cl = _max_chain_len(*_parse_operands(s))
+        si = _chain_to_stratum(cl)
+        sn = STRATUM_NAMES[si]
+        if len(tracked_by_stratum[sn]) < per_stratum_cap:
+            tracked_by_stratum[sn].append((i, si))
+    tracked_flat = [t for v in tracked_by_stratum.values() for t in v]
+    strata_counts = {sn: len(v) for sn, v in tracked_by_stratum.items()}
+    if sum(strata_counts.values()) >= 30:
+        tracked_idx = [t[0] for t in tracked_flat]
+        tracked_strata = [t[1] for t in tracked_flat]
+        reveal_tracked_ids = train_ids[tracked_idx]
+        reveal_tracked_ans = train_ans[tracked_idx]
+        reveal_tracked_strata = torch.tensor(tracked_strata, dtype=torch.long)
+        N_tr = len(tracked_idx)
+        # Reasoning order for addition: r2l — LSB (answer position ANS_LEN-1)
+        # decoded first, MSB (answer position 0) last. Rank[j] = ANS_LEN-1-j.
+        reveal_reasoning_order = torch.arange(
+            ANS_LEN - 1, -1, -1, dtype=torch.long).unsqueeze(0).expand(
+            N_tr, -1).contiguous()
+        reveal_blanks = torch.ones(N_tr, ANS_LEN, dtype=torch.bool)
+        print(f"  Reveal-τ tracking (stratified, [{mask_type}]): total={N_tr}, by stratum: " +
+              ', '.join(f"{sn}={c}" for sn, c in strata_counts.items() if c > 0))
+    else:
+        print(f"  Reveal-τ tracking: SKIPPED "
+              f"(total tracked < 30: {strata_counts})")
 
     # PUMA K schedule
     k_sched = None
@@ -992,7 +996,11 @@ def train_model(mask_type, tokenizer, train_samples, suite, max_len,
             k_sched = puma_k_fixed(PUMA_K)
             print(f"  PUMA K: fixed {PUMA_K}")
 
-    K_final_for_tau = k_sched(max_iters) if k_sched else None
+    # Diagnostic K for reveal-τ simulation. PUMA uses its live k_sched (training K).
+    # Random/PAPL have no training K — use PUMA_K_END as a fixed inference-time
+    # reveal granularity so all three methods are compared under the same decoding
+    # condition (same number of tokens revealed per step).
+    K_final_for_tau = k_sched(max_iters) if k_sched else (PUMA_K_END or PUMA_K)
 
     # Eval callback — probe on natural + optional gen eval + reveal-τ diagnostic
     def eval_fn(model, it, tg):
@@ -1007,11 +1015,21 @@ def train_model(mask_type, tokenizer, train_samples, suite, max_len,
             probe['gen_acc_confidence'] = r['accuracy']
             print(f"      [gen] natural confidence={r['accuracy']:.3f}")
 
-        # Reveal-vs-reasoning tau (PUMA only, past K threshold, on fixed cadence)
+        # Reveal-vs-reasoning tau (all mask types, on fixed cadence after warmup)
+        # For PUMA: use live k_sched(it), gated by K_cur >= K_final * threshold so
+        #   we only measure once the curriculum has reached its final reveal granularity.
+        # For random/PAPL: K is fixed (K_final_for_tau), always eligible after min iter.
         if (reveal_tracked_ids is not None and it > 0
                 and it % REVEAL_TAU_EVERY == 0 and K_final_for_tau is not None):
-            K_cur = k_sched(it)
-            if K_cur >= K_final_for_tau * REVEAL_TAU_K_THRESHOLD_FRAC:
+            if mask_type == 'puma' and k_sched is not None:
+                K_cur = k_sched(it)
+                eligible = K_cur >= K_final_for_tau * REVEAL_TAU_K_THRESHOLD_FRAC
+            else:
+                # Random/PAPL: K is fixed; activate after ~1/4 of training so
+                # there's some signal to measure (avoid near-init models)
+                K_cur = K_final_for_tau
+                eligible = it >= max(max_iters // 4, 20000)
+            if eligible:
                 traj = simulate_reveal_trajectory(
                     model, tokenizer, reveal_tracked_ids, reveal_tracked_ans, ANS_LEN,
                     blank_masks=reveal_blanks, K=K_cur, tau=PUMA_TAU,
@@ -1210,41 +1228,63 @@ def make_figures(all_dyn, all_final):
         ax.set_ylim(-0.02, 1.02); ax.legend(); ax.grid(alpha=0.3)
         fig.tight_layout(); figs[f'never_revealed_{extreme_key}'] = fig
 
-    # Fig 7: Reveal-vs-reasoning Kendall τ trajectory (PUMA only)
-    # Central training-time diagnostic. Overlays overall trajectory (shaded IQR)
-    # with per-stratum median trajectories, so the paper argument "PUMA learns
-    # r2l order for easy chains but fails to align for chain≥24" is a single
-    # figure: chain_0_3 line converges to +1, chain_24plus stays near 0.
-    puma_dyn = all_dyn.get('puma', {})
-    tau_pts = [c for c in puma_dyn.get('checkpoints', []) if 'reveal_tau' in c]
-    if tau_pts:
-        fig, ax = plt.subplots(figsize=(10, 5))
-        # Overall (shaded IQR)
-        xs = [c['iter'] for c in tau_pts]
-        mids = [c['reveal_tau']['q50'] for c in tau_pts]
-        q25s = [c['reveal_tau']['q25'] for c in tau_pts]
-        q75s = [c['reveal_tau']['q75'] for c in tau_pts]
-        ax.fill_between(xs, q25s, q75s, alpha=0.2, color='#8e44ad', label='overall IQR')
-        ax.plot(xs, mids, '--', color='#5e2d6e', lw=1.5, label='overall median')
-        # Per-stratum trajectories
+    # Fig 7: Reveal-vs-reasoning Kendall τ trajectory (3-way: random | papl | puma)
+    # Central training-time diagnostic. Per-stratum trajectories reveal which
+    # training method produces a denoiser whose confidence-greedy reveal order
+    # aligns with the canonical r2l reasoning order. Key paper claim: on the
+    # chain_16plus extreme stratum, Random's τ reaches ≈ +1 (r2l learned),
+    # while PUMA and PAPL both stay near τ ≈ 0 — confidence-aligned training
+    # systematically fails to cover the extreme stratum's reasoning order.
+    mask_types_present = [mt for mt in ['random', 'papl', 'puma']
+                          if mt in all_dyn and any(
+                              'reveal_tau' in c
+                              for c in all_dyn[mt].get('checkpoints', []))]
+    if mask_types_present:
+        fig, axes = plt.subplots(1, len(mask_types_present),
+                                 figsize=(5 * len(mask_types_present), 5),
+                                 sharey=True)
+        if len(mask_types_present) == 1:
+            axes = [axes]
         s_cmap = plt.cm.plasma
-        for si, sn in enumerate(STRATUM_NAMES):
-            xs_s, mids_s = [], []
-            for c in tau_pts:
-                ps = c['reveal_tau'].get('per_stratum', {}).get(sn)
-                if ps is not None:
-                    xs_s.append(c['iter']); mids_s.append(ps['q50'])
-            if xs_s:
-                ax.plot(xs_s, mids_s, '-o',
-                        color=s_cmap(si / max(len(STRATUM_NAMES) - 1, 1)),
-                        label=sn, lw=2, markersize=5)
-        ax.axhline(0, color='gray', ls=':', alpha=0.7, label='τ=0')
-        ax.axhline(1, color='green', ls='--', alpha=0.4, label='τ=+1 (r2l)')
-        ax.axhline(-1, color='red', ls='--', alpha=0.4, label='τ=−1 (reversed)')
-        ax.set_xlabel('Training iteration')
-        ax.set_ylabel('Kendall τ (reveal vs r2l reasoning order)')
-        ax.set_title('PUMA reveal-order alignment, stratified by chain length')
-        ax.set_ylim(-1.05, 1.05); ax.legend(loc='best', fontsize=8); ax.grid(alpha=0.3)
+        for ax_idx, mt in enumerate(mask_types_present):
+            ax = axes[ax_idx]
+            dyn = all_dyn[mt]
+            tau_pts = [c for c in dyn.get('checkpoints', []) if 'reveal_tau' in c]
+            if not tau_pts:
+                ax.set_title(f'{mt}\n(no data)')
+                continue
+            # Overall IQR
+            xs = [c['iter'] for c in tau_pts]
+            mids = [c['reveal_tau']['q50'] for c in tau_pts]
+            q25s = [c['reveal_tau']['q25'] for c in tau_pts]
+            q75s = [c['reveal_tau']['q75'] for c in tau_pts]
+            ax.fill_between(xs, q25s, q75s, alpha=0.15, color='#444444',
+                            label='overall IQR')
+            ax.plot(xs, mids, '--', color='#222222', lw=1.2, alpha=0.7,
+                    label='overall median')
+            # Per-stratum trajectories
+            for si, sn in enumerate(STRATUM_NAMES):
+                xs_s, mids_s = [], []
+                for c in tau_pts:
+                    ps = c['reveal_tau'].get('per_stratum', {}).get(sn)
+                    if ps is not None:
+                        xs_s.append(c['iter']); mids_s.append(ps['q50'])
+                if xs_s:
+                    ax.plot(xs_s, mids_s, '-o',
+                            color=s_cmap(si / max(len(STRATUM_NAMES) - 1, 1)),
+                            label=sn, lw=2, markersize=4)
+            ax.axhline(0, color='gray', ls=':', alpha=0.7)
+            ax.axhline(1, color='green', ls='--', alpha=0.3)
+            ax.axhline(-1, color='red', ls='--', alpha=0.3)
+            ax.set_xlabel('Training iteration')
+            if ax_idx == 0:
+                ax.set_ylabel('Kendall τ (confidence-greedy reveal order vs r2l)')
+            ax.set_title(f'{mt}')
+            ax.set_ylim(-1.05, 1.05); ax.grid(alpha=0.3)
+            if ax_idx == len(mask_types_present) - 1:
+                ax.legend(loc='lower right', fontsize=7)
+        fig.suptitle('Reveal-order alignment vs canonical r2l, stratified by chain length',
+                     y=1.02, fontsize=11)
         fig.tight_layout(); figs['reveal_tau_stratified'] = fig
 
     return figs
