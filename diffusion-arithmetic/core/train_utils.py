@@ -131,10 +131,14 @@ def train_diffusion(
     puma_tau=0.9,
     puma_k_schedule=None,   # callable(it) → K; required if mask_type='puma'
     # PAPL (Planner-Aware Path Learning; Peng et al. 2025, arXiv:2509.23405)
-    # PAPL uses uniform random masking (like 'random') but reweights per-token
-    # loss by planner weights w^i ∝ exp((1/τ) log P(x_0^i | x_k)), softmax over
-    # masked positions. Final weight per position: (1/(L-k)) * (1 + α * w^i).
-    # The weights are detached — no gradient through the "planner" term.
+    # PAPL uses uniform random masking (like 'random') and reweights per-token
+    # loss by softmax-normalized planner weights (paper Eq. 7):
+    #     w^i ∝ exp((1/τ) log P(x_0^i | x_k)), softmax over masked positions
+    #     weight_i = (1/(L-k)) · (1 + α·w^i)
+    #     loss = Σ_{i: x_k^i=mask} weight_i · NLL_i
+    # The planner weights w^i are detached — no gradient through them.
+    # Direction: positions where the model is already confident on the correct
+    # token get additional weight, concentrating capacity on easy patterns.
     # α=0 recovers vanilla random masking; paper defaults τ=1, α=1.
     papl_tau=1.0,
     papl_alpha=1.0,
@@ -406,17 +410,25 @@ def train_diffusion(
                 logits = model(xm)
                 if m.sum() == 0:
                     continue
-                # Per-sample-mean formulation (matches PAPL paper Eq. 7 with α=0,
-                # which is the standard DLM ELBO Eq. 1). Each sample's loss is
-                # 1/(L-k) · Σ_i NLL_i over masked positions; then averaged over
-                # batch. This is fair to both 'random' and 'papl' modes (α=0
-                # recovers random exactly).
+                # Per-sample-mean formulation: each sample's loss is the mean
+                # NLL over its masked positions, then averaged over batch.
+                # PAPL paper Eq. 7 with α=0 reduces to this (= standard DLM ELBO).
                 log_probs = F.log_softmax(logits.float(), dim=-1)
                 tlp = log_probs.gather(-1, ids.unsqueeze(-1)).squeeze(-1)  # [B,T]
                 nll = -tlp                                                  # [B,T]
                 n_masked = m.sum(dim=-1).clamp_min(1).float()               # [B]
                 if mask_type == 'papl':
-                    # PAPL: w^i ∝ exp((1/τ) log P(x_0^i | x_k)), softmax over masked
+                    # PAPL loss (Peng et al. 2025, paper Eq. 7):
+                    #   L = -E_{x_0,k,x_k} Σ_{i: x_k^i=mask}
+                    #         (1/(L-k)) (1 + α·w^i) log P(x_0^i | x_k)
+                    #   where w^i ∝ exp((1/τ) log P(x_0^i | x_k)),
+                    #         softmax over masked positions, detached.
+                    # Direction: confident-on-correct masked positions get
+                    # additional weight beyond the base 1/(L-k). w^i is detached
+                    # — no gradient through the planner-weight branch.
+                    # The paper's github repo provides a simpler educational
+                    # form (weight = 1 + α·P(correct), no softmax/τ); we use
+                    # the formal Eq. 7 version with paper-default τ=1, α=1.
                     det = (tlp.detach() / papl_tau).masked_fill(~m, float('-inf'))
                     w_papl = F.softmax(det, dim=-1)                         # [B,T]
                     base_w = (1.0 / n_masked).unsqueeze(-1)                 # [B,1]
@@ -523,14 +535,21 @@ def generate_ar(model, prefix_ids, n_tokens, device=None):
 def generate_diffusion(model, prefix_ids, n_tokens, mask_id,
                        policy='confidence', greedy=True,
                        parallel_k=1, pad_to=None, pad_id=None,
+                       reasoning_rank=None,
                        device=None):
     """
     Masked diffusion generation with decode order tracking.
 
     Args:
-        policy: 'confidence', 'l2r', 'r2l', 'random'
+        policy: 'confidence', 'l2r', 'r2l', 'random', 'layered_oracle'
         greedy: argmax (True) or sample (False)
         pad_to: pad to training-length for consistent bidirectional attention
+        reasoning_rank: [B, n_tokens] long tensor of per-position partial-order
+            ranks (smaller = decode earlier). Used by 'layered_oracle' policy:
+            among masked answer positions, select those with minimum rank,
+            then break ties by confidence. Positions with rank >= n_tokens
+            are treated as "not in the answer" (e.g., rainbow padding past
+            trace_len) and decoded last in arbitrary order.
     Returns: (sequences, log_probs, decode_info)
     """
     if device is None:
@@ -557,6 +576,13 @@ def generate_diffusion(model, prefix_ids, n_tokens, mask_id,
     else:
         T_total = T
 
+    # Build full-sequence-aligned reasoning rank for layered_oracle (ans region only)
+    if policy == 'layered_oracle':
+        assert reasoning_rank is not None, "layered_oracle requires reasoning_rank"
+        # reasoning_rank: [B, n_tokens] — extend to [B, T_total] with +inf outside ans
+        full_rank = torch.full((B, T_total), float('inf'), device=device)
+        full_rank[:, T_pre:T_pre + n_tokens] = reasoning_rank.to(device).float()
+
     scores = torch.zeros(B, device=device)
     orders = []
 
@@ -577,6 +603,22 @@ def generate_diffusion(model, prefix_ids, n_tokens, mask_id,
             rand_scores = torch.rand(B, T_total, device=device)
             rand_scores[unmasked] = -float('inf')
             pos = rand_scores.argmax(-1)
+        elif policy == 'layered_oracle':
+            # Among masked positions, find those with minimum rank per sample;
+            # break ties by confidence (max-logit). Two-stage selection.
+            max_logit = logits.max(dim=-1).values            # [B, T_total]
+            # Mask-out ineligible: already-unmasked or rank=inf (outside ans)
+            mask_inel = unmasked | (full_rank == float('inf'))
+            # Compute min rank per row over eligible positions
+            rank_eff = full_rank.clone()
+            rank_eff[mask_inel] = float('inf')
+            min_rank = rank_eff.min(dim=-1, keepdim=True).values  # [B, 1]
+            # Eligible at min rank
+            elig_min = (rank_eff == min_rank) & ~mask_inel
+            # Score: confidence among elig_min, else -inf
+            score = max_logit.clone()
+            score[~elig_min] = -float('inf')
+            pos = score.argmax(-1)
         else:
             raise ValueError(f"Unknown policy: {policy}")
 
