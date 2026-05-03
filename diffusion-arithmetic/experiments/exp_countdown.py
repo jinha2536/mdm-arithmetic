@@ -82,6 +82,10 @@ MAX_ANS_LEN = 40
 MAX_SEQ_LEN = 60
 
 N_TRAIN = None; N_TEST = 1000; BATCH_SIZE = 256
+# Sub-sample rate for low-multiplicity (m=1-3) train puzzles. Default 0.10
+# keeps ~10% of m=1-3 (originally ~55% of data) so the rare-hard stratum
+# becomes ~5% of train — matching the paper's "rare patterns" framing.
+LOW_MULT_SAMPLE_RATE = 0.10
 MAX_ITERS = 400000; EVAL_EVERY = 5000; LOG_EVERY = 1000
 GEN_EVAL_EVERY = 10000; GEN_EVAL_N = 500
 MASK_TYPES = ['random', 'papl', 'puma']  # spectrum of confidence-alignment intervention
@@ -91,9 +95,13 @@ DECODE_POLICIES = ['confidence', 'step_seq', 'random']
 N_LAYER = 3; N_HEAD = 12; N_EMBD = 384; DROPOUT = 0.0; POS_ENC = 'absolute'
 LR = 3e-4; MIN_LR = 1e-5; WARMUP_ITERS = 1000; GRAD_CLIP = 1.0
 WEIGHT_DECAY = 0.01; EMA_DECAY = 0.9999
-PUMA_TAU = 0.9; PUMA_K = 8
-PUMA_K_START = None; PUMA_K_END = None
-PUMA_K_STEP = 3; PUMA_K_EVERY = None
+PUMA_TAU = 0.9; PUMA_K = 8  # fixed K (unused when K_START is set)
+# K range chosen for reveal-per-step alignment, matching other domains:
+# K=4 → 10 tokens/step at start (random-like, confidence uninformative early)
+# K=20 → 2 tokens/step at end (fine-grained, confidence reliable late).
+# ANS_LEN=40, so K_END=20 gives ans_len/2 reveals per step.
+PUMA_K_START = 4; PUMA_K_END = 20
+PUMA_K_STEP = 3; PUMA_K_EVERY = None  # None = auto (ramp over first 1/3 of training)
 # PAPL (Peng et al. 2025, arXiv:2509.23405): paper defaults τ=1, α=1.
 PAPL_TAU = 1.0; PAPL_ALPHA = 1.0
 SEED = 42
@@ -117,6 +125,9 @@ def parse_args():
     p.add_argument('--train-file', type=str); p.add_argument('--test-file', type=str)
     p.add_argument('--max-ans-len', type=int)
     p.add_argument('--n-train', type=int); p.add_argument('--n-test', type=int)
+    p.add_argument('--low-mult-sample-rate', type=float, default=None,
+                   help='Sub-sample rate for m=1-3 train puzzles (0-1). Default 0.10 '
+                        '(keeps ~10%% of m=1-3, making it ~5%% of train — rare hard stratum).')
     p.add_argument('--max-iters', type=int); p.add_argument('--batch-size', type=int)
     p.add_argument('--eval-every', type=int); p.add_argument('--gen-eval-every', type=int)
     p.add_argument('--n-layer', type=int); p.add_argument('--n-head', type=int)
@@ -157,6 +168,7 @@ def parse_args():
         'puma_k_start': 'PUMA_K_START', 'puma_k_end': 'PUMA_K_END',
         'puma_k_step': 'PUMA_K_STEP', 'puma_k_every': 'PUMA_K_EVERY',
         'papl_tau': 'PAPL_TAU', 'papl_alpha': 'PAPL_ALPHA',
+        'low_mult_sample_rate': 'LOW_MULT_SAMPLE_RATE',
         'seed': 'SEED', 'no_amp': 'NO_AMP',
         'continuation_iters': 'CONTINUATION_ITERS',
         'corner_ood_n': 'CORNER_OOD_N',
@@ -265,16 +277,17 @@ def count_solutions(nums, target, limit=None):
 
 
 def _mult_bin(m):
-    if m <= 1:
-        return 'm=1'
-    if m <= 5:
-        return 'm=2-5'
-    if m <= 20:
-        return 'm=6-20'
-    return 'm=21+'
+    """Multiplicity bins. Lower multiplicity = harder (fewer ways to reach
+    target = model must find the specific path). Combined m=1-3 gives a
+    statistically stable "rare hard" stratum that paper claim targets."""
+    if m <= 3:
+        return 'm=1-3'      # rare hard stratum (combined for statistical power)
+    if m <= 10:
+        return 'm=4-10'     # medium
+    return 'm=11+'          # easy (combined for size)
 
 
-MULT_BINS = ['m=1', 'm=2-5', 'm=6-20', 'm=21+']
+MULT_BINS = ['m=1-3', 'm=4-10', 'm=11+']
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -398,10 +411,14 @@ def load_jsonl(filepath, max_n=None):
     return data
 
 
-def load_and_format(filepath, max_n=None, seed=42, compute_mult=False):
+def load_and_format(filepath, max_n=None, seed=42, compute_mult=False,
+                    low_mult_sample_rate=1.0):
     """Load jsonl, format samples, return (samples, metas).
 
     If `compute_mult=True`, each meta gets solution_mult + mult_bin.
+    If `low_mult_sample_rate` < 1.0 (and compute_mult=True), only that fraction
+    of m=1-3 puzzles is kept. Use 0.10 for train data to make low-mult the
+    rarest stratum (~5%), matching the paper's "rare patterns" framing.
     """
     raw = load_jsonl(filepath, max_n)
     rng = random.Random(seed)
@@ -409,15 +426,26 @@ def load_and_format(filepath, max_n=None, seed=42, compute_mult=False):
 
     samples, metas = [], []
     skipped = 0
+    low_mult_dropped = 0
     for d in raw:
         s, m = _format_sample(d['input'], d['output'], compute_mult=compute_mult)
-        if s is not None:
-            samples.append(s)
-            metas.append(m)
-        else:
+        if s is None:
             skipped += 1
+            continue
+        # Sub-sample low-mult puzzles if requested (compute_mult must be True)
+        if (low_mult_sample_rate < 1.0 and compute_mult
+                and m.get('mult_bin') == 'm=1-3'
+                and rng.random() >= low_mult_sample_rate):
+            low_mult_dropped += 1
+            continue
+        samples.append(s)
+        metas.append(m)
     if skipped:
         print(f"  Skipped {skipped} samples (too long)")
+    if low_mult_dropped:
+        print(f"  Sub-sampled m=1-3: dropped {low_mult_dropped}, kept "
+              f"{sum(1 for m in metas if m.get('mult_bin') == 'm=1-3')} "
+              f"(rate={low_mult_sample_rate})")
     return samples, metas
 
 
@@ -1240,14 +1268,22 @@ def run(tag=''):
     test_path = os.path.join(DATA_DIR, TEST_FILE)
 
     print(f"\nLoading train data from {train_path}...")
+    t0 = time.time()
+    # LOW_MULT_SAMPLE_RATE=0.10: keep ~10% of m=1-3 (originally ~55% of data)
+    # so the rare-hard stratum becomes ~5% of train — matching paper's
+    # "confidence-aligned methods miss rare patterns" framing.
     train_samples, train_metas = load_and_format(
-        train_path, max_n=N_TRAIN, seed=SEED, compute_mult=False)
-    print(f"  {len(train_samples)} training samples")
+        train_path, max_n=N_TRAIN, seed=SEED, compute_mult=True,
+        low_mult_sample_rate=LOW_MULT_SAMPLE_RATE)
+    print(f"  {len(train_samples)} training samples "
+          f"(mult computed in {time.time()-t0:.1f}s)")
 
     print(f"Loading test data from {test_path}...")
     t0 = time.time()
+    # Test: keep full distribution (low_mult_sample_rate=1.0) for unbiased eval
     test_samples, test_metas = load_and_format(
-        test_path, max_n=N_TEST, seed=SEED + 1, compute_mult=True)
+        test_path, max_n=N_TEST, seed=SEED + 1, compute_mult=True,
+        low_mult_sample_rate=1.0)
     print(f"  {len(test_samples)} test samples "
           f"(mult computed in {time.time()-t0:.1f}s)")
 
@@ -1255,9 +1291,14 @@ def run(tag=''):
     print(f"  Chain depth (train): {dict(sorted(chain_dist.items()))}")
     chain_test = Counter(m['chain_depth'] for m in test_metas)
     print(f"  Chain depth (test):  {dict(sorted(chain_test.items()))}")
+    mult_train = Counter(m.get('mult_bin', 'unknown') for m in train_metas)
     mult_test = Counter(m['mult_bin'] for m in test_metas)
+    n_train = sum(mult_train.values())
+    n_test = sum(mult_test.values())
+    print(f"  Mult bin (train):    "
+          f"{[(mb, mult_train.get(mb, 0), f'{100*mult_train.get(mb,0)/max(n_train,1):.1f}%') for mb in MULT_BINS]}")
     print(f"  Mult bin (test):     "
-          f"{[(mb, mult_test.get(mb, 0)) for mb in MULT_BINS]}")
+          f"{[(mb, mult_test.get(mb, 0), f'{100*mult_test.get(mb,0)/max(n_test,1):.1f}%') for mb in MULT_BINS]}")
 
     ood_samples, ood_metas = [], []
     if not getattr(args, 'skip_ood', False):
