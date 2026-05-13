@@ -26,7 +26,15 @@ if EXP_DIR.name != 'experiments':
 REPO_ROOT = EXP_DIR.parent
 sys.path.insert(0, str(REPO_ROOT))
 sys.path.insert(0, str(EXP_DIR))
-print(f"REPO_ROOT = {REPO_ROOT}\nEXP_DIR   = {EXP_DIR}")
+# Switch cwd to repo root so relative paths like 'experiments/data/...' inside
+# the experiment scripts resolve correctly.  Users typically symlink data via:
+#     !ln -s /content/drive/MyDrive/data ./experiments/data
+# which puts the link at <repo>/experiments/data — only valid when cwd is the
+# repo root.  Without this chdir, exp_countdown looks up 'experiments/data/
+# cd4_test.jsonl' from cwd=<repo>/experiments and resolves to
+# <repo>/experiments/experiments/data/cd4_test.jsonl, which does not exist.
+os.chdir(REPO_ROOT)
+print(f"REPO_ROOT = {REPO_ROOT}\nEXP_DIR   = {EXP_DIR}\ncwd       = {os.getcwd()}")
 
 try:
     from google.colab import drive
@@ -102,6 +110,36 @@ def seed_has_all_checkpoints(seed):
 # ─── Cell 2: train 3 seeds ─────────────────────────────────────────────────
 print(f"\n{'═' * 70}\n  TRAIN: {DOMAIN}\n{'═' * 70}")
 import exp_countdown as ex  # noqa: E402
+
+# Resolve DATA_DIR to an absolute path that actually contains the test/train
+# files.  Tolerant to several common setups:
+#   (a) Symlink at <repo>/experiments/data → /content/drive/MyDrive/data
+#   (b) Data placed directly at /content/drive/MyDrive/data (no symlink)
+#   (c) Symlink ended up at <repo>/experiments/experiments/data (because user
+#       ran !ln -s ... ./experiments/data from cwd=experiments/)
+#   (d) Original relative 'experiments/data' resolving from repo root
+_data_candidates = [
+    REPO_ROOT / ex.DATA_DIR,                  # cwd-anchored, what the script assumes
+    EXP_DIR / 'data',                         # <repo>/experiments/data
+    EXP_DIR / 'experiments' / 'data',         # <repo>/experiments/experiments/data
+    Path('/content/drive/MyDrive/data'),      # direct Drive path
+    Path(ex.DATA_DIR).resolve(),              # raw path resolved
+]
+_resolved = None
+for _c in _data_candidates:
+    if (_c / ex.TEST_FILE).exists():
+        _resolved = _c.resolve()
+        break
+if _resolved is None:
+    print(f"WARNING: could not locate {ex.TEST_FILE} in any of:")
+    for _c in _data_candidates:
+        print(f"    {_c}  (exists={_c.exists()})")
+    print("Falling back to original DATA_DIR; training will likely fail.")
+else:
+    ex.DATA_DIR = str(_resolved)
+    print(f"Resolved DATA_DIR = {ex.DATA_DIR}")
+    print(f"  test file: {_resolved / ex.TEST_FILE}")
+    print(f"  train file: {_resolved / ex.TRAIN_FILE}")
 
 ex.TRAIN_ONLY = True
 
