@@ -31,7 +31,13 @@ if EXP_DIR.name != 'experiments':
 REPO_ROOT = EXP_DIR.parent
 sys.path.insert(0, str(REPO_ROOT))
 sys.path.insert(0, str(EXP_DIR))
-print(f"REPO_ROOT = {REPO_ROOT}\nEXP_DIR   = {EXP_DIR}")
+# Switch cwd to repo root so relative paths like 'experiments/data/...' inside
+# the experiment scripts (countdown in particular) resolve correctly.  Users
+# typically symlink data via:
+#     !ln -s /content/drive/MyDrive/data ./experiments/data
+# which lives at <repo>/experiments/data, valid only when cwd is the repo root.
+os.chdir(REPO_ROOT)
+print(f"REPO_ROOT = {REPO_ROOT}\nEXP_DIR   = {EXP_DIR}\ncwd       = {os.getcwd()}")
 
 try:
     from google.colab import drive

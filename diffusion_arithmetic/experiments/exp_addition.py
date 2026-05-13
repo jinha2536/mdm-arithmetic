@@ -52,9 +52,9 @@ TRAIN_ONLY = False  # set True via --train-only to skip all eval/analysis
 NO_AMP = True
 DATA_MODE = 'natural'
 
-# Early stopping: patience in iters (None = disabled, run full max_iters)
-# ~50k iters ≈ 640 epochs of patience
-PATIENCE = 50000
+# Early stopping: paper §D.2 — "Early stopping is disabled across all runs
+# to remove convergence speed as a confound between methods."
+PATIENCE = None
 
 # Continuation training: ~100-200 epochs ≈ 10k iters
 CONTINUATION_ITERS = 10000
@@ -86,7 +86,7 @@ def parse_args():
     p.add_argument('--data-mode', choices=['balanced', 'natural'])
     p.add_argument('--continuation-iters', type=int)
     p.add_argument('--no-continuation', action='store_true')
-    p.add_argument('--no-amp', action='store_true')
+    p.add_argument('--no-amp', action='store_true', default=None)
     p.add_argument('--train-only', action='store_true', help='Skip all eval/analysis, only train and save checkpoints')
     p.add_argument('--tag', type=str, default=''); p.add_argument('--seed', type=int)
     p.add_argument('--seeds', nargs='+', type=int)

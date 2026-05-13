@@ -101,7 +101,7 @@ def parse_args():
     p.add_argument('--no-patience', action='store_true',
                    help='Disable early stopping for fair comparison across mask types')
     p.add_argument('--no-continuation', action='store_true')
-    p.add_argument('--no-amp', action='store_true')
+    p.add_argument('--no-amp', action='store_true', default=None)
     p.add_argument('--train-only', action='store_true', help='Skip all eval/analysis, only train and save checkpoints')
     p.add_argument('--tag', type=str, default='')
     p.add_argument('--seed', type=int, default=None)

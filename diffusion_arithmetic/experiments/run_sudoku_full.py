@@ -25,7 +25,11 @@ if EXP_DIR.name != 'experiments':
 REPO_ROOT = EXP_DIR.parent
 sys.path.insert(0, str(REPO_ROOT))
 sys.path.insert(0, str(EXP_DIR))
-print(f"REPO_ROOT = {REPO_ROOT}\nEXP_DIR   = {EXP_DIR}")
+# Switch cwd to repo root for consistency with the other run_*_full scripts.
+# Sudoku loads from HuggingFace so doesn't strictly need this, but keeping the
+# same setup pattern simplifies the workflow.
+os.chdir(REPO_ROOT)
+print(f"REPO_ROOT = {REPO_ROOT}\nEXP_DIR   = {EXP_DIR}\ncwd       = {os.getcwd()}")
 
 try:
     from google.colab import drive
