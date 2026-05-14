@@ -1,4 +1,15 @@
-"""Multi-digit addition: training and decode analyses."""
+"""
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  Addition — Carry Dependency Learning + PUMA Coverage Deficit
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  Training: random vs puma masking (iteration-based, EMA)
+  Decode:   confidence (model) vs lsb (oracle) vs random
+  Analyses: GKP dependency, carry rarity × accuracy, PUMA coverage,
+            corner cases, confidence cascade, counterfactual carry
+  Continuation: random→puma, puma→random (representation persistence)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+"""
 import sys, os, time, math, json, random
 import torch
 import torch.nn as nn
@@ -19,42 +30,51 @@ from core.train_utils import (
 
 EXP_NAME = 'exp_addition'
 
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Config
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 ND = 32; ANS_LEN = ND + 1
-
+# N_TEST increased: natural distribution has chain≥24 at ~0.1-1% rate, so N=1000
+# barely reaches 10 extreme samples. N=10000 gives ~100 which is statistically meaningful.
+# Constructive tests (chain sweep, corner cases) are per-bucket and do not scale with N_TEST.
 N_TRAIN = 20000; N_TEST = 10000; BATCH_SIZE = 256
-# Per-bucket count for constructed (chain sweeps, corner cases) : shared across all analyses
+# Per-bucket count for constructed (chain sweeps, corner cases) — shared across all analyses
 N_PER_BUCKET = 500
-# ~78 iters/epoch at N_TRAIN=20000/BS=256 → 300k iters ≈ 3800 epochs (paper §D.2)
-MAX_ITERS = 300000; EVAL_EVERY = 5000; LOG_EVERY = 1000
+# ~78 iters/epoch at N_TRAIN=20000/BS=256 → 400k iters ≈ 5000 epochs
+MAX_ITERS = 400000; EVAL_EVERY = 5000; LOG_EVERY = 1000
 GEN_EVAL_EVERY = 10000; GEN_EVAL_N = 500
 # Reveal trajectory: K stages, match PUMA K_END for apples-to-apples
 REVEAL_K_DEFAULT = 16
+# Reveal-vs-reasoning tau diagnostic (PUMA-only, stratified across chain length).
+# Per-stratum cap ensures all chain-length buckets present in training data are
+# represented in the tracked subset; the final τ is decomposed by stratum so
+# easy/hard cases can be compared separately.
 REVEAL_TAU_N_TRACKED = 100        # total cap across strata (per-stratum = cap/num_strata)
 REVEAL_TAU_EVERY = 20000           # less frequent than eval; trajectory is slow-changing
 REVEAL_TAU_K_THRESHOLD_FRAC = 0.7  # only run once K_cur >= K_final * this
 MASK_TYPES = ['random', 'papl', 'puma']  # spectrum of confidence-alignment intervention
 DECODE_POLICIES = ['confidence', 'lsb']
-# Architecture: paper Table 4 — 2L/2H/128D ≈ 0.4M params
-N_LAYER = 2; N_HEAD = 2; N_EMBD = 128; DROPOUT = 0.1; POS_ENC = 'absolute'
+N_LAYER = 3; N_HEAD = 3; N_EMBD = 192; DROPOUT = 0.1; POS_ENC = 'absolute'
 LR = 1e-3; MIN_LR = 1e-4; WARMUP_ITERS = 2000; GRAD_CLIP = 1.0
 WEIGHT_DECAY = 0.1; EMA_DECAY = 0.9999
 PUMA_TAU = 0.9; PUMA_K = 8  # fixed K (unused when K_START is set)
+# Step schedule: K_START, +K_STEP every K_EVERY iters, cap K_END. The K range
+# is chosen so reveal-per-step = ans_len/K aligns with confidence informativeness:
+# start at ~10 tokens/step (random-like, confidence rank uninformative early in
+# training) and ramp to ~2 tokens/step (fine-grained once confidence is reliable).
+# For addition (ans_len=33): K=3 → 11 tokens/step, K=16 → ~2 tokens/step.
 PUMA_K_START = 3; PUMA_K_END = 16
 PUMA_K_STEP = 3; PUMA_K_EVERY = None  # None = auto (ramp over first 1/3 of training)
-# PAPL (Peng et al. 2026): α=5 is the paper's main setting, but it collapses
-# representation to zero on addition (Appendix D.3). We use α=1 for addition.
+# PAPL (Peng et al. 2025, arXiv:2509.23405): paper defaults τ=1, α=1. α up to 5
+# is safe for protein; we follow the recommended starting point.
 PAPL_TAU = 1.0; PAPL_ALPHA = 1.0
 SEED = 42
-TRAIN_ONLY = False  # set True via --train-only to skip all eval/analysis
-# bfloat16 reduces mantissa precision and interferes with exact single-digit
-# discrimination — disabled for fidelity (eval loss 0.0016 w/o vs 0.0027 w/ AMP).
-NO_AMP = True
+NO_AMP = False
 DATA_MODE = 'natural'
 
-# Early stopping: paper §D.2 — "Early stopping is disabled across all runs
-# to remove convergence speed as a confound between methods."
-PATIENCE = None
+# Early stopping: patience in iters (None = disabled, run full max_iters)
+# ~50k iters ≈ 640 epochs of patience
+PATIENCE = 50000
 
 # Continuation training: ~100-200 epochs ≈ 10k iters
 CONTINUATION_ITERS = 10000
@@ -84,10 +104,15 @@ def parse_args():
     p.add_argument('--papl-alpha', type=float)
     p.add_argument('--masks', nargs='+'); p.add_argument('--decode', nargs='+')
     p.add_argument('--data-mode', choices=['balanced', 'natural'])
+    # Position encoding ablation. 'absolute' (default) preserves original behavior.
+    # 'rope' enables RoPE in attention (no abs pos embedding).
+    # 'nope' disables both (NoPE — no positional information at all).
+    # 'none' is accepted as alias for 'nope' to match model.py's internal naming.
+    p.add_argument('--embedding', choices=['absolute', 'rope', 'nope', 'none'],
+                   help='Position encoding type for the Transformer')
     p.add_argument('--continuation-iters', type=int)
     p.add_argument('--no-continuation', action='store_true')
-    p.add_argument('--no-amp', action='store_true', default=None)
-    p.add_argument('--train-only', action='store_true', help='Skip all eval/analysis, only train and save checkpoints')
+    p.add_argument('--no-amp', action='store_true')
     p.add_argument('--tag', type=str, default=''); p.add_argument('--seed', type=int)
     p.add_argument('--seeds', nargs='+', type=int)
     try:
@@ -113,11 +138,19 @@ def parse_args():
     if args.masks: g['MASK_TYPES'] = args.masks
     if args.decode: g['DECODE_POLICIES'] = args.decode
     if args.data_mode: g['DATA_MODE'] = args.data_mode
+    if getattr(args, 'embedding', None):
+        pe = args.embedding
+        # Normalize 'nope' to model.py's internal name 'none' (where wpe=None and RoPE off).
+        if pe == 'nope':
+            pe = 'none'
+        g['POS_ENC'] = pe
     if getattr(args, 'no_patience', False): g['PATIENCE'] = None
     return args
 
 
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Data helpers
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 def _pad(n, w): return str(n).zfill(w)
 def _fmt_plain(a, b): return f"{_pad(a,ND)}+{_pad(b,ND)}={_pad(a+b,ANS_LEN)}"
 def get_answer(s): return s.split('=')[1]
@@ -212,9 +245,11 @@ def build_tok():
     return CharTokenizer(list('0123456789+='), {'mask': 'M', 'pad': 'P'})
 
 
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Data generation
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 def gen_data_natural(n, seed):
-    """Natural distribution : no carry balancing."""
+    """Natural distribution — no carry balancing."""
     rng = random.Random(seed)
     lo, hi = 10**(ND-1), 10**ND - 1
     return [_fmt_plain(rng.randint(lo, hi), rng.randint(lo, hi)) for _ in range(n)]
@@ -244,7 +279,9 @@ def gen_test_data(n, seed):
     return gen_data_natural(n, seed) if DATA_MODE == 'natural' else gen_data_balanced(n, seed)
 
 def gen_corner_case_test(n, seed, category='msb_chain'):
-    """Construct samples matching structural corner categories."""
+    """Construct samples matching structural corner categories.
+    Supported: 'msb_chain' (chain reaches MSB), 'full_propagate' (all-p digits).
+    """
     rng = random.Random(seed); lo, hi = 10**(ND-1), 10**ND-1; results = []
     for _ in range(n * 3000):
         if category == 'full_propagate':
@@ -314,7 +351,9 @@ def gen_counterfactual_pairs(n, seed):
     return results
 
 
-# Unified test suite : all analyses slice from here
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Unified test suite — all analyses slice from here
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 def _annotate_sample(s):
     """Pre-compute all structural annotations needed by downstream analyses."""
     a, b = _parse_operands(s)
@@ -342,12 +381,27 @@ def _bucket_from_samples(samples, tokenizer, max_len):
 
 
 def build_test_suite(tokenizer, max_len, seed=None):
-    """Build a unified test suite with pre-computed annotations."""
+    """
+    Build a unified test suite with pre-computed annotations.
+
+    All evaluations/analyses slice from this single source so that:
+      - Sample base is consistent across analyses (enables cross-referencing)
+      - Statistical power is shared (large natural + constructed extremes)
+      - No redundant re-generation and re-annotation
+
+    Structure:
+        suite['natural']                     — N_TEST natural distribution
+        suite['constructed']['chain_{cl}']   — min_chain ≥ cl (N_PER_BUCKET)
+        suite['constructed']['full_propagate'] — all-p corner (N_PER_BUCKET)
+        suite['constructed']['msb_chain']    — chain reaches MSB (N_PER_BUCKET)
+        suite['counterfactual']              — CF pairs (raw dict list)
+    Each bucket: {samples, metas, ids, ans_starts, n}
+    """
     if seed is None: seed = SEED + 1000
 
     suite = {}
 
-    # Natural distribution : the common test base
+    # Natural distribution — the common test base
     nat_samples = gen_test_data(N_TEST, seed)
     suite['natural'] = _bucket_from_samples(nat_samples, tokenizer, max_len)
 
@@ -368,7 +422,7 @@ def build_test_suite(tokenizer, max_len, seed=None):
         if sp:
             suite['constructed'][cat] = _bucket_from_samples(sp, tokenizer, max_len)
 
-    # Counterfactual pairs : raw dicts, uses natural-style samples
+    # Counterfactual pairs — raw dicts, uses natural-style samples
     suite['counterfactual'] = gen_counterfactual_pairs(200, seed=seed + 42)
 
     print(f"  Test suite built:")
@@ -380,7 +434,9 @@ def build_test_suite(tokenizer, max_len, seed=None):
 
 
 def filter_natural(suite, pred):
-    """Filter natural bucket by predicate on meta dict; return a bucket dict."""
+    """Filter natural bucket by predicate on meta dict; return a bucket dict.
+    Used to slice natural test data by chain length, carry pattern, etc.
+    """
     nat = suite['natural']
     idx = [i for i, m in enumerate(nat['metas']) if pred(m)]
     if not idx:
@@ -395,7 +451,9 @@ def filter_natural(suite, pred):
     }
 
 
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Probes & analyses
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 @torch.no_grad()
 def probe_per_position(model, tokenizer, test_samples, max_len, device=None):
@@ -481,7 +539,7 @@ def eval_counterfactual(model, tokenizer, cf_pairs, max_len, device=None):
     if device is None: device = DEVICE
     model.eval(); mask_id = tokenizer.special_ids['mask']
 
-    # Batch all samples: each cf pair 2 samples
+    # Batch all samples: each cf pair → 2 samples
     all_strings = []
     all_target_aj = []  # answer-relative position to check
     for cf in cf_pairs:
@@ -615,11 +673,31 @@ def analyse_carry_rarity(per_sample, test_samples):
     return {'per_position': per_pos, 'binned': binned, 'corr': corr}
 
 
-# Reveal trajectory analysis : the PUMA-specific failure diagnostic
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Reveal trajectory analysis — the PUMA-specific failure diagnostic
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 @torch.no_grad()
 def analyse_reveal_patterns(model, tokenizer, bucket, max_len,
                              K=REVEAL_K_DEFAULT, tau=PUMA_TAU, device=None):
-    """For a given test bucket (typically extreme class like chain>=24), run the PUMA forward process and aggregate reveal behavior by structural..."""
+    """
+    For a given test bucket (typically extreme class like chain>=24), run the
+    PUMA forward process and aggregate reveal behavior by structural role.
+
+    The core finding this produces: on extreme examples, PUMA defers (or never
+    reaches) specific structural positions — these are the positions the model
+    cannot learn because training signal is starved.
+
+    Returns:
+        per_position_reveal: [ANS_LEN, K] fraction of examples where position j
+                             is still masked at START of stage k (i.e., not yet revealed)
+        by_role: {role_name: [K] array, mean still-masked fraction per stage for positions of that role}
+                 role taken from dep_ctx (g/k/p_above_g/p_above_k/p_above_p/p_bottom/carry_out)
+        by_chain_position: [max_chain_seen, K] — for positions within the longest chain
+                          of each example, still-masked fraction indexed by "distance from chain bottom"
+        never_revealed: [ANS_LEN] fraction of examples where position j is still
+                        masked at the end of stage K
+        representative_traces: 3 example traces (reveal_stage arrays with annotation)
+    """
     if device is None: device = DEVICE
     if bucket['n'] == 0:
         return {'n': 0}
@@ -652,10 +730,13 @@ def analyse_reveal_patterns(model, tokenizer, bucket, max_len,
                 'n_positions': len(xs),
             }
 
+    # (3) By position-within-longest-chain (the core extreme-case view).
+    # For each example, find its longest propagate chain; for each chain position
+    # (0 = chain bottom, LSB side; L-1 = chain top, MSB side), record the reveal stage.
     max_chain_rank = 0
-    chain_acc = defaultdict(list)  # chain_rank list of (reveal_stage_value, still_masked_per_stage array)
+    chain_acc = defaultdict(list)  # chain_rank → list of (reveal_stage_value, still_masked_per_stage array)
     for i, m in enumerate(bucket['metas']):
-        gkp_digit = m['chain_stats']['gkp']  # digits LSBMSB
+        gkp_digit = m['chain_stats']['gkp']  # digits LSB→MSB
         # Find the longest p-run
         best = (-1, 0, 0)  # (length, start, end_exclusive)
         cur_s, cur_l = -1, 0
@@ -688,7 +769,7 @@ def analyse_reveal_patterns(model, tokenizer, bucket, max_len,
     # (4) Never-revealed fraction per position
     never = (rs >= K).float().mean(dim=0).tolist()  # [ANS_LEN]
 
-    # (5) Representative traces : 3 examples spanning short/medium/long max_chain
+    # (5) Representative traces — 3 examples spanning short/medium/long max_chain
     order_by_chain = sorted(range(N), key=lambda i: bucket['metas'][i]['chain_stats']['max_chain_len'])
     picks = [order_by_chain[len(order_by_chain) // 6],
              order_by_chain[len(order_by_chain) // 2],
@@ -804,8 +885,15 @@ def _quick_gen(model, tokenizer, test_samples, max_len, decode_policy='confidenc
     return {'accuracy': sum(r['correct'] for r in results)/max(len(results),1), 'n': len(results)}
 
 
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Training stratum construction
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
+# Chain-length stratum boundaries (upper-exclusive).
+# Natural uniform ND=32 distribution puts ~0 samples at chain≥24, so we use 4
+# strata instead of 5 and let the extreme bucket (chain_16plus) catch the long
+# tail — that's where the coverage-deficit prediction is most testable without
+# requiring constructive (synthetic) training data.
 STRATUM_BOUNDS = [(0, 4), (4, 8), (8, 16), (16, ND + 1)]
 STRATUM_NAMES = ['chain_0_3', 'chain_4_7', 'chain_8_15', 'chain_16plus']
 
@@ -818,36 +906,62 @@ def _chain_to_stratum(max_chain):
 
 
 def build_training_strata(train_samples):
-    """Compute stratum id per training sample (by max_chain_len)."""
+    """Compute stratum id per training sample (by max_chain_len).
+    Returns: long tensor [N], names list[str], counts list[int]
+    """
     strata = [_chain_to_stratum(_max_chain_len(*_parse_operands(s))) for s in train_samples]
     counts = [strata.count(i) for i in range(len(STRATUM_NAMES))]
     return torch.tensor(strata, dtype=torch.long), STRATUM_NAMES, counts
 
 
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Training wrapper (uses unified train_diffusion)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 def train_model(mask_type, tokenizer, train_samples, suite, max_len,
                 max_iters=None, init_state=None, device=None):
-    """Wrapper around train_diffusion for addition experiment."""
+    """Wrapper around train_diffusion for addition experiment.
+
+    Passes per-sample stratum tensor to train_diffusion so that training-time
+    masked-token loss is logged per chain-length stratum. This is the
+    training-side diagnostic: the trajectory shows which strata PUMA fails
+    to improve on over iterations.
+
+    `suite` is used for eval probes on natural distribution; eval_fn does
+    NOT compute stratified test-gen-acc (that analysis is done post-hoc after
+    training using the held-out constructed buckets).
+    """
     if device is None: device = DEVICE
     if max_iters is None: max_iters = MAX_ITERS
 
     train_ids, train_ans = encode_samples(train_samples, tokenizer, max_len)
     train_ids, train_ans = train_ids.to(device), train_ans.to(device)
 
-    # Stratum tensor : drives training-side loss trajectory
+    # Stratum tensor — drives training-side loss trajectory
     sample_strata, stratum_names, stratum_counts = build_training_strata(train_samples)
     print(f"  Training strata counts: " +
           ', '.join(f"{n}={c}" for n, c in zip(stratum_names, stratum_counts)))
 
     natural_samples = suite['natural']['samples']
 
+    # ── Reveal-vs-reasoning tau diagnostic setup (PUMA only) ──
+    # Track a fixed subset of extreme training samples (long carry chains) and,
+    # Reveal-vs-reasoning tau diagnostic (all mask types — the central thesis test)
+    # Track a stratified subset of training samples. At late-training checkpoints,
+    # simulate confidence-greedy reveal trajectories (using a fixed K tied to the
+    # PUMA final K so all methods are compared under identical inference conditions)
+    # and compare against the canonical reasoning order (r2l for addition).
+    # Key prediction: Random trains on all patterns uniformly, so even extreme
+    # chains end up with τ ≈ +1 (r2l learned). PUMA/PAPL amplify confident
+    # positions and miss extreme patterns, yielding τ ≈ 0 on chain_16plus.
     reveal_tracked_ids = None
     reveal_tracked_ans = None
     reveal_reasoning_order = None
     reveal_blanks = None
     reveal_tracked_strata = None
-
+    # Per-stratum tracked indices: gather up to per_stratum_cap samples from
+    # each chain-length stratum. Shared across all mask_types so comparisons
+    # are on the same sample set.
     per_stratum_cap = max(REVEAL_TAU_N_TRACKED // len(STRATUM_NAMES), 10)
     tracked_by_stratum = {sn: [] for sn in STRATUM_NAMES}
     for i, s in enumerate(train_samples):
@@ -865,7 +979,7 @@ def train_model(mask_type, tokenizer, train_samples, suite, max_len,
         reveal_tracked_ans = train_ans[tracked_idx]
         reveal_tracked_strata = torch.tensor(tracked_strata, dtype=torch.long)
         N_tr = len(tracked_idx)
-        # Reasoning order for addition: r2l : LSB (answer position ANS_LEN-1)
+        # Reasoning order for addition: r2l — LSB (answer position ANS_LEN-1)
         # decoded first, MSB (answer position 0) last. Rank[j] = ANS_LEN-1-j.
         reveal_reasoning_order = torch.arange(
             ANS_LEN - 1, -1, -1, dtype=torch.long).unsqueeze(0).expand(
@@ -889,14 +1003,18 @@ def train_model(mask_type, tokenizer, train_samples, suite, max_len,
                 k_every = max(1000, (max_iters // 3) // n_increments)
             k_sched = puma_k_step(PUMA_K_START, PUMA_K_END, k_step, k_every)
             final_k = k_sched(max_iters)
-            print(f"  PUMA K: step {PUMA_K_START}{final_k} (+{k_step} every {k_every//1000}k, cap={PUMA_K_END})")
+            print(f"  PUMA K: step {PUMA_K_START}→{final_k} (+{k_step} every {k_every//1000}k, cap={PUMA_K_END})")
         else:
             k_sched = puma_k_fixed(PUMA_K)
             print(f"  PUMA K: fixed {PUMA_K}")
 
+    # Diagnostic K for reveal-τ simulation. PUMA uses its live k_sched (training K).
+    # Random/PAPL have no training K — use PUMA_K_END as a fixed inference-time
+    # reveal granularity so all three methods are compared under the same decoding
+    # condition (same number of tokens revealed per step).
     K_final_for_tau = k_sched(max_iters) if k_sched else (PUMA_K_END or PUMA_K)
 
-    # Eval callback : probe on natural + optional gen eval + reveal-τ diagnostic
+    # Eval callback — probe on natural + optional gen eval + reveal-τ diagnostic
     def eval_fn(model, it, tg):
         probe = probe_per_position(model, tokenizer, natural_samples, max_len, device)
         dc = probe.get('dep_context', {})
@@ -909,6 +1027,10 @@ def train_model(mask_type, tokenizer, train_samples, suite, max_len,
             probe['gen_acc_confidence'] = r['accuracy']
             print(f"      [gen] natural confidence={r['accuracy']:.3f}")
 
+        # Reveal-vs-reasoning tau (all mask types, on fixed cadence after warmup)
+        # For PUMA: use live k_sched(it), gated by K_cur >= K_final * threshold so
+        #   we only measure once the curriculum has reached its final reveal granularity.
+        # For random/PAPL: K is fixed (K_final_for_tau), always eligible after min iter.
         if (reveal_tracked_ids is not None and it > 0
                 and it % REVEAL_TAU_EVERY == 0 and K_final_for_tau is not None):
             if mask_type == 'puma' and k_sched is not None:
@@ -980,7 +1102,9 @@ def train_model(mask_type, tokenizer, train_samples, suite, max_len,
     return model, dynamics
 
 
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Figures
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 def make_figures(all_dyn, all_final):
     figs = {}; labels = _pos_labels()
@@ -1019,7 +1143,7 @@ def make_figures(all_dyn, all_final):
                 ax.plot([v[0] for v in valid], [v[1] for v in valid], f'-{mk}',
                         color=col, label=mt, lw=2, markersize=8)
         ax.set_xlabel('Min carry chain length'); ax.set_ylabel('Accuracy')
-        ax.set_title(f'Chain Length Sweep :  {dp} decode'); ax.legend(); ax.grid(alpha=0.3)
+        ax.set_title(f'Chain Length Sweep — {dp} decode'); ax.legend(); ax.grid(alpha=0.3)
         fig.tight_layout(); figs[f'chain_sweep_{dp}'] = fig
 
     # Fig 3: Carry rarity × accuracy gap
@@ -1035,6 +1159,9 @@ def make_figures(all_dyn, all_final):
     ax.set_ylabel('acc(c=0) - acc(c=1)'); ax.legend(); ax.grid(alpha=0.3)
     fig.tight_layout(); figs['carry_rarity'] = fig
 
+    # Fig 4: Stratum loss trajectory — core training-side diagnostic
+    # Shows, per chain-length stratum, the mean masked-token loss over training.
+    # The central finding: PUMA's chain_24plus stratum plateaus while Random's decreases.
     mt_with_strat = [mt for mt in MASK_TYPES
                      if all_dyn.get(mt, {}).get('stratified_loss')]
     if mt_with_strat:
@@ -1063,6 +1190,11 @@ def make_figures(all_dyn, all_final):
         fig.suptitle('Training-time masked-token loss, stratified by chain length', y=1.02)
         fig.tight_layout(); figs['stratum_loss'] = fig
 
+    # Fig 5: Reveal-trajectory heatmap on extreme bucket — PUMA failure mechanism
+    # x-axis = PUMA stage, y-axis = chain-position rank (0 = chain bottom / LSB side,
+    # higher = chain top / MSB side). Cell value = fraction of examples where that
+    # chain-position is STILL MASKED at the start of that stage. High values at late
+    # stages = positions the forward process fails to train on.
     extreme_key = None
     for k in ['chain_24', 'chain_20', 'chain_16']:
         if any(f'{mt}_reveal_{k}' in all_final for mt in MASK_TYPES):
@@ -1089,7 +1221,7 @@ def make_figures(all_dyn, all_final):
                 ax.set_ylabel('Chain position rank (0 = LSB side of chain)')
                 ax.set_title(f'{mt}: still-masked fraction ({extreme_key}, N={rev["n"]})')
                 plt.colorbar(im, ax=ax, label='still masked')
-            fig.suptitle(f'Reveal trajectory :  {extreme_key} extreme bucket', y=1.02)
+            fig.suptitle(f'Reveal trajectory — {extreme_key} extreme bucket', y=1.02)
             fig.tight_layout(); figs[f'reveal_{extreme_key}'] = fig
 
     # Fig 6: Never-revealed fraction per answer position (PUMA failure map)
@@ -1108,6 +1240,13 @@ def make_figures(all_dyn, all_final):
         ax.set_ylim(-0.02, 1.02); ax.legend(); ax.grid(alpha=0.3)
         fig.tight_layout(); figs[f'never_revealed_{extreme_key}'] = fig
 
+    # Fig 7: Reveal-vs-reasoning Kendall τ trajectory (3-way: random | papl | puma)
+    # Central training-time diagnostic. Per-stratum trajectories reveal which
+    # training method produces a denoiser whose confidence-greedy reveal order
+    # aligns with the canonical r2l reasoning order. Key paper claim: on the
+    # chain_16plus extreme stratum, Random's τ reaches ≈ +1 (r2l learned),
+    # while PUMA and PAPL both stay near τ ≈ 0 — confidence-aligned training
+    # systematically fails to cover the extreme stratum's reasoning order.
     mask_types_present = [mt for mt in ['random', 'papl', 'puma']
                           if mt in all_dyn and any(
                               'reveal_tau' in c
@@ -1163,10 +1302,18 @@ def make_figures(all_dyn, all_final):
     return figs
 
 
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Run
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 def run(tag=''):
-    exp_name = f"{EXP_NAME}_{tag}" if tag else EXP_NAME
+    # Auto-suffix exp_name with the position-encoding variant when non-default,
+    # so runs with different --embedding don't overwrite each other's results.
+    # Use 'nope' (rather than 'none') in the filename for readability.
+    pe_for_name = 'nope' if POS_ENC == 'none' else POS_ENC
+    pe_suffix = '' if pe_for_name == 'absolute' else f'_{pe_for_name}'
+    base_name = f'{EXP_NAME}{pe_suffix}'
+    exp_name = f'{base_name}_{tag}' if tag else base_name
     mount_drive()
     torch.manual_seed(SEED); random.seed(SEED)
     tok = build_tok()
@@ -1174,13 +1321,13 @@ def run(tag=''):
     print(f"\n{'='*70}")
     print(f"  Addition ND={ND} | masks={MASK_TYPES} | decode={DECODE_POLICIES}")
     print(f"  N_TRAIN={N_TRAIN} N_TEST={N_TEST} MAX_ITERS={MAX_ITERS}")
-    print(f"  arch: {N_LAYER}L/{N_HEAD}H/{N_EMBD}D | data: {DATA_MODE}")
+    print(f"  arch: {N_LAYER}L/{N_HEAD}H/{N_EMBD}D | pos_enc={POS_ENC} | data: {DATA_MODE}")
     print(f"{'='*70}\n")
 
     train_data = gen_train_data(N_TRAIN, seed=SEED)
     max_len = max(len(tok.encode(s)) for s in train_data)
 
-    # Unified test suite : all evals/analyses slice from here
+    # Unified test suite — all evals/analyses slice from here
     suite = build_test_suite(tok, max_len, seed=SEED + 1000)
     natural_samples = suite['natural']['samples']
 
@@ -1192,25 +1339,11 @@ def run(tag=''):
 
     # ── Main training ──
     for mt in MASK_TYPES:
-        # Equalize initialization across mask types: each train_diffusion() call
-        # constructs a fresh Transformer (consuming global torch RNG for weight init).
-        # Without this re-seed, random→papl→puma each get different init weights,
-        # since prior trainings have advanced the global RNG state through dropout,
-        # batch sampling, randperm, etc. Re-seeding ensures all three start from the
-        # identical W_init, so observed differences are purely method-induced.
-        torch.manual_seed(SEED); random.seed(SEED)
-        print(f"\n=== {mt} ===")
+        print(f"\n{'━'*60}\n▶ {mt}\n{'━'*60}")
         m, d = train_model(mt, tok, train_data, suite, max_len)
         all_dyn[mt] = d
         saved_states[mt] = {k: v.cpu().clone() for k, v in m.state_dict().items()}
         save_checkpoint(exp_name, saved_states[mt], tag=mt)
-        if TRAIN_ONLY:
-            # Persist dynamics-so-far so we can resume analysis cleanly
-            save_results(exp_name, {'all_dyn': all_dyn, 'train_only': True},
-                         tag='dynamics_partial')
-            del m
-            if torch.cuda.is_available(): torch.cuda.empty_cache()
-            continue
 
         # Standard + heavy (both from suite / filter)
         for dp in DECODE_POLICIES:
@@ -1270,7 +1403,7 @@ def run(tag=''):
         corr_str = f"{rarity['corr']:.3f}" if rarity.get('corr') is not None else "N/A"
         print(f"    Rarity corr: {corr_str}")
 
-        # Reveal trajectory on extreme bucket : PUMA-specific failure diagnostic
+        # Reveal trajectory on extreme bucket — PUMA-specific failure diagnostic
         # (for both mask types: Random gives baseline shape to contrast against)
         extreme_key = None
         for k in ['chain_24', 'chain_20', 'chain_16']:
@@ -1295,12 +1428,6 @@ def run(tag=''):
 
     # ── Continuation training ──
     args = parse_args()
-    if TRAIN_ONLY:
-        # Save final dynamics and exit; eval/analysis is done offline.
-        save_results(exp_name, {'all_dyn': all_dyn, 'train_only': True})
-        print(f"\n[TRAIN_ONLY] skipping continuation + post-loop analysis; "
-              f"checkpoints + dynamics saved.")
-        return
     if not getattr(args, 'no_continuation', False) and len(MASK_TYPES) >= 2:
         cont_pairs = []
         if 'random' in saved_states and 'puma' in MASK_TYPES:
@@ -1310,7 +1437,7 @@ def run(tag=''):
 
         for src, tgt in cont_pairs:
             label = f'{src}_to_{tgt}'
-            print(f"\n=== Continuation: {label} ({CONTINUATION_ITERS} iters) ===")
+            print(f"\n{'━'*60}\n▶ Continuation: {label} ({CONTINUATION_ITERS} iters)\n{'━'*60}")
             m, d = train_model(tgt, tok, train_data, suite, max_len,
                                max_iters=CONTINUATION_ITERS,
                                init_state=saved_states[src])
@@ -1396,15 +1523,9 @@ def run(tag=''):
 
 if __name__ == '__main__':
     args = parse_args()
-    globals()['TRAIN_ONLY'] = args.train_only
     seeds = args.seeds if args.seeds else [SEED]
     for si, seed in enumerate(seeds):
         globals()['SEED'] = seed
-        # Always disambiguate output directories per-seed when multiple seeds are run,
-        # even without --tag; otherwise results from later seeds silently overwrite earlier ones.
-        if len(seeds) > 1:
-            t = f"{args.tag}_s{seed}" if args.tag else f"s{seed}"
-        else:
-            t = args.tag
+        t = f"{args.tag}_s{seed}" if args.tag and len(seeds) > 1 else args.tag
         if len(seeds) > 1: print(f"\n{'#'*70}\n# Seed {seed} ({si+1}/{len(seeds)})\n{'#'*70}")
         run(tag=t)
