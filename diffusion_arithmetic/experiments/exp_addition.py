@@ -26,8 +26,8 @@ ND = 32; ANS_LEN = ND + 1
 N_TRAIN = 20000; N_TEST = 10000; BATCH_SIZE = 256
 # Per-bucket count for constructed (chain sweeps, corner cases) : shared across all analyses
 N_PER_BUCKET = 500
-# ~78 iters/epoch at N_TRAIN=20000/BS=256 400k iters ≈ 5000 epochs
-MAX_ITERS = 400000; EVAL_EVERY = 5000; LOG_EVERY = 1000
+# ~78 iters/epoch at N_TRAIN=20000/BS=256; 300k iters ≈ 3800 epochs
+MAX_ITERS = 300000; EVAL_EVERY = 5000; LOG_EVERY = 1000
 GEN_EVAL_EVERY = 10000; GEN_EVAL_N = 500
 # Reveal trajectory: K stages, match PUMA K_END for apples-to-apples
 REVEAL_K_DEFAULT = 16
@@ -36,7 +36,7 @@ REVEAL_TAU_EVERY = 20000           # less frequent than eval; trajectory is slow
 REVEAL_TAU_K_THRESHOLD_FRAC = 0.7  # only run once K_cur >= K_final * this
 MASK_TYPES = ['random', 'papl', 'puma']  # spectrum of confidence-alignment intervention
 DECODE_POLICIES = ['confidence', 'lsb']
-N_LAYER = 3; N_HEAD = 3; N_EMBD = 192; DROPOUT = 0.1; POS_ENC = 'absolute'
+N_LAYER = 2; N_HEAD = 2; N_EMBD = 128; DROPOUT = 0.1; POS_ENC = 'absolute'
 LR = 1e-3; MIN_LR = 1e-4; WARMUP_ITERS = 2000; GRAD_CLIP = 1.0
 WEIGHT_DECAY = 0.1; EMA_DECAY = 0.9999
 PUMA_TAU = 0.9; PUMA_K = 8  # fixed K (unused when K_START is set)
@@ -46,7 +46,7 @@ PUMA_K_STEP = 3; PUMA_K_EVERY = None  # None = auto (ramp over first 1/3 of trai
 # is safe for protein; we follow the recommended starting point.
 PAPL_TAU = 1.0; PAPL_ALPHA = 1.0
 SEED = 42
-NO_AMP = False
+NO_AMP = True   # paper config: AMP bfloat16 disabled for digit-prediction fidelity
 DATA_MODE = 'natural'
 DATA_CHUNK_SIZE = 500_000  # chunk size for DATA_MODE='fresh'
 
@@ -57,8 +57,8 @@ DATA_CHUNK_SIZE = 500_000  # chunk size for DATA_MODE='fresh'
 CKPT_ITERS = [5000, 10000, 15000, 20000, 50000, 100000, 200000, 300000]
 
 # Early stopping: patience in iters (None = disabled, run full max_iters)
-# ~50k iters ≈ 640 epochs of patience
-PATIENCE = 50000
+# Paper config: None — run all max_iters to completion for clean trajectory comparison.
+PATIENCE = None
 
 # Continuation training: ~100-200 epochs ≈ 10k iters
 CONTINUATION_ITERS = 10000
