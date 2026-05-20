@@ -11,6 +11,7 @@ from collections import defaultdict
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
                 if '__file__' in dir() else '.')
 from core.tokenizer import CharTokenizer
+from core.model import Transformer
 from core.train_utils import (
     mount_drive, save_results, save_checkpoint, encode_samples,
     train_diffusion, puma_k_fixed, puma_k_linear, puma_k_step, generate_diffusion,
@@ -25,8 +26,8 @@ ND = 32; ANS_LEN = ND + 1
 N_TRAIN = 20000; N_TEST = 10000; BATCH_SIZE = 256
 # Per-bucket count for constructed (chain sweeps, corner cases) : shared across all analyses
 N_PER_BUCKET = 500
-# ~78 iters/epoch at N_TRAIN=20000/BS=256 → 300k iters ≈ 3800 epochs (paper §D.2)
-MAX_ITERS = 300000; EVAL_EVERY = 5000; LOG_EVERY = 1000
+# ~78 iters/epoch at N_TRAIN=20000/BS=256 400k iters ≈ 5000 epochs
+MAX_ITERS = 400000; EVAL_EVERY = 5000; LOG_EVERY = 1000
 GEN_EVAL_EVERY = 10000; GEN_EVAL_N = 500
 # Reveal trajectory: K stages, match PUMA K_END for apples-to-apples
 REVEAL_K_DEFAULT = 16
@@ -35,26 +36,29 @@ REVEAL_TAU_EVERY = 20000           # less frequent than eval; trajectory is slow
 REVEAL_TAU_K_THRESHOLD_FRAC = 0.7  # only run once K_cur >= K_final * this
 MASK_TYPES = ['random', 'papl', 'puma']  # spectrum of confidence-alignment intervention
 DECODE_POLICIES = ['confidence', 'lsb']
-# Architecture: paper Table 4 — 2L/2H/128D ≈ 0.4M params
-N_LAYER = 2; N_HEAD = 2; N_EMBD = 128; DROPOUT = 0.1; POS_ENC = 'absolute'
+N_LAYER = 3; N_HEAD = 3; N_EMBD = 192; DROPOUT = 0.1; POS_ENC = 'absolute'
 LR = 1e-3; MIN_LR = 1e-4; WARMUP_ITERS = 2000; GRAD_CLIP = 1.0
 WEIGHT_DECAY = 0.1; EMA_DECAY = 0.9999
 PUMA_TAU = 0.9; PUMA_K = 8  # fixed K (unused when K_START is set)
 PUMA_K_START = 3; PUMA_K_END = 16
 PUMA_K_STEP = 3; PUMA_K_EVERY = None  # None = auto (ramp over first 1/3 of training)
-# PAPL (Peng et al. 2026): α=5 is the paper's main setting, but it collapses
-# representation to zero on addition (Appendix D.3). We use α=1 for addition.
+# PAPL (Peng et al. 2025, arXiv:2509.23405): paper defaults τ=1, α=1. α up to 5
+# is safe for protein; we follow the recommended starting point.
 PAPL_TAU = 1.0; PAPL_ALPHA = 1.0
 SEED = 42
-TRAIN_ONLY = False  # set True via --train-only to skip all eval/analysis
-# bfloat16 reduces mantissa precision and interferes with exact single-digit
-# discrimination — disabled for fidelity (eval loss 0.0016 w/o vs 0.0027 w/ AMP).
-NO_AMP = True
+NO_AMP = False
 DATA_MODE = 'natural'
+DATA_CHUNK_SIZE = 500_000  # chunk size for DATA_MODE='fresh'
 
-# Early stopping: paper §D.2 — "Early stopping is disabled across all runs
-# to remove convergence speed as a confound between methods."
-PATIENCE = None
+# Multi-checkpoint schedule. Hybrid (dense early + sparse late) to capture
+# phase transitions in initial training and convergence behavior at the end.
+# Each iter ≤ MAX_ITERS triggers a save of the EMA snapshot during training.
+# Defaults are tuned for MAX_ITERS=300000; override via --ckpt-iters if MAX_ITERS differs.
+CKPT_ITERS = [5000, 10000, 15000, 20000, 50000, 100000, 200000, 300000]
+
+# Early stopping: patience in iters (None = disabled, run full max_iters)
+# ~50k iters ≈ 640 epochs of patience
+PATIENCE = 50000
 
 # Continuation training: ~100-200 epochs ≈ 10k iters
 CONTINUATION_ITERS = 10000
@@ -83,17 +87,30 @@ def parse_args():
     p.add_argument('--papl-tau', type=float)
     p.add_argument('--papl-alpha', type=float)
     p.add_argument('--masks', nargs='+'); p.add_argument('--decode', nargs='+')
-    p.add_argument('--data-mode', choices=['balanced', 'natural'])
+    p.add_argument('--data-mode', choices=['balanced', 'natural', 'fresh'],
+                   help="Training data mode. 'natural'/'balanced' pre-generate "
+                        "N_TRAIN samples once. 'fresh' generates new samples "
+                        "on demand (each sample seen at most once) — pool size "
+                        "= MAX_ITERS × BATCH_SIZE.")
+    p.add_argument('--data-chunk-size', type=int,
+                   help="Chunk size for 'fresh' data mode (default 500000)")
     # Position encoding ablation. 'absolute' (default) preserves original behavior.
     # 'rope' enables RoPE in attention (no abs pos embedding).
     # 'nope' disables both (NoPE — no positional information at all).
     # 'none' is accepted as alias for 'nope' to match model.py's internal naming.
     p.add_argument('--embedding', choices=['absolute', 'rope', 'nope', 'none'],
                    help='Position encoding type for the Transformer')
+    # Multi-checkpoint training: comma-separated iters at which to save EMA snapshots.
+    # E.g. --ckpt-iters 5000,10000,50000,100000 . Use 'none' to disable per-iter saves.
+    p.add_argument('--ckpt-iters', type=str,
+                   help="Comma-separated iters for EMA checkpoint saves, or 'none' to disable")
+    # Training-only mode: train + save per-method dynamics + per-iter EMA ckpts,
+    # then skip all post-training analyses. Pair with addition_decode_analysis.py.
+    p.add_argument('--train-only', action='store_true',
+                   help='Skip all post-training analyses; only train and save ckpts/dynamics')
     p.add_argument('--continuation-iters', type=int)
     p.add_argument('--no-continuation', action='store_true')
-    p.add_argument('--no-amp', action='store_true', default=None)
-    p.add_argument('--train-only', action='store_true', help='Skip all eval/analysis, only train and save checkpoints')
+    p.add_argument('--no-amp', action='store_true')
     p.add_argument('--tag', type=str, default=''); p.add_argument('--seed', type=int)
     p.add_argument('--seeds', nargs='+', type=int)
     try:
@@ -119,12 +136,19 @@ def parse_args():
     if args.masks: g['MASK_TYPES'] = args.masks
     if args.decode: g['DECODE_POLICIES'] = args.decode
     if args.data_mode: g['DATA_MODE'] = args.data_mode
+    if getattr(args, 'data_chunk_size', None):
+        g['DATA_CHUNK_SIZE'] = args.data_chunk_size
     if getattr(args, 'embedding', None):
         pe = args.embedding
-        # Normalize 'nope' to model.py's internal name 'none' (where wpe=None and RoPE off).
         if pe == 'nope':
-            pe = 'none'
+            pe = 'none'  # model.py uses 'none' internally
         g['POS_ENC'] = pe
+    if getattr(args, 'ckpt_iters', None) is not None:
+        s = args.ckpt_iters.strip().lower()
+        if s in ('none', 'off', 'disabled', ''):
+            g['CKPT_ITERS'] = []
+        else:
+            g['CKPT_ITERS'] = sorted(int(x) for x in s.split(',') if x.strip())
     if getattr(args, 'no_patience', False): g['PATIENCE'] = None
     return args
 
@@ -839,55 +863,86 @@ def build_training_strata(train_samples):
 # Training wrapper (uses unified train_diffusion)
 
 def train_model(mask_type, tokenizer, train_samples, suite, max_len,
-                max_iters=None, init_state=None, device=None):
-    """Wrapper around train_diffusion for addition experiment."""
+                max_iters=None, init_state=None, device=None,
+                seed_train=None, ckpt_schedule=None, ckpt_save_fn=None,
+                data_source=None):
+    """Wrapper around train_diffusion for addition experiment.
+
+    Reproducibility params:
+        seed_train: applied via torch.manual_seed AFTER model init load.
+            Decouples training RNG (mask sampling, batch order) from
+            model-init RNG. Use distinct values per (run-seed, method).
+        ckpt_schedule: list[int] of iters at which to save EMA snapshots.
+        ckpt_save_fn: callable(state_dict_cpu, it) — called at each scheduled iter.
+        data_source: optional fresh-data source (overrides pre-generated train_samples).
+    """
     if device is None: device = DEVICE
     if max_iters is None: max_iters = MAX_ITERS
 
-    train_ids, train_ans = encode_samples(train_samples, tokenizer, max_len)
-    train_ids, train_ans = train_ids.to(device), train_ans.to(device)
-
-    # Stratum tensor : drives training-side loss trajectory
-    sample_strata, stratum_names, stratum_counts = build_training_strata(train_samples)
-    print(f"  Training strata counts: " +
-          ', '.join(f"{n}={c}" for n, c in zip(stratum_names, stratum_counts)))
-
-    natural_samples = suite['natural']['samples']
-
-    reveal_tracked_ids = None
-    reveal_tracked_ans = None
-    reveal_reasoning_order = None
-    reveal_blanks = None
-    reveal_tracked_strata = None
-
-    per_stratum_cap = max(REVEAL_TAU_N_TRACKED // len(STRATUM_NAMES), 10)
-    tracked_by_stratum = {sn: [] for sn in STRATUM_NAMES}
-    for i, s in enumerate(train_samples):
-        cl = _max_chain_len(*_parse_operands(s))
-        si = _chain_to_stratum(cl)
-        sn = STRATUM_NAMES[si]
-        if len(tracked_by_stratum[sn]) < per_stratum_cap:
-            tracked_by_stratum[sn].append((i, si))
-    tracked_flat = [t for v in tracked_by_stratum.values() for t in v]
-    strata_counts = {sn: len(v) for sn, v in tracked_by_stratum.items()}
-    if sum(strata_counts.values()) >= 30:
-        tracked_idx = [t[0] for t in tracked_flat]
-        tracked_strata = [t[1] for t in tracked_flat]
-        reveal_tracked_ids = train_ids[tracked_idx]
-        reveal_tracked_ans = train_ans[tracked_idx]
-        reveal_tracked_strata = torch.tensor(tracked_strata, dtype=torch.long)
-        N_tr = len(tracked_idx)
-        # Reasoning order for addition: r2l : LSB (answer position ANS_LEN-1)
-        # decoded first, MSB (answer position 0) last. Rank[j] = ANS_LEN-1-j.
-        reveal_reasoning_order = torch.arange(
-            ANS_LEN - 1, -1, -1, dtype=torch.long).unsqueeze(0).expand(
-            N_tr, -1).contiguous()
-        reveal_blanks = torch.ones(N_tr, ANS_LEN, dtype=torch.bool)
-        print(f"  Reveal-τ tracking (stratified, [{mask_type}]): total={N_tr}, by stratum: " +
-              ', '.join(f"{sn}={c}" for sn, c in strata_counts.items() if c > 0))
+    # Fresh-data mode: train_samples is a small dummy list; the real data
+    # flows from data_source. Skip the per-sample stratum logging and the
+    # reveal-τ tracking (both require persistent per-sample identity).
+    if data_source is not None:
+        # Dummy tensors of shape (1, max_len) and (1,) — placeholders so the
+        # train_diffusion API still receives the expected shape. They are not
+        # indexed in fresh-data mode (see train_utils.py).
+        train_ids = torch.zeros(1, max_len, dtype=torch.long, device=device)
+        train_ans = torch.zeros(1, dtype=torch.long, device=device)
+        sample_strata = None
+        stratum_names = None
+        reveal_tracked_ids = None
+        reveal_tracked_ans = None
+        reveal_reasoning_order = None
+        reveal_blanks = None
+        reveal_tracked_strata = None
+        natural_samples = suite['natural']['samples']
+        print(f"  [fresh-data] data_source={data_source}; "
+              f"skipping stratum/reveal-τ logging.")
     else:
-        print(f"  Reveal-τ tracking: SKIPPED "
-              f"(total tracked < 30: {strata_counts})")
+        train_ids, train_ans = encode_samples(train_samples, tokenizer, max_len)
+        train_ids, train_ans = train_ids.to(device), train_ans.to(device)
+
+        # Stratum tensor : drives training-side loss trajectory
+        sample_strata, stratum_names, stratum_counts = build_training_strata(train_samples)
+        print(f"  Training strata counts: " +
+              ', '.join(f"{n}={c}" for n, c in zip(stratum_names, stratum_counts)))
+
+        natural_samples = suite['natural']['samples']
+
+        reveal_tracked_ids = None
+        reveal_tracked_ans = None
+        reveal_reasoning_order = None
+        reveal_blanks = None
+        reveal_tracked_strata = None
+
+        per_stratum_cap = max(REVEAL_TAU_N_TRACKED // len(STRATUM_NAMES), 10)
+        tracked_by_stratum = {sn: [] for sn in STRATUM_NAMES}
+        for i, s in enumerate(train_samples):
+            cl = _max_chain_len(*_parse_operands(s))
+            si = _chain_to_stratum(cl)
+            sn = STRATUM_NAMES[si]
+            if len(tracked_by_stratum[sn]) < per_stratum_cap:
+                tracked_by_stratum[sn].append((i, si))
+        tracked_flat = [t for v in tracked_by_stratum.values() for t in v]
+        strata_counts = {sn: len(v) for sn, v in tracked_by_stratum.items()}
+        if sum(strata_counts.values()) >= 30:
+            tracked_idx = [t[0] for t in tracked_flat]
+            tracked_strata = [t[1] for t in tracked_flat]
+            reveal_tracked_ids = train_ids[tracked_idx]
+            reveal_tracked_ans = train_ans[tracked_idx]
+            reveal_tracked_strata = torch.tensor(tracked_strata, dtype=torch.long)
+            N_tr = len(tracked_idx)
+            # Reasoning order for addition: r2l : LSB (answer position ANS_LEN-1)
+            # decoded first, MSB (answer position 0) last. Rank[j] = ANS_LEN-1-j.
+            reveal_reasoning_order = torch.arange(
+                ANS_LEN - 1, -1, -1, dtype=torch.long).unsqueeze(0).expand(
+                N_tr, -1).contiguous()
+            reveal_blanks = torch.ones(N_tr, ANS_LEN, dtype=torch.bool)
+            print(f"  Reveal-τ tracking (stratified, [{mask_type}]): total={N_tr}, by stratum: " +
+                  ', '.join(f"{sn}={c}" for sn, c in strata_counts.items() if c > 0))
+        else:
+            print(f"  Reveal-τ tracking: SKIPPED "
+                  f"(total tracked < 30: {strata_counts})")
 
     # PUMA K schedule
     k_sched = None
@@ -988,6 +1043,10 @@ def train_model(mask_type, tokenizer, train_samples, suite, max_len,
         sample_strata=sample_strata, stratum_names=stratum_names,
         init_state=init_state, device=device,
         use_amp=False if NO_AMP else None,
+        seed_train=seed_train,
+        ckpt_schedule=ckpt_schedule,
+        ckpt_save_fn=ckpt_save_fn,
+        data_source=data_source,
     )
     return model, dynamics
 
@@ -1177,14 +1236,170 @@ def make_figures(all_dyn, all_final):
 
 # Run
 
-def run(tag=''):
-    # Auto-suffix exp_name with the position-encoding variant when non-default,
-    # so runs with different --embedding don't overwrite each other's results.
-    # Use 'nope' (rather than 'none') in the filename for readability.
+def _build_shared_init(tok, max_len, seed):
+    """Build a fresh Transformer with deterministic init for the given seed
+    and return its CPU state_dict. Used to share an identical init across
+    all mask types within one seed.
+    """
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    init_model = Transformer(
+        vocab_size=len(tok), block_size=max_len + 8,
+        n_layer=N_LAYER, n_head=N_HEAD, n_embd=N_EMBD,
+        dropout=DROPOUT, is_causal=False, pos_enc=POS_ENC,
+    )
+    return {k: v.cpu().clone() for k, v in init_model.state_dict().items()}
+
+
+def _exp_name_with_pe(tag):
+    """Return exp_name suffixed with the PE variant when non-default, so
+    runs with different --embedding don't overwrite each other's results.
+    """
     pe_for_name = 'nope' if POS_ENC == 'none' else POS_ENC
     pe_suffix = '' if pe_for_name == 'absolute' else f'_{pe_for_name}'
     base_name = f'{EXP_NAME}{pe_suffix}'
-    exp_name = f'{base_name}_{tag}' if tag else base_name
+    return f'{base_name}_{tag}' if tag else base_name
+
+
+def run_training(tag=''):
+    """Training-only multi-checkpoint flow.
+
+    For the current global SEED, builds one shared init state, then trains
+    each method in MASK_TYPES from that same init with a method-specific
+    training seed (SEED * 100 + method_idx). EMA snapshots are saved at
+    every iter in CKPT_ITERS. Per-method training dynamics (loss curves,
+    stratified loss, probe trajectories) are saved to results_seed{N}_train.json.
+
+    No post-training analyses are performed; use addition_decode_analysis.py
+    to run all decode evaluations across the saved checkpoints.
+
+    File layout under {DRIVE_BASE}/{exp_name}/:
+        checkpoint_init_seed{SEED}.pt
+        checkpoint_seed{SEED}_{method}_iter{iter:06d}.pt   × len(MASK_TYPES) × len(CKPT_ITERS)
+        results_seed{SEED}_train.json
+    """
+    exp_name = _exp_name_with_pe(tag)
+    mount_drive()
+    torch.manual_seed(SEED); random.seed(SEED)
+    tok = build_tok()
+
+    print(f"\n{'='*70}")
+    print(f"  Addition TRAINING-ONLY  | seed={SEED}")
+    print(f"  ND={ND} | masks={MASK_TYPES}")
+    print(f"  N_TRAIN={N_TRAIN} MAX_ITERS={MAX_ITERS} BATCH={BATCH_SIZE}")
+    print(f"  arch: {N_LAYER}L/{N_HEAD}H/{N_EMBD}D | pos_enc={POS_ENC} | data: {DATA_MODE}")
+    print(f"  ckpt_iters: {CKPT_ITERS}")
+    print(f"  exp_name: {exp_name}")
+    print(f"{'='*70}\n")
+
+    # Training data + test suite. In 'fresh' mode the train pool is generated
+    # on the fly by _FreshAdditionSource — we skip the upfront materialization
+    # but still need a small natural pool (gen_train_data) for max_len and for
+    # building the test suite. Test suite is always built from a stable seed.
+    if DATA_MODE == 'fresh':
+        from core.train_utils import _FreshAdditionSource
+        # max_len is determined by the fixed format: 2*ND + 2 + (ND+1) = 3*ND + 3
+        max_len = 2 * ND + 2 + ANS_LEN
+        # Tiny seed pool just for build_test_suite path (which needs a tokenizer
+        # and max_len; test data is generated independently inside the suite).
+        train_data = []
+        suite = build_test_suite(tok, max_len, seed=SEED + 1000)
+        # Total samples needed: MAX_ITERS × BATCH_SIZE. PUMA uses less (~1/K),
+        # but we provision the full amount so all methods see uniform pool.
+        total_fresh = MAX_ITERS * BATCH_SIZE
+        chunk = min(DATA_CHUNK_SIZE, total_fresh)
+        print(f"  [fresh-data] total_samples={total_fresh:,}, chunk={chunk:,}")
+    else:
+        train_data = gen_train_data(N_TRAIN, seed=SEED)
+        max_len = max(len(tok.encode(s)) for s in train_data)
+        suite = build_test_suite(tok, max_len, seed=SEED + 1000)
+
+    # ── Build SHARED init state for all methods within this seed ──
+    shared_init = _build_shared_init(tok, max_len, SEED)
+    init_tag = f'init_seed{SEED}'
+    save_checkpoint(exp_name, shared_init, tag=init_tag)
+    print(f"  Built shared init for seed {SEED} ({len(shared_init)} tensors)")
+
+    # ── Train each method ──
+    all_dyn = {}
+    method_ckpt_tags = {}
+    method_seeds = {}
+    for mi, mt in enumerate(MASK_TYPES):
+        method_seed = SEED * 100 + mi
+        method_seeds[mt] = method_seed
+        print(f"\n=== {mt}  (seed={SEED}, train_seed={method_seed}) ===")
+
+        ckpt_tags = []
+        def _save(state_cpu, it, _mt=mt, _seed=SEED, _tags=ckpt_tags):
+            t = f'seed{_seed}_{_mt}_iter{it:06d}'
+            save_checkpoint(exp_name, state_cpu, tag=t)
+            _tags.append(t)
+
+        # Per-method fresh source: deterministic given method_seed. Each
+        # method gets its own instance — independent consumption pointer.
+        if DATA_MODE == 'fresh':
+            data_source = _FreshAdditionSource(
+                nd=ND, max_len=max_len, total_samples=total_fresh,
+                tokenizer=tok, seed=method_seed, chunk_size=chunk,
+                ans_len=ANS_LEN,
+            )
+        else:
+            data_source = None
+
+        m, d = train_model(
+            mt, tok, train_data, suite, max_len,
+            init_state=shared_init,
+            seed_train=method_seed,
+            ckpt_schedule=CKPT_ITERS,
+            ckpt_save_fn=_save,
+            data_source=data_source,
+        )
+        all_dyn[mt] = d
+        method_ckpt_tags[mt] = ckpt_tags
+        del m
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    # ── Save training dynamics + metadata for downstream analysis ──
+    config_keys = [
+        'ND','ANS_LEN','N_TRAIN','N_TEST','MAX_ITERS','BATCH_SIZE',
+        'N_LAYER','N_HEAD','N_EMBD','DROPOUT','POS_ENC',
+        'MASK_TYPES','DATA_MODE','DATA_CHUNK_SIZE','SEED','CKPT_ITERS',
+        'PUMA_TAU','PUMA_K','PUMA_K_START','PUMA_K_END','PUMA_K_STEP','PUMA_K_EVERY',
+        'PAPL_TAU','PAPL_ALPHA','NO_AMP','LR','MIN_LR','WARMUP_ITERS',
+        'GRAD_CLIP','WEIGHT_DECAY','EMA_DECAY','PATIENCE',
+    ]
+    sd = {
+        'config':            {k: globals()[k] for k in config_keys},
+        'seed':              SEED,
+        'train_seeds':       method_seeds,
+        'init_ckpt_tag':     init_tag,
+        'method_ckpt_tags':  method_ckpt_tags,
+    }
+    for mt, d in all_dyn.items():
+        sd[f'dyn_{mt}'] = {
+            'checkpoints': d['checkpoints'],
+            'train_loss': d['train_loss'],
+            'stratified_loss': d.get('stratified_loss', []),
+            'stratum_names': d.get('stratum_names', []),
+        }
+    save_results(exp_name, sd, tag=f'seed{SEED}_train')
+
+    n_ckpts = sum(len(v) for v in method_ckpt_tags.values())
+    print(f"\n{'='*70}")
+    print(f"  TRAINING DONE for seed {SEED}")
+    print(f"  Saved: 1 init + {n_ckpts} per-iter ckpts + dynamics json")
+    print(f"  Location: {exp_name}/")
+    print(f"  Next: %run addition_decode_analysis.py --checkpoint_dir <dir> "
+          f"--seed {SEED}")
+    print(f"{'='*70}\n")
+
+    return all_dyn
+
+
+def run(tag=''):
+    exp_name = _exp_name_with_pe(tag)
     mount_drive()
     torch.manual_seed(SEED); random.seed(SEED)
     tok = build_tok()
@@ -1192,7 +1407,7 @@ def run(tag=''):
     print(f"\n{'='*70}")
     print(f"  Addition ND={ND} | masks={MASK_TYPES} | decode={DECODE_POLICIES}")
     print(f"  N_TRAIN={N_TRAIN} N_TEST={N_TEST} MAX_ITERS={MAX_ITERS}")
-    print(f"  arch: {N_LAYER}L/{N_HEAD}H/{N_EMBD}D | pos_enc={POS_ENC} | data: {DATA_MODE}")
+    print(f"  arch: {N_LAYER}L/{N_HEAD}H/{N_EMBD}D | data: {DATA_MODE}")
     print(f"{'='*70}\n")
 
     train_data = gen_train_data(N_TRAIN, seed=SEED)
@@ -1210,25 +1425,11 @@ def run(tag=''):
 
     # ── Main training ──
     for mt in MASK_TYPES:
-        # Equalize initialization across mask types: each train_diffusion() call
-        # constructs a fresh Transformer (consuming global torch RNG for weight init).
-        # Without this re-seed, random→papl→puma each get different init weights,
-        # since prior trainings have advanced the global RNG state through dropout,
-        # batch sampling, randperm, etc. Re-seeding ensures all three start from the
-        # identical W_init, so observed differences are purely method-induced.
-        torch.manual_seed(SEED); random.seed(SEED)
         print(f"\n=== {mt} ===")
         m, d = train_model(mt, tok, train_data, suite, max_len)
         all_dyn[mt] = d
         saved_states[mt] = {k: v.cpu().clone() for k, v in m.state_dict().items()}
         save_checkpoint(exp_name, saved_states[mt], tag=mt)
-        if TRAIN_ONLY:
-            # Persist dynamics-so-far so we can resume analysis cleanly
-            save_results(exp_name, {'all_dyn': all_dyn, 'train_only': True},
-                         tag='dynamics_partial')
-            del m
-            if torch.cuda.is_available(): torch.cuda.empty_cache()
-            continue
 
         # Standard + heavy (both from suite / filter)
         for dp in DECODE_POLICIES:
@@ -1313,12 +1514,6 @@ def run(tag=''):
 
     # ── Continuation training ──
     args = parse_args()
-    if TRAIN_ONLY:
-        # Save final dynamics and exit; eval/analysis is done offline.
-        save_results(exp_name, {'all_dyn': all_dyn, 'train_only': True})
-        print(f"\n[TRAIN_ONLY] skipping continuation + post-loop analysis; "
-              f"checkpoints + dynamics saved.")
-        return
     if not getattr(args, 'no_continuation', False) and len(MASK_TYPES) >= 2:
         cont_pairs = []
         if 'random' in saved_states and 'puma' in MASK_TYPES:
@@ -1414,15 +1609,14 @@ def run(tag=''):
 
 if __name__ == '__main__':
     args = parse_args()
-    globals()['TRAIN_ONLY'] = args.train_only
     seeds = args.seeds if args.seeds else [SEED]
+    use_training_only = getattr(args, 'train_only', False)
     for si, seed in enumerate(seeds):
         globals()['SEED'] = seed
-        # Always disambiguate output directories per-seed when multiple seeds are run,
-        # even without --tag; otherwise results from later seeds silently overwrite earlier ones.
+        t = f"{args.tag}_s{seed}" if args.tag and len(seeds) > 1 else args.tag
         if len(seeds) > 1:
-            t = f"{args.tag}_s{seed}" if args.tag else f"s{seed}"
+            print(f"\n{'#'*70}\n# Seed {seed} ({si+1}/{len(seeds)})\n{'#'*70}")
+        if use_training_only:
+            run_training(tag=t)
         else:
-            t = args.tag
-        if len(seeds) > 1: print(f"\n{'#'*70}\n# Seed {seed} ({si+1}/{len(seeds)})\n{'#'*70}")
-        run(tag=t)
+            run(tag=t)
