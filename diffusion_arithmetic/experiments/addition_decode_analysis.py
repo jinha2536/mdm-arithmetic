@@ -906,23 +906,116 @@ ALL_ANALYSES = {
 }
 
 
+import re
+_CKPT_RE = re.compile(
+    r'^checkpoint_seed(?P<seed>\d+)_(?P<method>[a-z_]+)_iter(?P<it>\d+)\.pt$'
+)
+
+
+def _discover_checkpoints(ckpt_dir: Path):
+    """Walk a checkpoint directory and group ckpt files by (seed, method, iter).
+
+    Returns a sorted list of dicts: {seed, method, iter, path}.
+    Files not matching the seed{N}_{method}_iter{NNNNNN} convention are ignored.
+    """
+    out = []
+    for f in sorted(ckpt_dir.glob('checkpoint_seed*_iter*.pt')):
+        m = _CKPT_RE.match(f.name)
+        if not m:
+            continue
+        out.append({
+            'seed': int(m['seed']),
+            'method': m['method'],
+            'iter': int(m['it']),
+            'path': f,
+        })
+    out.sort(key=lambda d: (d['seed'], d['method'], d['iter']))
+    return out
+
+
+def _filter_ckpts(ckpts, seed=None, methods=None, iters=None):
+    out = ckpts
+    if seed is not None:
+        out = [c for c in out if c['seed'] == seed]
+    if methods:
+        s = set(methods)
+        out = [c for c in out if c['method'] in s]
+    if iters:
+        s = set(iters)
+        out = [c for c in out if c['iter'] in s]
+    return out
+
+
+def _run_analyses(model, tokenizer, chain_buckets, selected, args, device):
+    """Run the selected analyses against one model. Returns the results dict."""
+    results = {"n_per_bucket": args.n_per_bucket}
+
+    if "a1" in selected:
+        print("    A1: per-instance correctness comparison")
+        results["a1"] = {f"chain_{k}": a1_per_instance(model, tokenizer, b, device=device)
+                         for k, b in chain_buckets.items()}
+    if "a2" in selected:
+        print("    A2: Kendall tau vs LSB order")
+        results["a2"] = {f"chain_{k}": a2_kendall_tau(model, tokenizer, b,
+                                                      K=args.K_puma, tau=args.tau, device=device)
+                         for k, b in chain_buckets.items()}
+    if "a3" in selected:
+        print("    A3: per-stage commit correctness")
+        results["a3"] = {f"chain_{k}": a3_stage_correctness(model, tokenizer, b,
+                                                            K=args.K_decode, tau=args.tau, device=device)
+                         for k, b in chain_buckets.items()}
+    if "a4" in selected:
+        print("    A4: confidence calibration")
+        all_samples = [s for b in chain_buckets.values() for s in b["samples"]]
+        big_bucket = _bucket_from_samples(all_samples, tokenizer, TOTAL_LEN)
+        results["a4"] = a4_calibration(model, tokenizer, big_bucket,
+                                       K=args.K_decode, tau=args.tau, device=device)
+    if "a5" in selected:
+        print("    A5: adversarial sum-9 slice")
+        results["a5"] = a5_adversarial_slice(model, tokenizer,
+                                             n_per_bucket=args.n_per_bucket, device=device)
+    if "a6" in selected:
+        print("    A6: lookahead-window probe")
+        results["a6"] = a6_lookahead_probe(model, tokenizer,
+                                           n_per_bucket=args.n_per_bucket, device=device)
+    if "a8" in selected:
+        print("    A8: confidence-failure dissection")
+        results["a8"] = {f"chain_{k}": a8_failure_dissection(model, tokenizer, b,
+                                                              max_examples=50, device=device)
+                         for k, b in chain_buckets.items()}
+    if "a9" in selected:
+        print("    A9: confidence-ranking margin diagnostic")
+        results["a9"] = {f"chain_{k}": a9_ranking_margin(model, tokenizer, b,
+                                                          max_examples=50, device=device)
+                         for k, b in chain_buckets.items()}
+    return results
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--checkpoint_dir", required=True, type=Path)
+    ap.add_argument("--checkpoint_dir", required=True, type=Path,
+                    help="Directory containing checkpoint_seed{N}_{method}_iter{NNNNNN}.pt files")
     ap.add_argument("--out_dir", default=Path("./decode_analysis"), type=Path)
     ap.add_argument("--analyses", default="all",
                     help="Comma-separated subset of " + ",".join(ALL_ANALYSES))
     ap.add_argument("--n_per_bucket", default=300, type=int)
     ap.add_argument("--K_decode", default=ANS_LEN, type=int,
                     help="Stages for inference-time decode-trace analyses "
-                         "(A3, A4). Default ANS_LEN = one token per stage, "
-                         "matching generate_diffusion().")
+                         "(A3, A4). Default ANS_LEN = one token per stage.")
     ap.add_argument("--K_puma", default=16, type=int,
-                    help="Stages for PUMA-style reveal trajectory simulation "
-                         "(A2). Matches PUMA's training-time K_END=16.")
+                    help="Stages for PUMA-style reveal trajectory simulation (A2).")
     ap.add_argument("--tau", default=0.9, type=float)
     ap.add_argument("--n_head", default=None, type=int,
-                    help="Override n_head (default 2 for exp_addition).")
+                    help="Override n_head when loading checkpoints.")
+    # New: filtering for multi-checkpoint runs
+    ap.add_argument("--seed", type=int, default=None,
+                    help="Filter to checkpoints from this seed only")
+    ap.add_argument("--methods", nargs='+', default=None,
+                    help="Filter to these methods (e.g. --methods random puma)")
+    ap.add_argument("--iters", nargs='+', type=int, default=None,
+                    help="Filter to these iters (e.g. --iters 10000 100000 300000)")
+    ap.add_argument("--legacy-single", action='store_true',
+                    help="Use legacy mode: load checkpoint_{method}.pt (one per method, no iter)")
     args = ap.parse_args()
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
@@ -935,6 +1028,8 @@ def main():
     tokenizer = build_tok()
     device = DEVICE
     print(f"Device: {device}")
+    print(f"Checkpoint dir: {args.checkpoint_dir}")
+    print(f"Out dir: {args.out_dir}")
     print(f"Selected analyses: {selected}")
 
     print("\nBuilding test buckets (chain sweep, including extreme tail)...")
@@ -946,79 +1041,68 @@ def main():
             chain_buckets[k] = _bucket_from_samples(sp, tokenizer, TOTAL_LEN)
             print(f"  chain>={k}: {chain_buckets[k]['n']} samples")
 
-    for method in METHODS:
-        ckpt = args.checkpoint_dir / f"checkpoint_{method}.pt"
-        if not ckpt.exists():
-            print(f"\n[skip] {ckpt} not found")
+    if args.legacy_single:
+        # Legacy mode: checkpoint_{method}.pt
+        print("\n[legacy-single mode] Looking for checkpoint_{method}.pt files...")
+        for method in METHODS:
+            ckpt = args.checkpoint_dir / f"checkpoint_{method}.pt"
+            if not ckpt.exists():
+                print(f"  [skip] {ckpt} not found"); continue
+            print(f"\n=== {method} ===")
+            model = load_model(ckpt, device)
+            results = {"method": method, **_run_analyses(
+                model, tokenizer, chain_buckets, selected, args, device)}
+            out_path = args.out_dir / f"analysis_{method}.json"
+            with open(out_path, "w") as f:
+                json.dump(results, f, indent=2, default=str)
+            print(f"  wrote {out_path}")
+            del model
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        print("\nDone.")
+        return
+
+    # Multi-checkpoint mode: enumerate all checkpoint_seed*_iter*.pt
+    all_ckpts = _discover_checkpoints(args.checkpoint_dir)
+    if not all_ckpts:
+        print(f"\n[error] No checkpoint_seed*_iter*.pt files in {args.checkpoint_dir}")
+        print(f"        If you have legacy single-file checkpoints, use --legacy-single.")
+        return
+
+    ckpts = _filter_ckpts(all_ckpts, seed=args.seed, methods=args.methods, iters=args.iters)
+    print(f"\nDiscovered {len(all_ckpts)} checkpoints in dir; "
+          f"running analysis on {len(ckpts)} after filtering.")
+    if not ckpts:
+        print("  Nothing matches the filter. Exiting.")
+        return
+
+    seeds_seen = sorted(set(c['seed'] for c in ckpts))
+    methods_seen = sorted(set(c['method'] for c in ckpts))
+    iters_seen = sorted(set(c['iter'] for c in ckpts))
+    print(f"  seeds:   {seeds_seen}")
+    print(f"  methods: {methods_seen}")
+    print(f"  iters:   {iters_seen}")
+
+    for ci, c in enumerate(ckpts):
+        out_path = args.out_dir / (
+            f"analysis_seed{c['seed']}_{c['method']}_iter{c['iter']:06d}.json")
+        if out_path.exists():
+            print(f"\n[{ci+1}/{len(ckpts)}] {out_path.name} already exists, skipping")
             continue
-        print(f"\n=== {method} ===")
-        model = load_model(ckpt, device)
-        results = {"method": method, "n_per_bucket": args.n_per_bucket}
-
-        if "a1" in selected:
-            print("  A1: per-instance correctness comparison")
-            results["a1"] = {}
-            for k, b in chain_buckets.items():
-                results["a1"][f"chain_{k}"] = a1_per_instance(
-                    model, tokenizer, b, device=device)
-
-        if "a2" in selected:
-            print("  A2: Kendall tau vs LSB order")
-            results["a2"] = {}
-            for k, b in chain_buckets.items():
-                results["a2"][f"chain_{k}"] = a2_kendall_tau(
-                    model, tokenizer, b, K=args.K_puma, tau=args.tau, device=device)
-
-        if "a3" in selected:
-            print("  A3: per-stage commit correctness")
-            results["a3"] = {}
-            for k, b in chain_buckets.items():
-                results["a3"][f"chain_{k}"] = a3_stage_correctness(
-                    model, tokenizer, b, K=args.K_decode, tau=args.tau, device=device)
-
-        if "a4" in selected:
-            print("  A4: confidence calibration")
-            all_samples = [s for b in chain_buckets.values() for s in b["samples"]]
-            big_bucket = _bucket_from_samples(all_samples, tokenizer, TOTAL_LEN)
-            results["a4"] = a4_calibration(model, tokenizer, big_bucket,
-                                           K=args.K_decode, tau=args.tau, device=device)
-
-        if "a5" in selected:
-            print("  A5: adversarial sum-9 slice")
-            results["a5"] = a5_adversarial_slice(model, tokenizer,
-                                                 n_per_bucket=args.n_per_bucket,
-                                                 device=device)
-
-        if "a6" in selected:
-            print("  A6: lookahead-window probe")
-            results["a6"] = a6_lookahead_probe(model, tokenizer,
-                                               n_per_bucket=args.n_per_bucket,
-                                               device=device)
-
-        if "a8" in selected:
-            print("  A8: confidence-failure dissection")
-            results["a8"] = {}
-            for k, b in chain_buckets.items():
-                results["a8"][f"chain_{k}"] = a8_failure_dissection(
-                    model, tokenizer, b, max_examples=50, device=device)
-
-        if "a9" in selected:
-            print("  A9: confidence-ranking margin diagnostic")
-            results["a9"] = {}
-            for k, b in chain_buckets.items():
-                results["a9"][f"chain_{k}"] = a9_ranking_margin(
-                    model, tokenizer, b, max_examples=50, device=device)
-
-        out_path = args.out_dir / f"analysis_{method}.json"
+        print(f"\n[{ci+1}/{len(ckpts)}] seed={c['seed']} {c['method']} iter={c['iter']}")
+        model = load_model(c['path'], device)
+        results = {
+            "seed": c['seed'], "method": c['method'], "iter": c['iter'],
+            **_run_analyses(model, tokenizer, chain_buckets, selected, args, device),
+        }
         with open(out_path, "w") as f:
             json.dump(results, f, indent=2, default=str)
         print(f"  wrote {out_path}")
-
         del model
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-    print("\nDone.")
+    print(f"\nDone. {len(ckpts)} analyses written to {args.out_dir}/")
 
 
 if __name__ == "__main__":
