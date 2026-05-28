@@ -664,7 +664,15 @@ def train_diffusion(
         optimizer.step()
 
         with torch.no_grad():
-            for name, param in model.named_parameters():
+            # remove_duplicate=False is critical: with tied weights (wte.weight
+            # = lm_head.weight in our Transformer), the default remove_duplicate=True
+            # yields only one name and the other ema_state entry stays at init,
+            # producing checkpoints where one tied key has trained values and the
+            # other has init values. Saving with .clone() (e.g. milestone snapshots)
+            # exposes the divergence. Yielding both names with the same Parameter
+            # object means both ema_state entries lerp from the same source tensor,
+            # keeping them byte-identical throughout training.
+            for name, param in model.named_parameters(remove_duplicate=False):
                 ema_state[name].lerp_(param.data, 1 - ema_decay)
 
         # ── Multi-checkpoint save (EMA snapshot at milestones) ──
