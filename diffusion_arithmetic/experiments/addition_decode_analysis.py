@@ -558,9 +558,10 @@ def a8_failure_dissection(model, tokenizer, bucket, max_examples=50, device=None
             logits[:, :, mask_id] = -float("inf")
 
             if policy == "confidence":
-                max_logit = logits.max(dim=-1).values
-                max_logit[unmasked] = -float("inf")
-                pos = max_logit.argmax(-1)
+                # top-1 softmax probability (LLaDA/Dream convention)
+                max_prob = F.softmax(logits, dim=-1).max(dim=-1).values
+                max_prob[unmasked] = -float("inf")
+                pos = max_prob.argmax(-1)
             elif policy == "r2l":
                 pos = torch.full((B,), T_pre + ANS_LEN - 1 - stage,
                                  dtype=torch.long, device=device)
@@ -746,9 +747,10 @@ def a9_ranking_margin(model, tokenizer, bucket, max_examples=50, device=None):
         logits = model(x)
         logits[:, :, mask_id] = -float("inf")
 
-        max_logit, top1_tok = logits.max(dim=-1)  # both [B, T]
-        # For per-stage diagnostics we still want top1_prob as a human-readable
-        # number ,  compute it but don't use for ranking.
+        # top-1 token per position (logit argmax == softmax argmax, monotonic)
+        top1_tok = logits.argmax(dim=-1)  # [B, T]
+        # Rank positions by top-1 SOFTMAX PROBABILITY (LLaDA/Dream convention),
+        # consistent with generate_diffusion's confidence policy.
         probs = F.softmax(logits, dim=-1)  # [B, T, V]
         top1_prob_all = probs.max(dim=-1).values  # [B, T]
 
@@ -760,30 +762,32 @@ def a9_ranking_margin(model, tokenizer, bucket, max_examples=50, device=None):
                 continue
 
             masked_abs = T_pre + still_masked_in_ans
-            scores = max_logit[i, masked_abs]  # [n_masked] ,  use logits for ranking
+            scores = top1_prob_all[i, masked_abs]  # [n_masked], rank by softmax prob
 
             sorted_scores, sorted_idx = scores.sort(descending=True)
             chosen_local = sorted_idx[0].item()
             chosen_ans_offset = still_masked_in_ans[chosen_local].item()
             chosen_top1 = top1_prob_all[i, T_pre + chosen_ans_offset].item()
-            chosen_logit = sorted_scores[0].item()
             chosen_math_d = ANS_LEN - 1 - chosen_ans_offset
             dep_ctx = metas[i].get("dep_ctx", [])
             chosen_role = dep_ctx[chosen_ans_offset] if chosen_ans_offset < len(dep_ctx) else "?"
 
-            runner_top1 = None; runner_math_d = None; runner_role = None; runner_logit = None
+            runner_top1 = None; runner_math_d = None; runner_role = None
             if sorted_scores.numel() > 1:
                 runner_local = sorted_idx[1].item()
                 runner_ans_offset = still_masked_in_ans[runner_local].item()
                 runner_top1 = top1_prob_all[i, T_pre + runner_ans_offset].item()
-                runner_logit = sorted_scores[1].item()
                 runner_math_d = ANS_LEN - 1 - runner_ans_offset
                 runner_role = dep_ctx[runner_ans_offset] if runner_ans_offset < len(dep_ctx) else "?"
 
-            # Margin in BOTH spaces ,  logit margin is the "true" decision margin,
-            # prob margin is the human-readable size.
+            # Ranking is now by softmax prob (consistent with confidence policy),
+            # so the only meaningful margin is the prob margin.
             ranking_margin_prob = (chosen_top1 - runner_top1) if runner_top1 is not None else None
-            ranking_margin_logit = (chosen_logit - runner_logit) if runner_logit is not None else None
+            # Back-compat aliases: ranking score == softmax prob now (not logit).
+            # These *_logit fields retain the schema but hold PROB values.
+            chosen_logit = sorted_scores[0].item()
+            runner_logit = sorted_scores[1].item() if sorted_scores.numel() > 1 else None
+            ranking_margin_logit = ranking_margin_prob
 
             # Was this commit wrong?
             chosen_pred_tok = top1_tok[i, T_pre + chosen_ans_offset].item()
