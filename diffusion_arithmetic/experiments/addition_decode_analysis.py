@@ -83,6 +83,15 @@ def load_model(ckpt_path, device):
         raise RuntimeError(
             f"state_dict mismatch:\n  missing: {missing}\n  unexpected: {unexpected}"
         )
+    # ── WORKAROUND for tied-weight EMA bug ──
+    # Older training code saved wte.weight (the EMA-updated, trained one)
+    # and lm_head.weight (still at init due to named_parameters()
+    # deduplicating tied params during EMA update) as separate tensors.
+    # load_state_dict writes both into the same underlying memory and the
+    # alphabetically-later key (lm_head.weight) wins, leaving the model
+    # with an UNTRAINED output head. Force the trained wte.weight to win.
+    if 'wte.weight' in sd:
+        model.wte.weight.data.copy_(sd['wte.weight'].to(device))
     model.to(device).eval()
     return model
 
@@ -991,11 +1000,114 @@ def _run_analyses(model, tokenizer, chain_buckets, selected, args, device):
     return results
 
 
+def _process_one_dir(checkpoint_dir, out_dir, args, tokenizer, chain_buckets,
+                     selected, device):
+    """Run analyses on all (filtered) checkpoints in one directory.
+
+    Returns the number of analyses written. Skips files that already exist
+    in out_dir (resume-friendly).
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
+    print(f"\n  Checkpoint dir: {checkpoint_dir}")
+    print(f"  Out dir:        {out_dir}")
+
+    if args.legacy_single:
+        print(f"  [legacy-single mode]")
+        n_written = 0
+        for method in METHODS:
+            ckpt = checkpoint_dir / f"checkpoint_{method}.pt"
+            if not ckpt.exists():
+                print(f"    [skip] {ckpt.name} not found"); continue
+            out_path = out_dir / f"analysis_{method}.json"
+            if out_path.exists() and not args.force:
+                print(f"    [skip] {out_path.name} already exists"); continue
+            print(f"    === {method} ===")
+            model = load_model(ckpt, device)
+            results = {"method": method, **_run_analyses(
+                model, tokenizer, chain_buckets, selected, args, device)}
+            with open(out_path, "w") as f:
+                json.dump(results, f, indent=2, default=str)
+            print(f"    wrote {out_path.name}")
+            del model
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            n_written += 1
+        return n_written
+
+    # Multi-checkpoint mode
+    all_ckpts = _discover_checkpoints(checkpoint_dir)
+    if not all_ckpts:
+        print(f"    [no ckpts] No checkpoint_seed*_iter*.pt in {checkpoint_dir}")
+        return 0
+
+    ckpts = _filter_ckpts(all_ckpts, seed=args.seed,
+                           methods=args.methods, iters=args.iters)
+    print(f"    Discovered {len(all_ckpts)} ckpts, "
+          f"{len(ckpts)} after filtering")
+    if not ckpts:
+        return 0
+
+    seeds_seen = sorted(set(c['seed'] for c in ckpts))
+    methods_seen = sorted(set(c['method'] for c in ckpts))
+    iters_seen = sorted(set(c['iter'] for c in ckpts))
+    print(f"    seeds:   {seeds_seen}")
+    print(f"    methods: {methods_seen}")
+    print(f"    iters:   {iters_seen}")
+
+    n_written = 0
+    for ci, c in enumerate(ckpts):
+        out_path = out_dir / (
+            f"analysis_seed{c['seed']}_{c['method']}_iter{c['iter']:06d}.json")
+        if out_path.exists() and not args.force:
+            print(f"    [{ci+1}/{len(ckpts)}] skip (exists): {out_path.name}")
+            continue
+        print(f"    [{ci+1}/{len(ckpts)}] seed={c['seed']} {c['method']} iter={c['iter']}")
+        model = load_model(c['path'], device)
+        results = {
+            "seed": c['seed'], "method": c['method'], "iter": c['iter'],
+            **_run_analyses(model, tokenizer, chain_buckets, selected, args, device),
+        }
+        with open(out_path, "w") as f:
+            json.dump(results, f, indent=2, default=str)
+        del model
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        n_written += 1
+    return n_written
+
+
+def _discover_experiment_dirs(root):
+    """Find subdirs of `root` that contain at least one ckpt-pattern file.
+
+    A "ckpt-pattern" file is either `checkpoint_seed*_iter*.pt`
+    (multi-checkpoint format) or `checkpoint_{random,papl,puma}.pt`
+    (legacy format). Returns a sorted list of Path objects.
+    """
+    out = []
+    for d in sorted(root.iterdir()):
+        if not d.is_dir():
+            continue
+        has_multi = any(d.glob('checkpoint_seed*_iter*.pt'))
+        has_legacy = any((d / f'checkpoint_{m}.pt').exists() for m in METHODS)
+        if has_multi or has_legacy:
+            out.append(d)
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--checkpoint_dir", required=True, type=Path,
-                    help="Directory containing checkpoint_seed{N}_{method}_iter{NNNNNN}.pt files")
-    ap.add_argument("--out_dir", default=Path("./decode_analysis"), type=Path)
+    # Either --checkpoint_dir (single experiment) OR --checkpoint_root (parent
+    # containing multiple experiment dirs). Exactly one of the two is required.
+    ap.add_argument("--checkpoint_dir", type=Path, default=None,
+                    help="Single experiment directory containing ckpt files")
+    ap.add_argument("--checkpoint_root", type=Path, default=None,
+                    help="Parent directory containing multiple experiment "
+                         "subdirs. Each subdir with ckpt files is analyzed "
+                         "sequentially; analyses go to <subdir>/analysis/.")
+    ap.add_argument("--out_dir", default=None, type=Path,
+                    help="Output dir for analyses. Default: "
+                         "<checkpoint_dir>/analysis or <subdir>/analysis "
+                         "when using --checkpoint_root.")
     ap.add_argument("--analyses", default="all",
                     help="Comma-separated subset of " + ",".join(ALL_ANALYSES))
     ap.add_argument("--n_per_bucket", default=300, type=int)
@@ -1007,7 +1119,6 @@ def main():
     ap.add_argument("--tau", default=0.9, type=float)
     ap.add_argument("--n_head", default=None, type=int,
                     help="Override n_head when loading checkpoints.")
-    # New: filtering for multi-checkpoint runs
     ap.add_argument("--seed", type=int, default=None,
                     help="Filter to checkpoints from this seed only")
     ap.add_argument("--methods", nargs='+', default=None,
@@ -1016,9 +1127,13 @@ def main():
                     help="Filter to these iters (e.g. --iters 10000 100000 300000)")
     ap.add_argument("--legacy-single", action='store_true',
                     help="Use legacy mode: load checkpoint_{method}.pt (one per method, no iter)")
+    ap.add_argument("--force", action='store_true',
+                    help="Overwrite existing analysis JSONs (default: skip if exists)")
     args = ap.parse_args()
 
-    args.out_dir.mkdir(parents=True, exist_ok=True)
+    if (args.checkpoint_dir is None) == (args.checkpoint_root is None):
+        ap.error("Specify exactly one of --checkpoint_dir or --checkpoint_root")
+
     if args.n_head is not None:
         global N_HEAD_OVERRIDE
         N_HEAD_OVERRIDE = args.n_head
@@ -1028,10 +1143,11 @@ def main():
     tokenizer = build_tok()
     device = DEVICE
     print(f"Device: {device}")
-    print(f"Checkpoint dir: {args.checkpoint_dir}")
-    print(f"Out dir: {args.out_dir}")
     print(f"Selected analyses: {selected}")
 
+    # Test buckets are built once and reused across all experiment dirs —
+    # they're driven only by ND, n_per_bucket, and seeded RNG, all of which
+    # are constant within an invocation. Saves substantial time when looping.
     print("\nBuilding test buckets (chain sweep, including extreme tail)...")
     chain_buckets = {}
     for k in [4, 8, 12, 16, 20, 24, 28, 30, 32]:
@@ -1041,68 +1157,43 @@ def main():
             chain_buckets[k] = _bucket_from_samples(sp, tokenizer, TOTAL_LEN)
             print(f"  chain>={k}: {chain_buckets[k]['n']} samples")
 
-    if args.legacy_single:
-        # Legacy mode: checkpoint_{method}.pt
-        print("\n[legacy-single mode] Looking for checkpoint_{method}.pt files...")
-        for method in METHODS:
-            ckpt = args.checkpoint_dir / f"checkpoint_{method}.pt"
-            if not ckpt.exists():
-                print(f"  [skip] {ckpt} not found"); continue
-            print(f"\n=== {method} ===")
-            model = load_model(ckpt, device)
-            results = {"method": method, **_run_analyses(
-                model, tokenizer, chain_buckets, selected, args, device)}
-            out_path = args.out_dir / f"analysis_{method}.json"
-            with open(out_path, "w") as f:
-                json.dump(results, f, indent=2, default=str)
-            print(f"  wrote {out_path}")
-            del model
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-        print("\nDone.")
-        return
+    # Determine list of (checkpoint_dir, out_dir) pairs to process.
+    if args.checkpoint_root is not None:
+        exp_dirs = _discover_experiment_dirs(args.checkpoint_root)
+        if not exp_dirs:
+            print(f"\n[error] No experiment subdirs found under {args.checkpoint_root}")
+            return
+        print(f"\nDiscovered {len(exp_dirs)} experiment dirs under "
+              f"{args.checkpoint_root}:")
+        for d in exp_dirs:
+            print(f"  {d.name}")
+        # When using checkpoint_root, default out_dir is <subdir>/analysis
+        # unless user provided an explicit override (in which case all
+        # analyses go into that single dir, prefixed by exp name).
+        targets = []
+        for d in exp_dirs:
+            if args.out_dir is not None:
+                # explicit override: nest by exp name to avoid collisions
+                od = args.out_dir / d.name
+            else:
+                od = d / 'analysis'
+            targets.append((d, od))
+    else:
+        od = args.out_dir or (args.checkpoint_dir / 'analysis')
+        targets = [(args.checkpoint_dir, od)]
 
-    # Multi-checkpoint mode: enumerate all checkpoint_seed*_iter*.pt
-    all_ckpts = _discover_checkpoints(args.checkpoint_dir)
-    if not all_ckpts:
-        print(f"\n[error] No checkpoint_seed*_iter*.pt files in {args.checkpoint_dir}")
-        print(f"        If you have legacy single-file checkpoints, use --legacy-single.")
-        return
+    # Process each (checkpoint_dir, out_dir) pair sequentially.
+    total_written = 0
+    for ti, (cdir, odir) in enumerate(targets):
+        print(f"\n{'='*70}\n  [{ti+1}/{len(targets)}] {cdir.name}\n{'='*70}")
+        n = _process_one_dir(cdir, odir, args, tokenizer, chain_buckets,
+                              selected, device)
+        total_written += n
+        print(f"  wrote {n} analyses to {odir.name}/")
 
-    ckpts = _filter_ckpts(all_ckpts, seed=args.seed, methods=args.methods, iters=args.iters)
-    print(f"\nDiscovered {len(all_ckpts)} checkpoints in dir; "
-          f"running analysis on {len(ckpts)} after filtering.")
-    if not ckpts:
-        print("  Nothing matches the filter. Exiting.")
-        return
-
-    seeds_seen = sorted(set(c['seed'] for c in ckpts))
-    methods_seen = sorted(set(c['method'] for c in ckpts))
-    iters_seen = sorted(set(c['iter'] for c in ckpts))
-    print(f"  seeds:   {seeds_seen}")
-    print(f"  methods: {methods_seen}")
-    print(f"  iters:   {iters_seen}")
-
-    for ci, c in enumerate(ckpts):
-        out_path = args.out_dir / (
-            f"analysis_seed{c['seed']}_{c['method']}_iter{c['iter']:06d}.json")
-        if out_path.exists():
-            print(f"\n[{ci+1}/{len(ckpts)}] {out_path.name} already exists, skipping")
-            continue
-        print(f"\n[{ci+1}/{len(ckpts)}] seed={c['seed']} {c['method']} iter={c['iter']}")
-        model = load_model(c['path'], device)
-        results = {
-            "seed": c['seed'], "method": c['method'], "iter": c['iter'],
-            **_run_analyses(model, tokenizer, chain_buckets, selected, args, device),
-        }
-        with open(out_path, "w") as f:
-            json.dump(results, f, indent=2, default=str)
-        print(f"  wrote {out_path}")
-        del model
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
-    print(f"\nDone. {len(ckpts)} analyses written to {args.out_dir}/")
+    print(f"\n{'='*70}")
+    print(f"  ALL DONE. {total_written} analyses written across {len(targets)} dirs.")
+    print(f"{'='*70}")
 
 
 if __name__ == "__main__":
