@@ -11,7 +11,6 @@ import os, time, math, json
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import numpy as np
 import matplotlib
 matplotlib.use('Agg')
 
@@ -25,10 +24,7 @@ DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 # Google Drive persistence
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-DRIVE_BASE = os.environ.get(
-    'DIFFUSION_ARITHMETIC_DRIVE',
-    '/content/drive/MyDrive/diffusion-arithmetic-results',
-)
+DRIVE_BASE = '/content/drive/MyDrive/diffusion-arithmetic-results'
 
 
 def mount_drive():
@@ -91,156 +87,6 @@ def encode_samples(samples, tokenizer, max_len=None):
         ids[i, :L] = torch.tensor(enc[:L])
         ans_starts[i] = samples[i].index('=') + 1
     return ids, ans_starts
-
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# Fresh-data source (chunked lazy generation for addition)
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-class _FreshAdditionSource:
-    """Chunked-lazy data source for fresh-data training mode on addition.
-
-    Pre-allocates a single pinned-memory chunk of `chunk_size` tokenized
-    samples and refills it in-place when exhausted. Generation is numpy-
-    vectorized (no Python per-sample loop). Inline regeneration is rare
-    (every chunk_size/batch_size iters) and fast (~200ms for chunk_size=500k);
-    no background threading is used, which keeps the lifecycle simple.
-
-    Safety notes on CPU-GPU transfer:
-      * Pinned source + non_blocking=True returns a GPU-side tensor whose
-        copy is in flight on the default stream. PyTorch synchronizes any
-        subsequent op that depends on it (forward pass, gather into PUMA
-        buffer), so by the time `next()` is called again, prior transfers
-        from this chunk have already been consumed and synchronized.
-      * Therefore overwriting the pinned chunk in-place when ptr reaches
-        chunk_size is safe — no prior batch's data is still pending on GPU.
-
-    Determinism:
-      `seed` controls the entire stream. chunk_idx is mixed in to derive
-      per-chunk numpy RNG states, so the i-th sample produced is a pure
-      function of (seed, total_samples_consumed_so_far).
-
-    Distribution:
-      Natural ND-digit addition: a, b ∈ [10**(ND-1), 10**ND - 1], uniform.
-      Matches gen_data_natural() in exp_addition.py byte-for-byte (apart
-      from the unused pad columns after the answer).
-    """
-
-    def __init__(self, nd, max_len, total_samples, tokenizer, seed,
-                 chunk_size=500_000, ans_len=None):
-        self.nd = nd
-        self.ans_len = ans_len if ans_len is not None else nd + 1
-        self.max_len = max_len
-        self.total_samples = int(total_samples)
-        self.tokenizer = tokenizer
-        self.chunk_size = min(int(chunk_size), self.total_samples)
-        self.seed = int(seed)
-
-        # Token-id lookup. Char tokenizer maps digit '0'..'9' to consecutive
-        # ids matching `list('0123456789+=')` insertion order, but we don't
-        # rely on that — go through stoi.
-        self._digit_ids = np.array(
-            [tokenizer.stoi[c] for c in '0123456789'], dtype=np.int64)
-        self._plus_id = tokenizer.stoi['+']
-        self._eq_id   = tokenizer.stoi['=']
-        self._pad_id  = tokenizer.special_ids['pad']
-        # Layout: a (nd) | '+' (1) | b (nd) | '=' (1) | c (ans_len)
-        self._ans_start = 2 * nd + 2
-
-        # Pre-allocate pinned chunk (positions after the equation stay as pad)
-        # pin_memory() requires CUDA. On CPU-only systems (testing), skip
-        # pinning — transfer to CPU is then just a tensor share.
-        _pin = torch.cuda.is_available()
-        self._cur_ids = torch.full(
-            (self.chunk_size, max_len), self._pad_id, dtype=torch.long)
-        self._cur_ans = torch.full(
-            (self.chunk_size,), self._ans_start, dtype=torch.long)
-        if _pin:
-            self._cur_ids = self._cur_ids.pin_memory()
-            self._cur_ans = self._cur_ans.pin_memory()
-        self._ptr = 0
-        self._chunk_idx = 0
-        self.consumed = 0
-
-        # Reusable numpy scratch for the chunk (avoids realloc each refill)
-        self._np_ids_scratch = np.full(
-            (self.chunk_size, max_len), self._pad_id, dtype=np.int64)
-
-        # Initial fill
-        self._gen_chunk()
-
-    def _gen_chunk(self):
-        """Generate one chunk of fresh samples into self._cur_ids in-place.
-
-        Uses a fresh numpy default_rng seeded from (self.seed, chunk_idx)
-        so each chunk is deterministic regardless of consumption order.
-        """
-        cs, nd = self.chunk_size, self.nd
-        rng = np.random.default_rng(self.seed + self._chunk_idx * 10007 + 1)
-
-        # ND-digit operands: leading digit ∈ [1,9], rest ∈ [0,9].
-        # Matches the natural-distribution lo=10**(ND-1) constraint in
-        # exp_addition.py:gen_data_natural.
-        a_lead = rng.integers(1, 10, size=cs, dtype=np.int64)
-        a_rest = rng.integers(0, 10, size=(cs, nd - 1), dtype=np.int64)
-        a_digits = np.concatenate([a_lead[:, None], a_rest], axis=1)
-        b_lead = rng.integers(1, 10, size=cs, dtype=np.int64)
-        b_rest = rng.integers(0, 10, size=(cs, nd - 1), dtype=np.int64)
-        b_digits = np.concatenate([b_lead[:, None], b_rest], axis=1)
-
-        # Compute c = a + b digit-wise with carry (right to left in the
-        # digit array, which is MSB-first). ans_len = nd + 1 to carry the
-        # potential overflow into a leading digit.
-        c_digits = np.zeros((cs, nd + 1), dtype=np.int64)
-        carry = np.zeros(cs, dtype=np.int64)
-        for i in range(nd - 1, -1, -1):
-            s = a_digits[:, i] + b_digits[:, i] + carry
-            c_digits[:, i + 1] = s % 10
-            carry = s // 10
-        c_digits[:, 0] = carry
-
-        # Build flat token-id array. Layout repeats above:
-        # cols [0..nd):     a digits → digit_ids
-        # col  nd:          '+'
-        # cols [nd+1..2nd+1):  b digits
-        # col  2nd+1:       '='
-        # cols [2nd+2..2nd+2+ans_len):  c digits
-        # cols beyond:      pad (left from initial pad fill)
-        ids_np = self._np_ids_scratch
-        ids_np[:, 0:nd]                        = self._digit_ids[a_digits]
-        ids_np[:, nd]                          = self._plus_id
-        ids_np[:, nd + 1:2 * nd + 1]           = self._digit_ids[b_digits]
-        ids_np[:, 2 * nd + 1]                  = self._eq_id
-        ids_np[:, 2 * nd + 2:2 * nd + 2 + nd + 1] = self._digit_ids[c_digits]
-
-        # Copy numpy chunk into pinned tensor. Use the underlying torch
-        # tensor view via from_numpy → copy_; this is one memcpy.
-        self._cur_ids.copy_(torch.from_numpy(ids_np), non_blocking=False)
-        # ans_starts is constant for this experiment layout; pre-filled in __init__.
-
-        self._ptr = 0
-        self._chunk_idx += 1
-
-    def next(self, batch_size, device):
-        """Return (ids, ans_starts) of shape (batch_size, max_len) and
-        (batch_size,) respectively, both on `device`. Refills the chunk
-        in-place if exhausted.
-        """
-        if self._ptr + batch_size > self.chunk_size:
-            self._gen_chunk()
-        slc = slice(self._ptr, self._ptr + batch_size)
-        # non_blocking transfer from pinned memory; PyTorch will sync any
-        # downstream op that uses the returned tensor.
-        ids = self._cur_ids[slc].to(device, non_blocking=True)
-        ans = self._cur_ans[slc].to(device, non_blocking=True)
-        self._ptr += batch_size
-        self.consumed += batch_size
-        return ids, ans
-
-    def __repr__(self):
-        return (f"_FreshAdditionSource(nd={self.nd}, total={self.total_samples}, "
-                f"chunk={self.chunk_size}, consumed={self.consumed}, "
-                f"chunk_idx={self._chunk_idx})")
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -321,22 +167,6 @@ def train_diffusion(
     device=None,
     # AMP
     use_amp=None,           # None=auto, True=force, False=disable
-    # ── NEW: reproducibility & multi-checkpoint ──
-    # seed_train: applied via torch.manual_seed AFTER model init/load. This
-    # decouples training randomness (mask sampling, batch order) from model
-    # init randomness. Pass distinct seeds per (run-seed, method) so methods
-    # within a seed share init but have isolated training RNGs.
-    seed_train=None,
-    # ckpt_schedule: list of iter values at which to save the EMA state via
-    # ckpt_save_fn(state_dict_cpu, it). Set to None to disable per-iter saves.
-    ckpt_schedule=None,
-    ckpt_save_fn=None,
-    # data_source: optional override of where (ids, ans_starts) batches come
-    # from. Default (None) uses the pre-loaded train_ids/train_ans on GPU.
-    # When provided, must implement `next(batch_size, device) → (ids, ans)`.
-    # Used by fresh-data mode where samples are generated on demand and the
-    # full dataset is too large to hold in GPU memory.
-    data_source=None,
 ):
     """
     Unified iteration-based diffusion training with EMA.
@@ -367,17 +197,6 @@ def train_diffusion(
     if init_state is not None:
         model.load_state_dict({k: v.to(device) for k, v in init_state.items()})
         print(f"  [{mask_type}] Loaded init checkpoint")
-
-    # Apply training seed AFTER model init/load: weights are deterministic
-    # (either from init_state or seeded model construction upstream), and we
-    # want subsequent RNG (mask sampling, batch perm, PUMA buffer) to be
-    # deterministic per (run-seed, method). Model init RNG state from the
-    # Transformer() call is consumed but doesn't affect us here.
-    if seed_train is not None:
-        torch.manual_seed(seed_train)
-        if device.type == 'cuda':
-            torch.cuda.manual_seed_all(seed_train)
-        print(f"  [{mask_type}] Training RNG seeded with {seed_train}")
 
     ema_state = {k: v.clone() for k, v in model.state_dict().items()}
     print(f"  [{mask_type}] params={model.n_params:,}, N={N}, T={T}, "
@@ -426,39 +245,25 @@ def train_diffusion(
         buf_ans = torch.zeros(batch_size, dtype=torch.long, device=device)
         buf_stage = torch.zeros(batch_size, dtype=torch.long, device=device)
         buf_orig_idx = torch.zeros(batch_size, dtype=torch.long, device=device)
-        # buf_pool indexing only used in fixed-pool mode (data_source is None)
-        buf_pool = torch.randperm(N) if data_source is None else None
+        buf_pool = torch.randperm(N)
         buf_ptr = 0
 
         def _refresh(indices):
             nonlocal buf_ptr, buf_pool
             idx_t = torch.tensor(indices, device=device)
             n = len(indices)
-            if data_source is None:
-                # Fixed-pool mode: index train_ids by buf_pool
-                if buf_ptr + n > len(buf_pool):
-                    buf_pool = torch.randperm(N); buf_ptr = 0
-                si = buf_pool[buf_ptr:buf_ptr + n].to(device); buf_ptr += n
-                fresh_ids = train_ids[si]
-                fresh_ans = train_ans[si]
-                fresh_blanks = blank_masks[si]
-                buf_orig_idx[idx_t] = si  # used by stratum logging
-            else:
-                # Fresh-data mode: pull a fresh batch from the data source.
-                # No persistent dataset → no stratum logging (orig_idx unused
-                # in that branch by design).
-                fresh_ids, fresh_ans = data_source.next(n, device)
-                # blank_masks is shape (N, ans_len); in fresh-data we assume
-                # full-blank answer (no per-sample blank pattern) — matches
-                # how addition's blank_masks is constructed (all True).
-                fresh_blanks = torch.ones(n, ans_len, dtype=torch.bool, device=device)
-            buf_x0[idx_t] = fresh_ids
-            buf_z[idx_t] = fresh_ids.clone()
-            buf_ans[idx_t] = fresh_ans
+            if buf_ptr + n > len(buf_pool):
+                buf_pool = torch.randperm(N); buf_ptr = 0
+            si = buf_pool[buf_ptr:buf_ptr + n].to(device); buf_ptr += n
+            buf_x0[idx_t] = train_ids[si]
+            buf_z[idx_t] = train_ids[si].clone()
+            buf_ans[idx_t] = train_ans[si]
             buf_stage[idx_t] = 0
+            buf_orig_idx[idx_t] = si
             ap = (buf_ans[idx_t].unsqueeze(1) + _arange).clamp(max=T - 1)
             bii = idx_t.unsqueeze(1).expand_as(ap)
-            buf_z[bii[fresh_blanks], ap[fresh_blanks]] = mask_id
+            bl = blank_masks[si]
+            buf_z[bii[bl], ap[bl]] = mask_id
 
         def _advance(logits, K_cur):
             nonlocal buf_stage
@@ -488,23 +293,15 @@ def train_diffusion(
         _refresh(list(range(batch_size)))
 
     # ── Random masking batch iterator ──
-    # `_next_batch` returns (ids, ans_starts, idx_or_None). Both fixed-pool
-    # and fresh-data modes flow through here; only the source differs.
-    # idx is None in fresh mode (no persistent per-sample identity) — used
-    # to disable stratum logging in that branch.
-    perm = torch.randperm(N, device=device) if data_source is None else None
+    perm = torch.randperm(N, device=device)
     perm_ptr = 0
 
     def _next_batch():
         nonlocal perm, perm_ptr
-        if data_source is None:
-            if perm_ptr + batch_size > N:
-                perm = torch.randperm(N, device=device); perm_ptr = 0
-            idx = perm[perm_ptr:perm_ptr + batch_size]; perm_ptr += batch_size
-            return train_ids[idx], train_ans[idx], idx
-        else:
-            ids, ans = data_source.next(batch_size, device)
-            return ids, ans, None
+        if perm_ptr + batch_size > N:
+            perm = torch.randperm(N, device=device); perm_ptr = 0
+        idx = perm[perm_ptr:perm_ptr + batch_size]; perm_ptr += batch_size
+        return idx
 
     # ── Eval helper ──
     def _do_eval(it_num):
@@ -540,10 +337,7 @@ def train_diffusion(
         return False
 
     # ── Stratum loss logging setup ──
-    # Stratum logging assumes a persistent per-sample stratum id indexed by
-    # the dataset position; this is incompatible with fresh-data mode where
-    # samples have no persistent identity. Force-disable in that case.
-    log_strata = (sample_strata is not None) and (data_source is None)
+    log_strata = sample_strata is not None
     if log_strata:
         sample_strata = sample_strata.to(device).long()
         assert sample_strata.shape == (N,), f"sample_strata must be [N={N}], got {sample_strata.shape}"
@@ -566,13 +360,6 @@ def train_diffusion(
     ctx = torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp)
     if use_amp:
         print(f"  [{mask_type}] AMP bfloat16 enabled")
-
-    # ── Multi-checkpoint schedule ──
-    # Save EMA snapshot at each milestone iter. Saved state is in CPU memory
-    # to avoid GPU OOM during long runs; callback decides where to persist it.
-    ckpt_schedule_set = set(ckpt_schedule or [])
-    if ckpt_schedule_set:
-        print(f"  [{mask_type}] Ckpt schedule: {sorted(ckpt_schedule_set)}")
 
     # ── Training loop ──
     for it in range(1, max_iters + 1):
@@ -599,17 +386,13 @@ def train_diffusion(
                 loss = per_sample.mean()
             tg += m.sum().item()
         else:
-            ids, ans_starts, idx = _next_batch()
+            idx = _next_batch()
+            ids = train_ids[idx]
+            ans_starts = train_ans[idx]
             B_b = ids.shape[0]
             ap = (ans_starts.unsqueeze(1) + _arange).clamp(max=T - 1)
             bi = torch.arange(B_b, device=device).unsqueeze(1).expand_as(ap)
-            # In fresh-data mode there is no persistent blank_masks indexed by
-            # sample id; the answer region is always fully blank (matches the
-            # addition experiment's default of torch.ones blank_masks).
-            if idx is not None:
-                bl = blank_masks[idx]
-            else:
-                bl = torch.ones(B_b, ans_len, dtype=torch.bool, device=device)
+            bl = blank_masks[idx]
             t_ratio = torch.rand(B_b, device=device)
             m_probs = torch.zeros(B_b, T, dtype=torch.float, device=device)
             m_probs[bi, ap] = t_ratio.unsqueeze(1) * bl.float()
@@ -664,22 +447,8 @@ def train_diffusion(
         optimizer.step()
 
         with torch.no_grad():
-            # remove_duplicate=False is critical: with tied weights (wte.weight
-            # = lm_head.weight in our Transformer), the default remove_duplicate=True
-            # yields only one name and the other ema_state entry stays at init,
-            # producing checkpoints where one tied key has trained values and the
-            # other has init values. Saving with .clone() (e.g. milestone snapshots)
-            # exposes the divergence. Yielding both names with the same Parameter
-            # object means both ema_state entries lerp from the same source tensor,
-            # keeping them byte-identical throughout training.
-            for name, param in model.named_parameters(remove_duplicate=False):
+            for name, param in model.named_parameters():
                 ema_state[name].lerp_(param.data, 1 - ema_decay)
-
-        # ── Multi-checkpoint save (EMA snapshot at milestones) ──
-        if ckpt_save_fn is not None and it in ckpt_schedule_set:
-            with torch.no_grad():
-                ema_cpu = {k: v.detach().cpu().clone() for k, v in ema_state.items()}
-            ckpt_save_fn(ema_cpu, it)
 
         # Stratum-level training loss accumulation (per-token, scattered by sample stratum)
         if log_strata and m.sum() > 0:
@@ -823,9 +592,14 @@ def generate_diffusion(model, prefix_ids, n_tokens, mask_id,
         logits[:, :, mask_id] = -float('inf')
 
         if policy == 'confidence':
-            max_logit = logits.max(dim=-1).values
-            max_logit[unmasked] = -float('inf')
-            pos = max_logit.argmax(-1)
+            # Confidence = top-1 SOFTMAX PROBABILITY (LLaDA/Dream convention),
+            # not raw max-logit. Across positions these can rank differently
+            # (softmax depends on the whole distribution; a sharp peak scores
+            # higher than a tall-but-contested one). Token choice below is
+            # unaffected (softmax is monotonic within a position).
+            max_prob = F.softmax(logits, dim=-1).max(dim=-1).values
+            max_prob[unmasked] = -float('inf')
+            pos = max_prob.argmax(-1)
         elif policy == 'l2r':
             pos = torch.full((B,), T_pre + t, dtype=torch.long, device=device)
         elif policy == 'r2l':
@@ -836,8 +610,8 @@ def generate_diffusion(model, prefix_ids, n_tokens, mask_id,
             pos = rand_scores.argmax(-1)
         elif policy == 'layered_oracle':
             # Among masked positions, find those with minimum rank per sample;
-            # break ties by confidence (max-logit). Two-stage selection.
-            max_logit = logits.max(dim=-1).values            # [B, T_total]
+            # break ties by confidence (top-1 softmax prob, LLaDA convention).
+            max_prob = F.softmax(logits, dim=-1).max(dim=-1).values  # [B, T_total]
             # Mask-out ineligible: already-unmasked or rank=inf (outside ans)
             mask_inel = unmasked | (full_rank == float('inf'))
             # Compute min rank per row over eligible positions
@@ -847,7 +621,7 @@ def generate_diffusion(model, prefix_ids, n_tokens, mask_id,
             # Eligible at min rank
             elig_min = (rank_eff == min_rank) & ~mask_inel
             # Score: confidence among elig_min, else -inf
-            score = max_logit.clone()
+            score = max_prob.clone()
             score[~elig_min] = -float('inf')
             pos = score.argmax(-1)
         else:
