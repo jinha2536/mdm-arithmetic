@@ -199,6 +199,20 @@ def train_diffusion(
         print(f"  [{mask_type}] Loaded init checkpoint")
 
     ema_state = {k: v.clone() for k, v in model.state_dict().items()}
+    # ── Tied-weight fix ──
+    # Keys sharing storage in the model (e.g. wte.weight / lm_head.weight)
+    # must share ONE EMA tensor. Otherwise the named_parameters()-based EMA
+    # update (which deduplicates tied params) leaves the duplicate key frozen
+    # at init, and the final load_state_dict writes both keys into the same
+    # storage with "last key wins" — returning a model whose output head is
+    # still at initialization.
+    _by_ptr = {}
+    for _k, _v in model.state_dict().items():
+        _ptr = _v.data_ptr()
+        if _ptr in _by_ptr:
+            ema_state[_k] = ema_state[_by_ptr[_ptr]]
+        else:
+            _by_ptr[_ptr] = _k
     print(f"  [{mask_type}] params={model.n_params:,}, N={N}, T={T}, "
           f"ans_len={ans_len}, max_iters={max_iters}")
 
