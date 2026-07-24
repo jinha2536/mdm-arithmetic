@@ -497,14 +497,22 @@ def train_diffusion(
                 stopped_early = True
                 break
 
+    # ── Final eval BEFORE loading best EMA, so that a best achieved at the
+    # final iteration is snapshotted into best_ema and actually returned.
+    # (Previous ordering loaded best_ema first and ran the final _do_eval
+    # afterwards; _do_eval swap-restores the pre-eval weights, so a best found
+    # at the final eval updated best_loss/best_ema but the returned model kept
+    # the earlier weights. With eval_every | max_iters the in-loop eval at
+    # it=max_iters masked this; the reorder makes it correct unconditionally.)
+    model.eval()
+    if not stopped_early:
+        _do_eval(max_iters)
     # ── Load best EMA ──
     if best_ema:
         model.load_state_dict({k: v.to(device) for k, v in best_ema.items()})
     elif ema_state:
         model.load_state_dict(ema_state)
     model.eval()
-    if not stopped_early:
-        _do_eval(max_iters)
     status = f"early stopped at {best_iter}" if stopped_early else f"full {max_iters} iters"
     print(f"  ✓ Done ({status}, best probe loss: {best_loss:.4f}, "
           f"{time.time() - t0:.0f}s)")
@@ -592,14 +600,9 @@ def generate_diffusion(model, prefix_ids, n_tokens, mask_id,
         logits[:, :, mask_id] = -float('inf')
 
         if policy == 'confidence':
-            # Confidence = top-1 SOFTMAX PROBABILITY (LLaDA/Dream convention),
-            # not raw max-logit. Across positions these can rank differently
-            # (softmax depends on the whole distribution; a sharp peak scores
-            # higher than a tall-but-contested one). Token choice below is
-            # unaffected (softmax is monotonic within a position).
-            max_prob = F.softmax(logits, dim=-1).max(dim=-1).values
-            max_prob[unmasked] = -float('inf')
-            pos = max_prob.argmax(-1)
+            max_logit = logits.max(dim=-1).values
+            max_logit[unmasked] = -float('inf')
+            pos = max_logit.argmax(-1)
         elif policy == 'l2r':
             pos = torch.full((B,), T_pre + t, dtype=torch.long, device=device)
         elif policy == 'r2l':
@@ -610,8 +613,8 @@ def generate_diffusion(model, prefix_ids, n_tokens, mask_id,
             pos = rand_scores.argmax(-1)
         elif policy == 'layered_oracle':
             # Among masked positions, find those with minimum rank per sample;
-            # break ties by confidence (top-1 softmax prob, LLaDA convention).
-            max_prob = F.softmax(logits, dim=-1).max(dim=-1).values  # [B, T_total]
+            # break ties by confidence (max-logit). Two-stage selection.
+            max_logit = logits.max(dim=-1).values            # [B, T_total]
             # Mask-out ineligible: already-unmasked or rank=inf (outside ans)
             mask_inel = unmasked | (full_rank == float('inf'))
             # Compute min rank per row over eligible positions
@@ -621,7 +624,7 @@ def generate_diffusion(model, prefix_ids, n_tokens, mask_id,
             # Eligible at min rank
             elig_min = (rank_eff == min_rank) & ~mask_inel
             # Score: confidence among elig_min, else -inf
-            score = max_prob.clone()
+            score = max_logit.clone()
             score[~elig_min] = -float('inf')
             pos = score.argmax(-1)
         else:
