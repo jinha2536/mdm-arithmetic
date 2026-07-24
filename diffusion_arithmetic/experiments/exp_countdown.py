@@ -1,4 +1,44 @@
-"""Countdown: training and decode analyses."""
+"""
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  Countdown (CD4) — Planning Depth + PUMA Coverage Deficit
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  Task:     Given 5 numbers (last = target), produce a 3-step equation
+            chain reaching the target using +, -, *, /.
+  Example:  input  = "86,28,13,31,96"
+            output = "86+28=114,31-13=18,114-18=96"
+
+  Position types in output:
+    Plan:  operands & operators (left side of '=')  — requires planning
+    Calc:  result digits (right side of '=')         — locally computable
+    Sep:   '=' and ','                              — structural
+
+  Difficulty axis (NEW): solution_multiplicity — # of valid solutions per
+                         instance (DFS-enumerated). Low mult = constrained
+                         instance, high mult = many valid paths.
+                         This replaces/supplements chain_depth which is
+                         actually a DFS-generation artifact proxy for mult.
+
+  Oracle:          step_seq = complete step 1 (plan→calc) → step 2 → ...
+                   (now available as an actual decode policy.)
+
+  Corner case:     bottom-multiplicity OOD instances (mult=1 & long output)
+                   — theory-motivated: instances where conditioning pattern
+                   PUMA was trained on is least likely to cover.
+
+  Additional analyses (NEW):
+    • selective_reveal: reveal X% of gold tokens, single-pass predict rest
+      → context-sensitivity test (zebra-style)
+    • simulate_puma_coverage: per-position-type mask persistence
+      → coverage-paradox diagnostic (listops-style)
+    • step propagation: calc_i → plan_{i+1} error cascade
+      → independent-error rate (listops op-propagation analog)
+    • strict validation: multiset consistency check → cheat rate
+
+  Training:  iter-based with EMA
+  Decode:    confidence | step_seq (oracle) | l2r | random
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+"""
 import sys, os, time, math, json, random, re, statistics, itertools
 import torch
 import torch.nn as nn
@@ -11,6 +51,7 @@ from collections import defaultdict, Counter
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
                 if '__file__' in dir() else '.')
 from core.tokenizer import CharTokenizer
+from core.model import Transformer
 from core.train_utils import (
     mount_drive, save_results, save_checkpoint,
     train_diffusion, puma_k_fixed, puma_k_linear, puma_k_step,
@@ -35,35 +76,38 @@ def encode_countdown_samples(samples, tokenizer, max_len=None):
 
 EXP_NAME = 'exp_countdown'
 
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Config
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 MAX_ANS_LEN = 40
 MAX_SEQ_LEN = 60
 
 N_TRAIN = None; N_TEST = 1000; BATCH_SIZE = 256
-
+# Sub-sample rate for low-multiplicity (m=1-3) train puzzles. Default 0.10
+# keeps ~10% of m=1-3 (originally ~55% of data) so the rare-hard stratum
+# becomes ~5% of train — matching the paper's "rare patterns" framing.
 LOW_MULT_SAMPLE_RATE = 0.10
-# Paper §D.2: countdown 200k iters
-MAX_ITERS = 200000; EVAL_EVERY = 5000; LOG_EVERY = 1000
+MAX_ITERS = 400000; EVAL_EVERY = 5000; LOG_EVERY = 1000
 GEN_EVAL_EVERY = 10000; GEN_EVAL_N = 500
 MASK_TYPES = ['random', 'papl', 'puma']  # spectrum of confidence-alignment intervention
-# step_seq = structural oracle (complete step i before step i+1, plancalc deps)
+# step_seq = structural oracle (complete step i before step i+1, plan→calc deps)
 DECODE_POLICIES = ['confidence', 'step_seq', 'random']
 
-# Architecture: paper Table 4 — 12L/12H/384D ≈ 21M params
-N_LAYER = 12; N_HEAD = 12; N_EMBD = 384; DROPOUT = 0.0; POS_ENC = 'absolute'
+N_LAYER = 3; N_HEAD = 12; N_EMBD = 384; DROPOUT = 0.0; POS_ENC = 'absolute'
 LR = 3e-4; MIN_LR = 1e-5; WARMUP_ITERS = 1000; GRAD_CLIP = 1.0
 WEIGHT_DECAY = 0.01; EMA_DECAY = 0.9999
 PUMA_TAU = 0.9; PUMA_K = 8  # fixed K (unused when K_START is set)
+# K range chosen for reveal-per-step alignment, matching other domains:
+# K=4 → 10 tokens/step at start (random-like, confidence uninformative early)
+# K=20 → 2 tokens/step at end (fine-grained, confidence reliable late).
+# ANS_LEN=40, so K_END=20 gives ans_len/2 reveals per step.
 PUMA_K_START = 4; PUMA_K_END = 20
 PUMA_K_STEP = 3; PUMA_K_EVERY = None  # None = auto (ramp over first 1/3 of training)
-# PAPL (Peng et al. 2026): paper §D.3 uses α=5 for countdown.
-PAPL_TAU = 1.0; PAPL_ALPHA = 5.0
+# PAPL (Peng et al. 2025, arXiv:2509.23405): paper defaults τ=1, α=1.
+PAPL_TAU = 1.0; PAPL_ALPHA = 1.0
 SEED = 42
-TRAIN_ONLY = False  # set True via --train-only to skip all eval/analysis
-# bfloat16 disabled — interferes with single-digit precision (see exp_addition note).
-NO_AMP = True
-# Early stopping disabled per paper §D.2 (remove convergence-speed confound).
-PATIENCE = None
+NO_AMP = False
+PATIENCE = 50000
 CONTINUATION_ITERS = 10000
 
 # NEW
@@ -84,7 +128,7 @@ def parse_args():
     p.add_argument('--n-train', type=int); p.add_argument('--n-test', type=int)
     p.add_argument('--low-mult-sample-rate', type=float, default=None,
                    help='Sub-sample rate for m=1-3 train puzzles (0-1). Default 0.10 '
-                        '(keeps ~10%% of m=1-3, making it ~5%% of train :  rare hard stratum).')
+                        '(keeps ~10%% of m=1-3, making it ~5%% of train — rare hard stratum).')
     p.add_argument('--max-iters', type=int); p.add_argument('--batch-size', type=int)
     p.add_argument('--eval-every', type=int); p.add_argument('--gen-eval-every', type=int)
     p.add_argument('--n-layer', type=int); p.add_argument('--n-head', type=int)
@@ -100,8 +144,7 @@ def parse_args():
     p.add_argument('--masks', nargs='+'); p.add_argument('--decode', nargs='+')
     p.add_argument('--continuation-iters', type=int)
     p.add_argument('--no-continuation', action='store_true')
-    p.add_argument('--no-amp', action='store_true', default=None)
-    p.add_argument('--train-only', action='store_true', help='Skip all eval/analysis, only train and save checkpoints')
+    p.add_argument('--no-amp', action='store_true')
     p.add_argument('--corner-ood-n', type=int)
     p.add_argument('--skip-selective', action='store_true')
     p.add_argument('--skip-coverage', action='store_true')
@@ -143,7 +186,9 @@ def parse_args():
     return args
 
 
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Position type classification
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 POS_PLAN = 'plan'
 POS_CALC = 'calc'
 POS_SEP = 'sep'
@@ -169,7 +214,10 @@ def classify_output_positions(output_str):
 
 
 def classify_chain_depth(output_str):
-    """Chain depth: # steps that reuse a previous result."""
+    """Chain depth: # steps that reuse a previous result.
+    NOTE: DFS-generation artifact, not intrinsic difficulty; kept for
+    legacy compatibility. Use solution_mult for primary stratification.
+    """
     steps = output_str.split(',')
     results = []
     reuse_count = 0
@@ -193,7 +241,9 @@ def classify_chain_depth(output_str):
     return reuse_count, is_full_chain, step_details
 
 
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # NEW: Solution multiplicity (intrinsic difficulty)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 def _combine_nums_values(a, b):
     a, b = int(a), int(b)
@@ -210,7 +260,9 @@ def _combine_nums_values(a, b):
 
 
 def count_solutions(nums, target, limit=None):
-    """Exhaustive DFS: count valid solution paths reaching target."""
+    """Exhaustive DFS: count valid solution paths reaching target.
+    For start_size=4, <1ms per instance.
+    """
     def _rec(remaining):
         if len(remaining) == 1:
             return 1 if remaining[0] == target else 0
@@ -226,7 +278,9 @@ def count_solutions(nums, target, limit=None):
 
 
 def _mult_bin(m):
-    """Multiplicity bins."""
+    """Multiplicity bins. Lower multiplicity = harder (fewer ways to reach
+    target = model must find the specific path). Combined m=1-3 gives a
+    statistically stable "rare hard" stratum that paper claim targets."""
     if m <= 3:
         return 'm=1-3'      # rare hard stratum (combined for statistical power)
     if m <= 10:
@@ -237,10 +291,12 @@ def _mult_bin(m):
 MULT_BINS = ['m=1-3', 'm=4-10', 'm=11+']
 
 
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Oracle decode orders
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 def build_oracle_order_step_seq(output_str):
-    """Step-sequential oracle: step1 plansepcalc, then step2, ..."""
+    """Step-sequential oracle: step1 plan→sep→calc, then step2, ..."""
     types = classify_output_positions(output_str)
     order = []
     steps_raw = output_str.split(',')
@@ -267,7 +323,9 @@ def build_oracle_order_calc_first(output_str):
     return calc_sep + plan
 
 
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Data formatting & tokenizer
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 SEP_CHAR = '|'
 EOS_CHAR = '$'
 RAINBOW_CHARS = 'abcdefghijklmnop'
@@ -339,7 +397,9 @@ def get_answer(s):
     return s.split(SEP_CHAR, 1)[1]
 
 
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Data loading
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 def load_jsonl(filepath, max_n=None):
     data = []
@@ -354,7 +414,13 @@ def load_jsonl(filepath, max_n=None):
 
 def load_and_format(filepath, max_n=None, seed=42, compute_mult=False,
                     low_mult_sample_rate=1.0):
-    """Load jsonl, format samples, return (samples, metas)."""
+    """Load jsonl, format samples, return (samples, metas).
+
+    If `compute_mult=True`, each meta gets solution_mult + mult_bin.
+    If `low_mult_sample_rate` < 1.0 (and compute_mult=True), only that fraction
+    of m=1-3 puzzles is kept. Use 0.10 for train data to make low-mult the
+    rarest stratum (~5%), matching the paper's "rare patterns" framing.
+    """
     raw = load_jsonl(filepath, max_n)
     rng = random.Random(seed)
     rng.shuffle(raw)
@@ -385,7 +451,12 @@ def load_and_format(filepath, max_n=None, seed=42, compute_mult=False,
 
 
 def select_ood_corner_cases(test_samples, test_metas, n=CORNER_OOD_N):
-    """Bottom-multiplicity, long-output instances as OOD corner."""
+    """Bottom-multiplicity, long-output instances as OOD corner.
+
+    Theory: PUMA's training manifold is narrow; OOD = instances whose
+    conditioning patterns are least covered by training. Low mult =
+    constrained solution space = pattern underrepresented in training.
+    """
     scored = []
     for i, m in enumerate(test_metas):
         mult = m.get('solution_mult', -1)
@@ -398,7 +469,9 @@ def select_ood_corner_cases(test_samples, test_metas, n=CORNER_OOD_N):
             [test_metas[i] for i in selected_idx])
 
 
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Equation validation
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 def check_equation(eq_str):
     try:
@@ -429,7 +502,10 @@ def check_equation(eq_str):
 
 
 def validate_countdown(pred_output, target, input_nums=None, strict=False):
-    """Validate output."""
+    """Validate output. `strict=True` adds multiset-consistent number usage
+    check: each equation's operands must come from pool = (inputs - used +
+    previous results).
+    """
     clean = pred_output.split(EOS_CHAR)[0] if EOS_CHAR in pred_output else pred_output
     for c in RAINBOW_CHARS:
         clean = clean.replace(c, '')
@@ -493,7 +569,9 @@ def validate_countdown(pred_output, target, input_nums=None, strict=False):
     return out
 
 
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Probe
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 @torch.no_grad()
 def probe_per_position(model, tokenizer, test_samples, test_metas,
@@ -578,12 +656,17 @@ def probe_per_position(model, tokenizer, test_samples, test_metas,
     return result
 
 
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # NEW: step_seq oracle generation (extends generate_diffusion's policies)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 @torch.no_grad()
 def _generate_step_seq(model, prefix_ids, oracle_orders, n_tokens, mask_id,
                        pad_to=None, pad_id=None, device=None):
-    """Greedy generation with per-sample oracle order."""
+    """Greedy generation with per-sample oracle order.
+    oracle_orders[b] = list of answer-region indices in decode order.
+    Missing indices are appended in ascending order.
+    """
     if device is None:
         device = DEVICE
     model.eval()
@@ -624,7 +707,9 @@ def _generate_step_seq(model, prefix_ids, oracle_orders, n_tokens, mask_id,
     return x, {'orders': orders_t}
 
 
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Generation evaluation
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 @torch.no_grad()
 def gen_eval(model, tokenizer, test_samples, test_metas, max_len,
@@ -807,12 +892,19 @@ def _rank_concordance(decode_step_map, oracle_order, n):
     return concordant / total
 
 
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # NEW: Selective reveal (zebra-style context sensitivity test)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 @torch.no_grad()
 def selective_reveal_eval(model, tokenizer, test_samples, test_metas, max_len,
                           reveal_frac=0.5, seed=0, device=None):
-    """Reveal `reveal_frac` of gold tokens randomly; single-pass predict the rest."""
+    """Reveal `reveal_frac` of gold tokens randomly; single-pass predict
+    the rest. Accuracy stratified by position type & mult bin.
+
+    A context-sensitive model should improve as reveal_frac grows.
+    A context-insensitive model shows flat accuracy (zebra PUMA signature).
+    """
     if device is None:
         device = DEVICE
     rng = random.Random(seed)
@@ -893,12 +985,19 @@ def selective_reveal_eval(model, tokenizer, test_samples, test_metas, max_len,
     return result
 
 
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # NEW: PUMA coverage simulation (listops-style)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 @torch.no_grad()
 def simulate_puma_coverage(model, tokenizer, test_samples, test_metas, max_len,
                            K=None, tau=None, n_samples=200, device=None):
-    """Simulate PUMA teacher-forced chain; measure per-position-type mask persistence (fraction of steps each position remains masked)."""
+    """Simulate PUMA teacher-forced chain; measure per-position-type mask
+    persistence (fraction of steps each position remains masked).
+
+    cov[t] ≈ training-time gradient signal to positions of type t.
+    Expected paradox: cov[plan] > cov[calc] BUT acc[plan] < acc[calc].
+    """
     if device is None:
         device = DEVICE
     if K is None:
@@ -984,10 +1083,16 @@ def simulate_puma_coverage(model, tokenizer, test_samples, test_metas, max_len,
     }
 
 
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # NEW: Step propagation (listops op_propagation analog)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 def analyse_step_propagation(per_sample_results, test_metas):
-    """Step-level error cascade on full-chain instances."""
+    """Step-level error cascade on full-chain instances.
+
+    propagation_rate       = P(plan_{i+1} err | calc_i err)
+    independent_error_rate = P(plan_{i+1} err | calc_i ok)
+    """
     ce_pe = 0; ce_po = 0; co_pe = 0; co_po = 0
 
     for r, m in zip(per_sample_results, test_metas):
@@ -1047,10 +1152,39 @@ def analyse_step_propagation(per_sample_results, test_metas):
     }
 
 
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Training wrapper
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+def _td_supports(name):
+    """True if the installed train_utils.train_diffusion accepts `name`.
+    Keeps this script compatible with both the base train_utils and the
+    seed_train-extended version used by the addition multi-seed runs."""
+    import inspect
+    try:
+        return name in inspect.signature(train_diffusion).parameters
+    except (TypeError, ValueError):
+        return False
+
+
+def _build_shared_init(tokenizer, max_len, seed):
+    """Fresh Transformer with deterministic init for `seed`, as a CPU
+    state_dict shared across all mask types within one seed (addition
+    multi-seed convention). block_size mirrors train_diffusion: T = max_len."""
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    init_model = Transformer(
+        vocab_size=len(tokenizer), block_size=max_len + 8,
+        n_layer=N_LAYER, n_head=N_HEAD, n_embd=N_EMBD,
+        dropout=DROPOUT, is_causal=False, pos_enc=POS_ENC,
+    )
+    return {k: v.cpu().clone() for k, v in init_model.state_dict().items()}
+
 
 def train_model(mask_type, tokenizer, train_samples, test_samples, test_metas,
-                max_len, max_iters=None, init_state=None, device=None):
+                max_len, max_iters=None, init_state=None, device=None,
+                seed_train=None):
     if device is None:
         device = DEVICE
     if max_iters is None:
@@ -1070,7 +1204,7 @@ def train_model(mask_type, tokenizer, train_samples, test_samples, test_metas,
                 k_every = max(1000, (max_iters // 3) // n_inc)
             k_sched = puma_k_step(PUMA_K_START, PUMA_K_END, k_step, k_every)
             final_k = k_sched(max_iters)
-            print(f"  PUMA K: step {PUMA_K_START}{final_k} "
+            print(f"  PUMA K: step {PUMA_K_START}→{final_k} "
                   f"(+{k_step} every {k_every // 1000}k, cap={PUMA_K_END})")
         else:
             k_sched = puma_k_fixed(PUMA_K)
@@ -1104,6 +1238,17 @@ def train_model(mask_type, tokenizer, train_samples, test_samples, test_metas,
             probe['gen_cheat'] = r['cheat_rate']
         return probe
 
+    extra_kwargs = {}
+    if seed_train is not None:
+        if _td_supports('seed_train'):
+            extra_kwargs['seed_train'] = seed_train
+        else:
+            torch.manual_seed(seed_train); random.seed(seed_train)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(seed_train)
+            print(f"  [seed] train RNG set to {seed_train} manually "
+                  f"(train_diffusion has no seed_train param)")
+
     model, dynamics = train_diffusion(
         train_ids=train_ids, train_ans=train_ans, ans_len=MAX_ANS_LEN,
         tokenizer=tokenizer,
@@ -1120,11 +1265,14 @@ def train_model(mask_type, tokenizer, train_samples, test_samples, test_metas,
         patience=PATIENCE,
         init_state=init_state, device=device,
         use_amp=False if NO_AMP else None,
+        **extra_kwargs,
     )
     return model, dynamics
 
 
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Serialization safety
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 def _to_serializable(obj):
     """Recursively convert tensors/sets to JSON-safe types."""
@@ -1139,7 +1287,9 @@ def _to_serializable(obj):
     return obj
 
 
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Main run
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 def run(tag=''):
     torch.manual_seed(SEED)
@@ -1159,7 +1309,9 @@ def run(tag=''):
 
     print(f"\nLoading train data from {train_path}...")
     t0 = time.time()
-
+    # LOW_MULT_SAMPLE_RATE=0.10: keep ~10% of m=1-3 (originally ~55% of data)
+    # so the rare-hard stratum becomes ~5% of train — matching paper's
+    # "confidence-aligned methods miss rare patterns" framing.
     train_samples, train_metas = load_and_format(
         train_path, max_n=N_TRAIN, seed=SEED, compute_mult=True,
         low_mult_sample_rate=LOW_MULT_SAMPLE_RATE)
@@ -1193,7 +1345,7 @@ def run(tag=''):
         ood_samples, ood_metas = select_ood_corner_cases(
             test_samples, test_metas, n=CORNER_OOD_N)
         print(f"  OOD corner (low-mult tail): {len(ood_samples)} instances "
-              f":  {Counter(m['mult_bin'] for m in ood_metas)}")
+              f"— {Counter(m['mult_bin'] for m in ood_metas)}")
 
     tokenizer = build_tok()
     max_len = MAX_SEQ_LEN
@@ -1202,28 +1354,29 @@ def run(tag=''):
     all_dyn, all_final = {}, {}
     models = {}
 
-    for mask_type in MASK_TYPES:
-        # Equalize initialization across mask types (see exp_addition for rationale).
-        torch.manual_seed(SEED); random.seed(SEED)
+    # ── Shared init across methods within this seed (addition convention) ──
+    shared_init = _build_shared_init(tokenizer, max_len, SEED)
+    save_checkpoint(exp_name, shared_init, tag=f'init_seed{SEED}')
+    print(f"  Built shared init for seed {SEED} ({len(shared_init)} tensors)")
+
+    method_seeds = {}
+    for mi, mask_type in enumerate(MASK_TYPES):
+        method_seed = SEED * 100 + mi
+        method_seeds[mask_type] = method_seed
         print(f"\n{'─'*60}")
-        print(f"  Training: {mask_type}")
+        print(f"  Training: {mask_type}  (seed={SEED}, train_seed={method_seed})")
         print(f"{'─'*60}")
 
         model, dynamics = train_model(
             mask_type, tokenizer, train_samples, test_samples, test_metas,
-            max_len, device=DEVICE)
+            max_len, device=DEVICE,
+            init_state=shared_init, seed_train=method_seed)
         models[mask_type] = model
         all_dyn[mask_type] = dynamics
-        # Save checkpoint immediately for offline analysis (added for --train-only mode).
-        sd_cpu = {k: v.cpu().clone() for k, v in model.state_dict().items()}
-        save_checkpoint(exp_name, sd_cpu, tag=mask_type)
-        if TRAIN_ONLY:
-            save_results(exp_name, {'all_dyn': all_dyn, 'train_only': True},
-                         tag='dynamics_partial')
-            del model, sd_cpu
-            models.pop(mask_type, None)
-            if torch.cuda.is_available(): torch.cuda.empty_cache()
-            continue
+        save_checkpoint(
+            exp_name,
+            {k: v.cpu().clone() for k, v in model.state_dict().items()},
+            tag=f'seed{SEED}_{mask_type}')
 
         # ─── Main eval across decode policies ───
         for dp in DECODE_POLICIES:
@@ -1248,7 +1401,7 @@ def run(tag=''):
                 print(f"    concordance: step_seq={r['concordance_step_seq']:.3f} "
                       f"calc_first={r.get('concordance_calc_first', 0):.3f}")
 
-            # Save per_sample only from confidence decode used in propagation
+            # Save per_sample only from confidence decode → used in propagation
             if dp == 'confidence' and per_sample is not None:
                 prop = analyse_step_propagation(per_sample, test_metas)
                 all_final[f"{mask_type}_step_propagation"] = prop
@@ -1297,23 +1450,19 @@ def run(tag=''):
                   f"cheat={r_ood['cheat_rate']:.3f}")
             for ex in r_ood.get('examples', [])[:3]:
                 print(f"      gold={ex['gold'][:35]}  pred={ex['pred'][:35]} "
-                      f"{'' if ex['exact'] else ''}")
+                      f"{'✓' if ex['exact'] else '✗'}")
 
     # ─── Continuation training ───
-    if TRAIN_ONLY:
-        save_results(exp_name, {'all_dyn': all_dyn, 'train_only': True})
-        print(f"\n[TRAIN_ONLY] skipping continuation + summary; "
-              f"checkpoints + dynamics saved.")
-        return
     if not getattr(args, 'no_continuation', False) and 'puma' in models:
         print(f"\n{'─'*60}")
-        print(f"  Continuation: PUMA  random ({CONTINUATION_ITERS} iters)")
+        print(f"  Continuation: PUMA → random ({CONTINUATION_ITERS} iters)")
         print(f"{'─'*60}")
         puma_state = models['puma'].state_dict()
         cont_model, cont_dyn = train_model(
             'random', tokenizer, train_samples, test_samples, test_metas,
             max_len, max_iters=CONTINUATION_ITERS,
-            init_state=puma_state, device=DEVICE)
+            init_state=puma_state, device=DEVICE,
+            seed_train=SEED * 100 + 50)
         for dp in ['confidence', 'step_seq']:
             r = gen_eval(cont_model, tokenizer, test_samples, test_metas,
                          max_len, dp, device=DEVICE)
@@ -1386,11 +1535,16 @@ def run(tag=''):
             print(f" {v:>12.4f}" if v is not None else f" {'N/A':>12s}", end='')
         print()
 
-    # ─── Save ───
+    # ─── Save (per-seed file names: results_seed{N}.json) ───
     sd = {'config': {k: globals()[k] for k in [
         'MAX_ANS_LEN', 'MAX_SEQ_LEN', 'N_LAYER', 'N_HEAD', 'N_EMBD',
         'MASK_TYPES', 'DECODE_POLICIES', 'MAX_ITERS', 'BATCH_SIZE',
-        'PUMA_K', 'SEED', 'CORNER_OOD_N', 'SELECTIVE_REVEAL_FRACS']}}
+        'PUMA_K', 'PUMA_K_START', 'PUMA_K_END', 'PUMA_K_STEP', 'PUMA_K_EVERY',
+        'PUMA_TAU', 'PAPL_TAU', 'PAPL_ALPHA', 'LOW_MULT_SAMPLE_RATE',
+        'NO_AMP', 'PATIENCE',
+        'SEED', 'CORNER_OOD_N', 'SELECTIVE_REVEAL_FRACS']},
+        'seed': SEED,
+        'train_seeds': method_seeds}
     for k, v in all_dyn.items():
         sd[f'dyn_{k}'] = _to_serializable(v)
     for k, v in all_final.items():
@@ -1404,24 +1558,18 @@ def run(tag=''):
             try:
                 json.dumps(v)
             except Exception as ee:
-                print(f"    BAD KEY: {k}  {ee}")
+                print(f"    BAD KEY: {k} → {ee}")
 
-    save_results(exp_name, sd)
+    save_results(exp_name, sd, tag=f'seed{SEED}')
     return all_dyn, all_final
 
 
 if __name__ == '__main__':
     args = parse_args()
-    globals()['TRAIN_ONLY'] = args.train_only
     seeds = args.seeds if args.seeds else [SEED]
     for si, seed in enumerate(seeds):
         globals()['SEED'] = seed
-        # Always disambiguate output directories per-seed when multiple seeds are run,
-        # even without --tag; otherwise results from later seeds silently overwrite earlier ones.
-        if len(seeds) > 1:
-            t = f"{args.tag}_s{seed}" if args.tag else f"s{seed}"
-        else:
-            t = args.tag
+        t = f"{args.tag}_s{seed}" if args.tag and len(seeds) > 1 else args.tag
         if len(seeds) > 1:
             print(f"\n{'#'*70}\n# Seed {seed} ({si+1}/{len(seeds)})\n{'#'*70}")
         run(tag=t)

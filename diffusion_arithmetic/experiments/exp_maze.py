@@ -30,6 +30,7 @@ import matplotlib.pyplot as plt
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
                 if '__file__' in dir() else '.')
 from core.tokenizer import CharTokenizer
+from core.model import Transformer
 from core.train_utils import (
     mount_drive, save_results, save_checkpoint, encode_samples,
     train_diffusion, puma_k_step, generate_diffusion,
@@ -47,12 +48,10 @@ GRID_W = GRID_H
 CELL_N = GRID_H * GRID_W   # = 225
 ANS_LEN = CELL_N            # solution is same size as puzzle
 
-# Paper §C.2: train 10,000 mazes, batch 256
-N_TRAIN = 10000; N_TEST = 5000; BATCH_SIZE = 256
+N_TRAIN = 50000; N_TEST = 5000; BATCH_SIZE = 128
 # Per-bucket count for constructed tests (sweeps, corners) — shared across analyses
 N_PER_BUCKET = 300
-# Paper §D.2: maze 50k iters
-MAX_ITERS = 50000; EVAL_EVERY = 5000; LOG_EVERY = 1000
+MAX_ITERS = 200000; EVAL_EVERY = 5000; LOG_EVERY = 1000
 GEN_EVAL_EVERY = 10000; GEN_EVAL_N = 200
 
 MASK_TYPES = ['random', 'papl', 'puma']  # spectrum of confidence-alignment intervention
@@ -61,23 +60,31 @@ DECODE_POLICIES = ['confidence', 'dead_end_filling', 'random']
 # matching the human-style maze-solving heuristic. bfs_oracle (BFS-from-start)
 # was redundant and didn't capture the backbone/corridor decomposition.
 
-# Architecture: paper Table 4 — 3L/3H/192D ≈ 1.4M params
-N_LAYER = 3; N_HEAD = 3; N_EMBD = 192; DROPOUT = 0.1; POS_ENC = 'absolute'
+N_LAYER = 4; N_HEAD = 4; N_EMBD = 128; DROPOUT = 0.1; POS_ENC = 'absolute'
 LR = 3e-4; MIN_LR = 1e-5; WARMUP_ITERS = 2000; GRAD_CLIP = 1.0
 WEIGHT_DECAY = 0.01; EMA_DECAY = 0.9999
 
 PUMA_TAU = 0.9
-# PUMA K schedule (paper Table 6): K_start=10, K_end=40 for maze.
-# Maze ans_len=441, so K_end=40 → ~11 cells/step (coarser than other domains
-# whose K_end gives ~2 tokens/step). This trade-off was discussed in the paper.
-PUMA_K_START = 10; PUMA_K_END = 40; PUMA_K_STEP = 3; PUMA_K_EVERY = None
-# PAPL (Peng et al. 2026): paper §D.3 uses α=5 for maze.
-PAPL_TAU = 1.0; PAPL_ALPHA = 5.0
+# PUMA K schedule. K range chosen so reveal-per-step aligns with confidence
+# strategy: coarse start when model is random (~10 cells/step) → finer at the
+# end when confidence is informative (~5 cells/step for maze, which has longer
+# ans_len than addition so we don't go as fine as 2 per step).
+# K_END=None → auto: target ~5 cells/step at final K.
+# K_EVERY=None → auto: ramp over first 1/3 of training.
+PUMA_K_START = 12; PUMA_K_END = None; PUMA_K_STEP = 3; PUMA_K_EVERY = None
+# PAPL (Peng et al. 2025, arXiv:2509.23405): paper defaults τ=1, α=1.
+PAPL_TAU = 1.0; PAPL_ALPHA = 1.0
 SEED = 42
-TRAIN_ONLY = False  # set True via --train-only to skip all eval/analysis
-# bfloat16 disabled — interferes with single-digit precision (see exp_addition note).
-NO_AMP = True
+NO_AMP = False
 STRAIGHTNESS_BIAS = 0.0  # 0.0=normal DFS, higher=longer corridors in training
+
+# One-cell-per-step decoding (default). Matches generate_diffusion's
+# one-token-per-step granularity used in addition/ListOps/Countdown, so maze
+# numbers are directly comparable across domains. The legacy multi-reveal
+# decode (ceil(n_remaining/K_remaining) cells per forward pass) produced the
+# paper-v1 maze numbers and is a known artifact; restore it only for
+# reproduction via --multi-reveal.
+ONE_CELL_DECODE = True
 
 # Continuation training
 CONTINUATION_ITERS = 5000
@@ -126,8 +133,10 @@ def parse_args():
     p.add_argument('--no-patience', action='store_true',
                    help='Disable early stopping for fair comparison across mask types')
     p.add_argument('--no-continuation', action='store_true')
-    p.add_argument('--no-amp', action='store_true', default=None)
-    p.add_argument('--train-only', action='store_true', help='Skip all eval/analysis, only train and save checkpoints')
+    p.add_argument('--no-amp', action='store_true')
+    p.add_argument('--multi-reveal', action='store_true',
+                   help='Restore legacy multi-reveal decode (K cells/step). '
+                        'Default is one-cell-per-step, matching generate_diffusion.')
     p.add_argument('--tag', type=str, default=''); p.add_argument('--seed', type=int)
     p.add_argument('--seeds', nargs='+', type=int)
     try:
@@ -155,6 +164,7 @@ def parse_args():
     if args.masks: g['MASK_TYPES'] = args.masks
     if args.decode: g['DECODE_POLICIES'] = args.decode
     if getattr(args, 'no_patience', False): g['PATIENCE'] = None
+    if getattr(args, 'multi_reveal', False): g['ONE_CELL_DECODE'] = False
     return args
 
 
@@ -992,23 +1002,31 @@ def probe_per_cell(model, tokenizer, test_data, max_len, device=None):
 
 @torch.no_grad()
 def generate_blanks(model, tokenizer, test_data, decode_policy='confidence',
-                    n_decode_steps=None, batch_size=32, device=None):
-    """Iterative unmasking, ONE CELL PER STEP (matches addition's
-    generate_diffusion). For ANS_LEN=N with ~K blanks, runs ~K forward
-    passes per batch.
- 
-    Slower than the previous multi-reveal version but matches the inference
-    semantics used by other domains and isolates the confidence-based
-    decoding mechanism cleanly.
+                    n_decode_steps=None, batch_size=64, device=None,
+                    one_cell=None):
+    """Iterative unmasking (batched over samples).
+
+    one_cell=True (default via ONE_CELL_DECODE): exactly ONE cell revealed per
+    forward pass per sample — the same decode granularity as generate_diffusion
+    in addition/ListOps/Countdown. Samples with fewer blanks finish early.
+
+    one_cell=False (legacy, --multi-reveal): reveals
+    ceil(n_remaining / K_remaining) cells per forward pass over n_decode_steps
+    passes. This is the paper-v1 behavior and is NOT comparable to the other
+    domains' one-token-per-step decoding.
     """
-    import random
     if device is None: device = DEVICE
+    if one_cell is None: one_cell = globals().get('ONE_CELL_DECODE', True)
+    if one_cell:
+        n_decode_steps = ANS_LEN  # upper bound; loop breaks when no masks remain
+    elif n_decode_steps is None:
+        n_decode_steps = globals().get('_PUMA_K_FINAL', PUMA_K_END or 24)
     mask_id = tokenizer.special_ids['mask']
     pad_id = tokenizer.special_ids['pad']
     dot_id = tokenizer.encode('.')[0]
     model.eval(); results = []
     _ar = torch.arange(ANS_LEN, device=device)
- 
+
     for st in range(0, len(test_data), batch_size):
         batch = test_data[st:st + batch_size]; B = len(batch)
         full_enc = [tokenizer.encode(d['string']) for d in batch]
@@ -1016,16 +1034,18 @@ def generate_blanks(model, tokenizer, test_data, decode_policy='confidence',
         ids = torch.full((B, ml), pad_id, dtype=torch.long, device=device)
         for i, e in enumerate(full_enc):
             ids[i, :len(e)] = torch.tensor(e, device=device)
- 
+
+        # Vectorized '=' search
         eq_id = tokenizer.encode('=')[0]
         ans_starts = (ids == eq_id).long().argmax(dim=1) + 1
         ap = (ans_starts.unsqueeze(1) + _ar).clamp(max=ml - 1)
         bi = torch.arange(B, device=device).unsqueeze(1).expand_as(ap)
- 
+
+        # Vectorized blank mask
         blank_m = (ids[:, :ANS_LEN] == dot_id)
         x = ids.clone()
         x[bi[blank_m], ap[blank_m]] = mask_id
- 
+
         # Static decode order
         static_order = None
         if decode_policy in ('bfs_oracle', 'dead_end_filling', 'random'):
@@ -1041,51 +1061,41 @@ def generate_blanks(model, tokenizer, test_data, decode_policy='confidence',
                 elif decode_policy == 'dead_end_filling' and 'de_filling_order' in batch[i]:
                     oracle = batch[i]['de_filling_order']
                     for j in blank_js: static_order[i, j] = oracle.get(j, 9999)
- 
-        # ── ONE-CELL-PER-STEP decode ────────────────────────────────────
-        max_steps = blank_m.sum(dim=1).max().item()
-        if n_decode_steps is not None:
-            max_steps = min(max_steps, n_decode_steps)
- 
-        for step in range(max_steps):
+
+        # Multi-reveal iterative decode
+        for step in range(n_decode_steps):
             is_m = blank_m & (x[bi, ap] == mask_id)
             if not is_m.any(): break
             logits = model(x)
             al = logits[bi, ap].clone(); al[:, :, mask_id] = -float('inf')
-            preds = al.argmax(dim=-1)            # [B, ANS_LEN]
- 
-            if decode_policy == 'confidence':
-                # Use max-logit (matches generate_diffusion); softmax is
-                # monotonic so the chosen position is identical, but
-                # max-logit avoids saturated-prob numerical noise.
-                scores = al.max(dim=-1).values   # [B, ANS_LEN]
-                scores = scores.masked_fill(~is_m, -float('inf'))
+            probs = F.softmax(al, dim=-1)
+            confs = probs.max(dim=-1).values; preds = probs.argmax(dim=-1)
+            confs[~is_m] = -float('inf')
+
+            if one_cell:
+                nr = torch.ones(B, dtype=torch.long, device=device)
             else:
-                # Static order: pick still-masked cell with smallest rank.
-                # Tie-break by max-logit (rare in practice).
+                nm = is_m.sum(dim=1).float()
+                K_rem = max(n_decode_steps - step, 1)
+                nr = (nm / K_rem).ceil().long().clamp(min=1)
+
+            if decode_policy == 'confidence':
+                ranked = confs.argsort(dim=1, descending=True)
+            else:
                 rank_vals = torch.where(is_m, static_order,
                                         torch.tensor(9999, dtype=torch.long, device=device))
-                # Lower rank = higher priority. Convert to "score" by negating.
-                # Tie-break by max-logit (small epsilon).
-                conf_score = al.max(dim=-1).values
-                scores = -rank_vals.float() + 1e-6 * conf_score
-                scores = scores.masked_fill(~is_m, -float('inf'))
- 
-            best_j = scores.argmax(dim=1)        # [B] — one cell per sample
- 
-            # Commit only for samples that still have masked cells
-            has_masked = is_m.any(dim=1)
-            for i in range(B):
-                if not has_masked[i]: continue
-                j = best_j[i].item()
-                x[i, ap[i, j]] = preds[i, j]
- 
-        # Vectorized result collection (unchanged)
+                ranked = rank_vals.argsort(dim=1)
+            rop = torch.zeros_like(ranked)
+            rop.scatter_(1, ranked, _ar.expand(B, -1))
+            reveal = (rop < nr.unsqueeze(1)) & is_m
+            x[bi[reveal], ap[reveal]] = preds[reveal]
+
+        # Vectorized result collection
         pred_at_ans = x[bi, ap]; gold_at_ans = ids[bi, ap]
         pos_correct = (pred_at_ans == gold_at_ans)
         open_correct = pos_correct | ~blank_m
         sample_correct = open_correct.all(dim=1)
- 
+
         for i in range(B):
             errs = ((~pos_correct[i]) & blank_m[i]).nonzero(as_tuple=True)[0].tolist()
             results.append({
@@ -1325,10 +1335,42 @@ def analyse_error_localization(per_sample, test_data):
 # Training
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
+def _td_supports(name):
+    """True if the installed train_utils.train_diffusion accepts `name`.
+    The multi-seed addition runs used a train_utils extended with seed_train;
+    this guard keeps the maze script working with either version."""
+    import inspect
+    try:
+        return name in inspect.signature(train_diffusion).parameters
+    except (TypeError, ValueError):
+        return False
+
+
+def _build_shared_init(tokenizer, max_len, seed):
+    """Fresh Transformer with deterministic init for `seed`, returned as a CPU
+    state_dict. Shared across all mask types within one seed (addition
+    multi-seed convention). block_size must mirror train_diffusion's
+    construction: encode_samples pads to max_len, so T = max_len."""
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    init_model = Transformer(
+        vocab_size=len(tokenizer), block_size=max_len + 8,
+        n_layer=N_LAYER, n_head=N_HEAD, n_embd=N_EMBD,
+        dropout=DROPOUT, is_causal=False, pos_enc=POS_ENC,
+    )
+    return {k: v.cpu().clone() for k, v in init_model.state_dict().items()}
+
+
 def train_model(mask_type, tokenizer, train_data, suite, max_len,
-                max_iters=None, init_state=None, device=None):
+                max_iters=None, init_state=None, device=None, seed_train=None):
     """Train maze model. train_data is list of entries (must have backbone_length).
     `suite` is the unified test suite (for eval probe on natural + reveal-τ on extreme).
+
+    seed_train: training-RNG seed (mask sampling, batch order), decoupled from
+    the model-init RNG (init comes from init_state). Passed through to
+    train_diffusion when supported; otherwise applied manually just before the
+    training call — equivalent given init_state fixes the weights.
     """
     if device is None: device = DEVICE
     if max_iters is None: max_iters = MAX_ITERS
@@ -1488,6 +1530,17 @@ def train_model(mask_type, tokenizer, train_data, suite, max_len,
                           f"| {strata_str}")
         return probe
 
+    extra_kwargs = {}
+    if seed_train is not None:
+        if _td_supports('seed_train'):
+            extra_kwargs['seed_train'] = seed_train
+        else:
+            torch.manual_seed(seed_train); random.seed(seed_train)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(seed_train)
+            print(f"  [seed] train RNG set to {seed_train} manually "
+                  f"(train_diffusion has no seed_train param)")
+
     model, dynamics = train_diffusion(
         train_ids=train_ids, train_ans=train_ans, ans_len=ANS_LEN, tokenizer=tokenizer,
         mask_type=mask_type, blank_masks=blank_masks,
@@ -1502,6 +1555,7 @@ def train_model(mask_type, tokenizer, train_data, suite, max_len,
         sample_strata=sample_strata, stratum_names=stratum_names,
         init_state=init_state, device=device,
         use_amp=False if NO_AMP else None,
+        **extra_kwargs,
     )
     return model, dynamics
 
@@ -1516,7 +1570,8 @@ train = train_model
 
 def make_figures(all_dyn, all_final):
     figs = {}
-    COLORS = {'random': '#3498db', 'puma': '#8e44ad'}
+    # Paper palette: random / papl / puma
+    COLORS = {'random': '#3b76b8', 'papl': '#d8443d', 'puma': '#e89537'}
 
     # Fig 1: Dep context accuracy over training
     ctx_show = ['junction', 'corridor_entrance', 'corridor_shallow', 'corridor_deep']
@@ -1730,10 +1785,12 @@ def make_figures(all_dyn, all_final):
 
 def run(tag=''):
     exp_name = f"{EXP_NAME}_{tag}" if tag else EXP_NAME
-    print(f"\n{'='*70}\n  {exp_name}\n{'='*70}")
+    print(f"\n{'='*70}\n  {exp_name}  | seed={SEED}\n{'='*70}")
     print(f"  Grid: {GRID_H}×{GRID_W} ({CELL_N} cells), bias={STRAIGHTNESS_BIAS}")
     print(f"  Model: L={N_LAYER} H={N_HEAD} E={N_EMBD}")
     print(f"  Masks: {MASK_TYPES}, Decode: {DECODE_POLICIES}")
+    print(f"  Decode granularity: "
+          f"{'ONE-CELL per step (generate_diffusion-aligned)' if ONE_CELL_DECODE else 'multi-reveal (LEGACY, paper-v1 artifact)'}")
 
     torch.manual_seed(SEED); random.seed(SEED)
     tok = build_tok()
@@ -1765,21 +1822,22 @@ def run(tag=''):
     all_dyn = {}; all_final = {}
     saved_states = {}
 
+    # ── Shared init across methods within this seed (addition convention) ──
+    shared_init = _build_shared_init(tok, max_len, SEED)
+    save_checkpoint(exp_name, shared_init, tag=f'init_seed{SEED}')
+    print(f"  Built shared init for seed {SEED} ({len(shared_init)} tensors)")
+
     # ── Train ──
-    for mt in MASK_TYPES:
-        # Equalize initialization across mask types (see exp_addition for rationale).
-        torch.manual_seed(SEED); random.seed(SEED)
-        print(f"\n{'━'*60}\n  Training: {mt}\n{'━'*60}")
-        m, dyn = train_model(mt, tok, train_data, suite, max_len, device=DEVICE)
+    method_seeds = {}
+    for mi, mt in enumerate(MASK_TYPES):
+        method_seed = SEED * 100 + mi
+        method_seeds[mt] = method_seed
+        print(f"\n{'━'*60}\n  Training: {mt}  (seed={SEED}, train_seed={method_seed})\n{'━'*60}")
+        m, dyn = train_model(mt, tok, train_data, suite, max_len, device=DEVICE,
+                             init_state=shared_init, seed_train=method_seed)
         all_dyn[f'dyn_{mt}'] = dyn
         saved_states[mt] = {k: v.cpu().clone() for k, v in m.state_dict().items()}
-        save_checkpoint(exp_name, saved_states[mt], tag=mt)
-        if TRAIN_ONLY:
-            save_results(exp_name, {'all_dyn': all_dyn, 'train_only': True},
-                         tag='dynamics_partial')
-            del m
-            if torch.cuda.is_available(): torch.cuda.empty_cache()
-            continue
+        save_checkpoint(exp_name, saved_states[mt], tag=f'seed{SEED}_{mt}')
 
         # Standard eval on natural
         for dp in DECODE_POLICIES:
@@ -1870,11 +1928,6 @@ def run(tag=''):
 
     # ── Continuation training ──
     args = parse_args()
-    if TRAIN_ONLY:
-        save_results(exp_name, {'all_dyn': all_dyn, 'train_only': True})
-        print(f"\n[TRAIN_ONLY] skipping continuation + post-loop analysis; "
-              f"checkpoints + dynamics saved.")
-        return
     if not getattr(args, 'no_continuation', False) and len(MASK_TYPES) >= 2:
         cont_pairs = []
         if 'random' in saved_states and 'puma' in MASK_TYPES:
@@ -1882,12 +1935,13 @@ def run(tag=''):
         if 'puma' in saved_states and 'random' in MASK_TYPES:
             cont_pairs.append(('puma', 'random'))
 
-        for src, tgt in cont_pairs:
+        for ci, (src, tgt) in enumerate(cont_pairs):
             label = f'{src}_to_{tgt}'
             print(f"\n{'━'*60}\n▶ Continuation: {label} ({CONTINUATION_ITERS} iters)\n{'━'*60}")
             m, d = train_model(tgt, tok, train_data, suite, max_len,
                                max_iters=CONTINUATION_ITERS,
-                               init_state=saved_states[src], device=DEVICE)
+                               init_state=saved_states[src], device=DEVICE,
+                               seed_train=SEED * 100 + 50 + ci)
             all_dyn[f'dyn_{label}'] = d
 
             for dp in DECODE_POLICIES:
@@ -1913,12 +1967,15 @@ def run(tag=''):
     # ── Figures ──
     figs = make_figures(all_dyn, all_final)
 
-    # ── Save ──
+    # ── Save (per-seed file names: results_seed{N}.json, figures *_seed{N}) ──
     sd = {'config': {k: globals()[k] for k in [
         'GRID_N', 'GRID_H', 'GRID_W', 'CELL_N', 'N_TRAIN', 'N_TEST', 'MAX_ITERS',
         'BATCH_SIZE', 'N_LAYER', 'N_HEAD', 'N_EMBD', 'MASK_TYPES', 'DECODE_POLICIES',
         'PUMA_K_START', 'PUMA_K_END', 'PUMA_K_STEP', 'PUMA_K_EVERY', 'PUMA_TAU',
-        'STRAIGHTNESS_BIAS', 'BACKBONE_SWEEP', 'DEAD_END_SWEEP', 'CORRIDOR_SWEEP']}}
+        'PAPL_TAU', 'PAPL_ALPHA', 'SEED', 'NO_AMP', 'PATIENCE', 'ONE_CELL_DECODE',
+        'STRAIGHTNESS_BIAS', 'BACKBONE_SWEEP', 'DEAD_END_SWEEP', 'CORRIDOR_SWEEP']},
+        'seed': SEED,
+        'train_seeds': method_seeds}
     for k, v in all_dyn.items():
         sd[k] = {
             'checkpoints': v['checkpoints'],
@@ -1928,7 +1985,7 @@ def run(tag=''):
         }
     for k, v in all_final.items():
         sd[f'final_{k}'] = v
-    save_results(exp_name, sd, figures=figs)
+    save_results(exp_name, sd, figures=figs, tag=f'seed{SEED}')
 
     # ── Summary ──
     print(f"\n{'='*70}\n  SUMMARY\n{'='*70}")
@@ -1958,16 +2015,10 @@ def run(tag=''):
 
 if __name__ == '__main__':
     args = parse_args()
-    globals()['TRAIN_ONLY'] = args.train_only
     seeds = args.seeds if args.seeds else [SEED]
     for si, seed in enumerate(seeds):
         globals()['SEED'] = seed
-        # Always disambiguate output directories per-seed when multiple seeds are run,
-        # even without --tag; otherwise results from later seeds silently overwrite earlier ones.
-        if len(seeds) > 1:
-            t = f"{args.tag}_s{seed}" if args.tag else f"s{seed}"
-        else:
-            t = args.tag
+        t = f"{args.tag}_s{seed}" if args.tag and len(seeds) > 1 else args.tag
         if len(seeds) > 1:
             print(f"\n{'#'*70}\n# Seed {seed} ({si+1}/{len(seeds)})\n{'#'*70}")
         run(tag=t)
