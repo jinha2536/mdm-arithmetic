@@ -65,10 +65,24 @@ def parse_args():
     p.add_argument('--methods', nargs='+', default=['random', 'papl', 'puma'])
     p.add_argument('--grid-n', type=int, default=10)
     p.add_argument('--n-head', type=int, default=None)
-    p.add_argument('--corridor-sweep', nargs='+', type=int,
-                   default=[10, 20, 30])
+    # Agreed bucket design (hard-tail discussion):
+    #   natural-stratified corridor bins  — pure stratification of the natural
+    #       pool by max corridor length (no straightness-bias confound)
+    #   extrapolation band — constructed mazes beyond the natural p99 (~75)
+    #   pure corridor — labeled representation-boundary bucket
+    p.add_argument('--natural-pool', type=int, default=3000,
+                   help='Natural mazes generated then stratified')
+    p.add_argument('--strata-edges', nargs='+', type=int,
+                   default=[24, 32, 40, 56],
+                   help='max-corridor bin edges over the natural pool')
+    p.add_argument('--xtrap-sweep', nargs='+', type=int, default=[50, 65, 80],
+                   help='Constructed extrapolation band (bias-generated; '
+                        'labeled as such)')
+    p.add_argument('--pure-n', type=int, default=100,
+                   help='Pure-corridor boundary bucket size (0 disables)')
     p.add_argument('--n-per-bucket', type=int, default=200)
-    p.add_argument('--natural-n', type=int, default=300)
+    p.add_argument('--natural-n', type=int, default=300,
+                   help='Unstratified natural bucket (0 disables)')
     p.add_argument('--test-seed', type=int, default=2042,
                    help='FIXED across seeds/methods — shared buckets')
     p.add_argument('--audit-every', type=int, default=25,
@@ -242,13 +256,23 @@ def audit_maze(base, gold, open_mask, entries, tok):
             else:
                 out['comp_purity']['mixed'] += 1
         qs = [float(qf[b, c]) for c in err]
+        # LOO blindness: rank of the best (lowest-q) error cell among ALL
+        # open cells of this instance. rank 0 → argmin targets an error in
+        # round 1; large rank → the errors are q-endorsed above correct
+        # cells and the leave-one-out corrector is structurally blind.
+        oc = open_mask[b].cpu().nonzero(as_tuple=True)[0].tolist()
+        allq = sorted(float(qf[b, c]) for c in oc)
+        best_err = min(qs)
+        import bisect
+        err_rank = bisect.bisect_left(allq, best_err)
         for c in err:
             v = float(qf[b, c])
             comp_of = next(cc for cc in comps if c in cc)
             (out['finalq_err_size1'] if len(comp_of) == 1
              else out['finalq_err_sizege2']).append(v)
         out['records'].append({
-            'b': b, 'n_err': len(err), 'n_comp': len(comps),
+            'b': b, 'err_q_rank': err_rank, 'n_open': len(oc),
+            'n_err': len(err), 'n_comp': len(comps),
             'max_comp': max(len(c) for c in comps),
             'n_add': n_add, 'n_delete': n_del,
             'finalq_med': sorted(qs)[len(qs) // 2],
@@ -257,6 +281,14 @@ def audit_maze(base, gold, open_mask, entries, tok):
             'max_corridor_len':
                 entries[b]['corridor_stats']['max_corridor_len'],
         })
+    ctrl = []
+    for b in range(B):
+        if correct[b]:
+            oc = open_mask[b].cpu().nonzero(as_tuple=True)[0]
+            ctrl.extend(float(qf[b, c]) for c in oc[:20])
+        if len(ctrl) >= 4000:
+            break
+    out['control_q'] = ctrl[:4000]
     for k in ('err_count_hist', 'comp_count_hist', 'comp_size_hist'):
         out[k] = dict(out[k])
     # keep score lists bounded
@@ -350,9 +382,14 @@ def run(args):
         torch.device('cuda') if torch.cuda.is_available()
         else torch.device('cpu'))
     set_grid(args.grid_n)
-    if args.n_head is not None:
-        import addition_decode_analysis as ADA
-        ADA.N_HEAD_OVERRIDE = args.n_head
+    # n_head is NOT inferable from checkpoint shapes; default to the maze
+    # config's own value (exp_maze.N_HEAD = 4) rather than the addition
+    # loader's default of 2 — a mismatch loads cleanly and silently
+    # produces garbage.
+    import addition_decode_analysis as ADA
+    ADA.N_HEAD_OVERRIDE = args.n_head if args.n_head is not None else M.N_HEAD
+    print(f"  building models with n_head={ADA.N_HEAD_OVERRIDE} "
+          f"(exp_maze default {M.N_HEAD}; override with --n-head)")
     tok = M.build_tok()
     mask_id = tok.special_ids['mask']
 
@@ -360,12 +397,31 @@ def run(args):
     if args.natural_n > 0:
         buckets['natural'] = M.gen_test_data(args.natural_n,
                                              seed=args.test_seed)
-    for cl in args.corridor_sweep:
+    # natural-stratified corridor bins (no bias confound)
+    if args.natural_pool > 0 and args.strata_edges:
+        pool = M.gen_test_data(args.natural_pool, seed=args.test_seed + 1)
+        edges = sorted(args.strata_edges)
+        bins = [(0, edges[0])] + list(zip(edges, edges[1:])) + [(edges[-1],
+                                                                10**9)]
+        for lo, hi in bins:
+            sel = [e for e in pool
+                   if lo <= e['corridor_stats']['max_corridor_len'] < hi]
+            if len(sel) >= 30:
+                nm = (f'nat[{lo},{hi})' if hi < 10**9 else f'nat[{lo}+]')
+                buckets[nm] = sel[:args.n_per_bucket]
+    # constructed extrapolation band (straightness-bias generated — labeled)
+    for cl in args.xtrap_sweep:
         sp = M.gen_min_corridor_test(args.n_per_bucket,
                                      seed=args.test_seed + 700 + cl,
                                      min_corridor=cl)
         if sp:
-            buckets[f'corridor>={cl}'] = sp
+            buckets[f'xtrap>={cl}'] = sp
+    # pure-corridor representation boundary
+    if args.pure_n > 0:
+        pc = M.gen_corner_case_test(args.pure_n, seed=args.test_seed + 9,
+                                    category='pure_corridor')
+        if pc:
+            buckets['pure_corridor'] = pc
     enc = {}
     for name, entries in buckets.items():
         x0, gold, open_mask, ans_start = build_bucket(tok, entries, device)
@@ -424,7 +480,8 @@ def run(args):
         print(f"\n── {key} ──")
         rows = results[key]
         print(f"  {'bucket':>13s} {'base':>7s} {'loo':>7s} {'renoise':>8s} "
-              f"{'coh-frac':>8s} {'q_med(1cell)':>12s} {'q_med(comp)':>11s}")
+              f"{'coh-frac':>8s} {'q_med(1cell)':>12s} {'q_med(comp)':>11s} "
+              f"{'q_med(ok)':>9s} {'blind%':>6s}")
         for name, e in rows.items():
             a = e['audit']
             nf = max(1, a['n_fail'])
@@ -432,11 +489,16 @@ def run(args):
             q2 = sorted(a['finalq_err_sizege2'])
             f1 = f"{q1[len(q1)//2]:.3f}" if q1 else '—'
             f2 = f"{q2[len(q2)//2]:.3f}" if q2 else '—'
+            cq = sorted(a.get('control_q', []))
+            cm = f"{cq[len(cq)//2]:.3f}" if cq else '—'
+            recs = a['records']
+            blind = (sum(1 for r in recs if r['err_q_rank'] > 0)
+                     / max(1, len(recs)))
             print(f"  {name:>13s} {e['base_acc']:>7.3f} "
                   f"{e['decoders']['loo']['acc_final']:>7.3f} "
                   f"{e['decoders']['renoise']['acc_final']:>8.3f} "
                   f"{(a['n_coherent']+a['n_multi_comp'])/nf:>8.2f} "
-                  f"{f1:>12s} {f2:>11s}")
+                  f"{f1:>12s} {f2:>11s} {cm:>9s} {blind:>6.0%}")
     with open(args.out, 'w') as f:
         json.dump(_jsonable(results), f, indent=1)
     print(f"\n  💾 {args.out}")
