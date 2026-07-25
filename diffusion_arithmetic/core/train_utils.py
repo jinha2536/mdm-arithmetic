@@ -7,7 +7,7 @@ Key design:
   3. Continuation training support (load checkpoint → train with different mask type)
   4. Greedy decoding for fair comparison
 """
-import os, time, math, json
+import os, time, math, json, random
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -118,6 +118,63 @@ def puma_k_fixed(k):
 # Unified diffusion training
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
+class _FreshAdditionSource:
+    """On-the-fly addition training data for DATA_MODE='fresh'.
+
+    Restored implementation (the extended local version was lost in a
+    train_utils replacement). Contract per exp_addition's constructor call:
+    deterministic given `seed`; provisions `total_samples` natural nd-digit
+    addition strings in chunks of `chunk_size`; serves device batches via
+    next_batch(batch_size, device). Wraps past total_samples by continuing
+    the deterministic chunk stream.
+    """
+
+    def __init__(self, nd, max_len, total_samples, tokenizer, seed,
+                 chunk_size, ans_len):
+        self.nd = nd
+        self.max_len = max_len
+        self.total_samples = int(total_samples)
+        self.tokenizer = tokenizer
+        self.seed = seed
+        self.chunk_size = int(chunk_size)
+        self.ans_len = ans_len
+        self._chunk_idx = 0
+        self._ptr = 0
+        self._ids = None
+        self._ans = None
+        self.served = 0
+
+    def _gen_chunk(self):
+        rng = random.Random(self.seed * 100003 + self._chunk_idx)
+        hi = 10 ** self.nd - 1
+        samples = []
+        for _ in range(self.chunk_size):
+            a = rng.randint(0, hi)
+            b = rng.randint(0, hi)
+            samples.append(f"{a:0{self.nd}d}+{b:0{self.nd}d}="
+                           f"{a + b:0{self.ans_len}d}")
+        ids, ans = encode_samples(samples, self.tokenizer, self.max_len)
+        self._ids, self._ans = ids, ans
+        self._ptr = 0
+        self._chunk_idx += 1
+
+    def next_batch(self, batch_size, device=None):
+        if self._ids is None or self._ptr + batch_size > self._ids.shape[0]:
+            self._gen_chunk()
+        sl = slice(self._ptr, self._ptr + batch_size)
+        self._ptr += batch_size
+        self.served += batch_size
+        ids, ans = self._ids[sl], self._ans[sl]
+        if device is not None:
+            ids, ans = ids.to(device), ans.to(device)
+        return ids, ans
+
+    def __repr__(self):
+        return (f"FreshAdditionSource(nd={self.nd}, total="
+                f"{self.total_samples:,}, chunk={self.chunk_size:,}, "
+                f"seed={self.seed}, served={self.served:,})")
+
+
 def train_diffusion(
     # Data (already on device)
     train_ids,          # [N, T]
@@ -167,6 +224,16 @@ def train_diffusion(
     device=None,
     # AMP
     use_amp=None,           # None=auto, True=force, False=disable
+    # ── Multi-seed extensions (restored after an accidental overwrite of the
+    #    extended local version; contract matches exp_addition's call site and
+    #    docstring: "ckpt_schedule: list[int] of iters at which to save EMA
+    #    snapshots; ckpt_save_fn: callable(state_dict_cpu, it)") ──
+    seed_train=None,        # int — training-loop RNG (batch order, mask draws,
+                            # PUMA pool order); applied AFTER init_state load
+    ckpt_schedule=None,     # list[int] — iters at which to save EMA snapshots
+    ckpt_save_fn=None,      # callable(state_dict_cpu, it)
+    data_source=None,       # streaming source (fresh mode) — overrides the
+                            # pre-encoded train_ids pool for non-PUMA masking
 ):
     """
     Unified iteration-based diffusion training with EMA.
@@ -224,6 +291,23 @@ def train_diffusion(
             return lr * it / max(warmup_iters, 1)
         ratio = (it - warmup_iters) / max(max_iters - warmup_iters, 1)
         return min_lr + 0.5 * (lr - min_lr) * (1 + math.cos(math.pi * min(ratio, 1.0)))
+
+    if data_source is not None and mask_type == 'puma':
+        raise NotImplementedError(
+            "data_source (fresh mode) x puma streaming is not wired in this "
+            "rebuilt train_utils; use materialized data for puma, or ask to "
+            "restore the fresh-puma path.")
+
+    # ── Per-run training RNG (multi-seed isolation) ──
+    # Applied AFTER model construction and init_state loading: the shared init
+    # is preserved, and only training stochasticity (batch permutation, mask
+    # bernoulli draws, PUMA buffer pool order) is governed by seed_train.
+    if seed_train is not None:
+        torch.manual_seed(seed_train)
+        random.seed(seed_train)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed_train)
+        print(f"  [{mask_type}] training RNG seed_train={seed_train}")
 
     dynamics = {'checkpoints': [], 'train_loss': []}
     best_loss, best_ema = float('inf'), None
@@ -350,6 +434,26 @@ def train_diffusion(
                 return True  # signal to stop
         return False
 
+    # ── Scheduled EMA snapshots (multi-seed checkpoint schedule) ──
+    _ckpt_set = set(int(x) for x in (ckpt_schedule or []))
+    _ckpt_done = set()
+
+    def _ema_snapshot_cpu():
+        """Tie-consistent CPU snapshot of current EMA weights (swap in,
+        state_dict, swap back — same mechanism as best_ema)."""
+        with torch.no_grad():
+            for name, param in model.named_parameters():
+                tmp = param.data.clone()
+                param.data.copy_(ema_state[name])
+                ema_state[name].copy_(tmp)
+        snap = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+        with torch.no_grad():
+            for name, param in model.named_parameters():
+                tmp = param.data.clone()
+                param.data.copy_(ema_state[name])
+                ema_state[name].copy_(tmp)
+        return snap
+
     # ── Stratum loss logging setup ──
     log_strata = sample_strata is not None
     if log_strata:
@@ -400,13 +504,22 @@ def train_diffusion(
                 loss = per_sample.mean()
             tg += m.sum().item()
         else:
-            idx = _next_batch()
-            ids = train_ids[idx]
-            ans_starts = train_ans[idx]
-            B_b = ids.shape[0]
-            ap = (ans_starts.unsqueeze(1) + _arange).clamp(max=T - 1)
-            bi = torch.arange(B_b, device=device).unsqueeze(1).expand_as(ap)
-            bl = blank_masks[idx]
+            if data_source is not None:
+                ids, ans_starts = data_source.next_batch(batch_size, device)
+                B_b = ids.shape[0]
+                T_b = ids.shape[1]
+                ap = (ans_starts.unsqueeze(1) + _arange).clamp(max=T_b - 1)
+                bi = torch.arange(B_b, device=device).unsqueeze(1).expand_as(ap)
+                bl = torch.ones(B_b, _arange.shape[0], dtype=torch.bool,
+                                device=device)
+            else:
+                idx = _next_batch()
+                ids = train_ids[idx]
+                ans_starts = train_ans[idx]
+                B_b = ids.shape[0]
+                ap = (ans_starts.unsqueeze(1) + _arange).clamp(max=T - 1)
+                bi = torch.arange(B_b, device=device).unsqueeze(1).expand_as(ap)
+                bl = blank_masks[idx]
             t_ratio = torch.rand(B_b, device=device)
             m_probs = torch.zeros(B_b, T, dtype=torch.float, device=device)
             m_probs[bi, ap] = t_ratio.unsqueeze(1) * bl.float()
@@ -501,6 +614,11 @@ def train_diffusion(
             print(f"    it {it:6d}/{max_iters} | loss {loss.item():.4f} | "
                   f"lr {get_lr(it):.1e} | tg {tg:,} | {time.time() - t0:.0f}s")
 
+        if _ckpt_set and ckpt_save_fn is not None and it in _ckpt_set:
+            ckpt_save_fn(_ema_snapshot_cpu(), it)
+            _ckpt_done.add(it)
+            print(f"    [ckpt] EMA snapshot saved @ it {it:,}")
+
         if it % eval_every == 0 or \
            (it <= max_iters * 0.1 and it % max(eval_every // 5, 1) == 0):
             should_stop = _do_eval(it)
@@ -521,6 +639,12 @@ def train_diffusion(
     model.eval()
     if not stopped_early:
         _do_eval(max_iters)
+    if _ckpt_set and ckpt_save_fn is not None:
+        _missed = sorted(x for x in _ckpt_set if x not in _ckpt_done)
+        if _missed:
+            print(f"    [ckpt] WARNING: schedule iters not reached "
+                  f"(early stop?): {_missed}")
+
     # ── Load best EMA ──
     if best_ema:
         model.load_state_dict({k: v.to(device) for k, v in best_ema.items()})
