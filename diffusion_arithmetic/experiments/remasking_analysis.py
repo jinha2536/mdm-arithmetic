@@ -39,6 +39,11 @@ Usage (Colab, repo layout diffusion_arithmetic/{core,experiments}):
       --chain-sweep 4 8 12 16 20 24 28 --n-per-bucket 300 \
       --out /content/drive/MyDrive/.../remasking_seed41.json
 
+  # Table R2 (ZTfz Q2, stochastic decoding) — separate run & output:
+  %run experiments/remasking_analysis.py --mode stochastic \
+      --checkpoint-dir ... --seeds 41 --methods random papl puma \
+      --out .../stochastic_seed41.json
+
   Multiple seeds in one dir: --checkpoint-dir DIR --seeds 41 42 43
   (template: checkpoint_seed{seed}_{method}_iter{iter:06d}.pt)
 
@@ -64,6 +69,8 @@ else:
 import exp_addition as A
 from addition_decode_analysis import load_model  # arch inference + EMA workaround
 
+DETECT_TAUS = [0.5]  # observability: q < 1/2 = model deems token more likely wrong than right
+
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # CLI
@@ -71,6 +78,10 @@ from addition_decode_analysis import load_model  # arch inference + EMA workarou
 
 def parse_args():
     p = argparse.ArgumentParser()
+    p.add_argument('--mode', choices=['remask', 'stochastic', 'all'],
+                   default='remask',
+                   help='remask → Table R1 (3GQB Q1); stochastic → Table R2 '
+                        '(ZTfz Q2); all → both from one base-decode pass')
     p.add_argument('--checkpoint-dir', type=str, required=True)
     p.add_argument('--ckpt-template', type=str,
                    default='checkpoint_seed{seed}_{method}_iter{iter:06d}.pt')
@@ -87,19 +98,37 @@ def parse_args():
                    help='0 disables the natural bucket')
     p.add_argument('--test-seed', type=int, default=1042,
                    help='Bucket generation seed — FIXED across seeds/methods')
-    p.add_argument('--decoders', nargs='+',
-                   default=['loo', 'renoise', 'conf_frozen'])
-    p.add_argument('--taus', nargs='+', type=float, default=[0.5, 0.9])
-    p.add_argument('--loo-rounds', type=int, default=8)
-    p.add_argument('--renoise-k', type=int, default=5)
-    p.add_argument('--renoise-rounds', type=int, default=8)
-    p.add_argument('--conf-k', type=int, default=2)
-    p.add_argument('--conf-rounds', type=int, default=4)
     p.add_argument('--audit-every', type=int, default=4,
                    help='LOO audit every N commits during base decode; 0 = off')
     p.add_argument('--loo-chunk', type=int, default=4096)
     p.add_argument('--fp-tau-grid', nargs='+', type=float,
                    default=[0.3, 0.5, 0.7, 0.9, 0.99])
+    # ── Stochastic decoding arm (ZTfz Q2) ──
+    # Token-sampling axis: temperature and nucleus (top-p) are SEPARATE,
+    # independently sweepable knobs. Position selection stays clean and
+    # deterministic (max clean logit) unless a score variant or positional
+    # Gumbel noise is explicitly requested.
+    p.add_argument('--temps', nargs='+', type=float, default=[0.7, 1.0, 1.5, 2.0])
+    p.add_argument('--top-ps', nargs='+', type=float, default=[1.0, 0.9],
+                   help='1.0 = nucleus off; grid is temps × top_ps')
+    p.add_argument('--nucleus-order', choices=['temp_first', 'nucleus_first'],
+                   default='temp_first',
+                   help='temp_first = HF convention (scale logits by T, then '
+                        'truncate); nucleus_first = truncate on clean probs, '
+                        'then temper survivors')
+    p.add_argument('--n-samples', type=int, default=8)
+    p.add_argument('--extra-scores', nargs='+', default=['sampled_prob'],
+                   choices=['sampled_prob', 'margin', 'neg_entropy'],
+                   help='Position-score variants run at T=1, p=1: sampled_prob '
+                        '= LLaDA/MaskGIT ranking by clean prob of the DRAWN '
+                        'token (mode filter); margin = top1−top2; neg_entropy '
+                        '= −H (sign-corrected peakedness)')
+    p.add_argument('--gumbel-scales', nargs='+', type=float, default=[1.0, 4.0],
+                   help='Positional-order noise: score = clean max-logit + '
+                        's·Gumbel, tokens greedy. Isolates the ORDER axis.')
+    p.add_argument('--stoch-buckets', nargs='+', default=None,
+                   help='Bucket names for the stochastic arm (default: '
+                        'natural + two largest chain buckets)')
     p.add_argument('--out', type=str, default='remasking_results.json')
     p.add_argument('--device', type=str, default=None)
     return p.parse_args()
@@ -332,6 +361,7 @@ def audit_and_observe(base, gold, metas, tok, taus):
                 if d < -5: d += 10
                 out['dir_by_role'][m['dep_role']][d] += 1
             rec = {
+                'b': b,
                 'chain_len': m['chain_len'],
                 'commit_rank': int(cr[b, dep]),
                 'commit_conf': float(cc[b, dep]),
@@ -361,91 +391,253 @@ def audit_and_observe(base, gold, metas, tok, taus):
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 @torch.no_grad()
-def run_rounds(model, base, gold, ans_start, AL, mask_id, select_fn,
-               max_rounds, chunk, need_q, stop_when_empty):
-    """Generic round loop. select_fn(state) -> bool [B, AL] set to remask.
-    state carries x, q (if need_q), commit_conf (refreshed on re-commit),
-    round index. Returns metrics."""
+def decoder_loo(model, base, gold, ans_start, AL, mask_id, chunk):
+    """Minimal PRISM-ideal corrector, one equation:
+        T_t = { argmin_j  p(x^j = y^j | y ⊕ m_j) }
+    Remask the single cell whose exact leave-one-out conditional (PRISM's
+    provably-optimal per-token-quality target, computed directly with one
+    forward pass per position) is lowest; refill by the same confidence
+    decoding; iterate to the fixed point (the refilled token equals the
+    removed one), capped at L rounds. No thresholds, no budgets."""
     x = base['x'].clone()
     B = x.shape[0]
     device = x.device
-    commit_conf = base['commit_conf'].clone()
-    acc_rounds, remask_counts, recommit_counts = [], [], []
-    prev_T = None
-    stuck = False
-    rounds_used = 0
-    for r in range(max_rounds):
+    ar = torch.arange(B, device=device)
+    active = torch.ones(B, dtype=torch.bool, device=device)
+    rounds = torch.zeros(B, dtype=torch.long, device=device)
+    n_changed = torch.zeros(B, dtype=torch.long, device=device)
+    for r in range(AL):
+        if not active.any():
+            break
         q = loo_q(model, x, ans_start, AL,
-                  torch.ones(B, AL, dtype=torch.bool, device=device),
-                  mask_id, chunk) if need_q else None
-        T = select_fn({'x': x, 'q': q, 'commit_conf': commit_conf,
-                       'round': r, 'ans_start': ans_start})
-        nT = int(T.sum())
-        if stop_when_empty and nT == 0:
-            break
-        if prev_T is not None and torch.equal(T, prev_T):
-            stuck = True
-            break
-        prev_T = T.clone()
-        rounds_used = r + 1
-        old_tok = x[:, ans_start:ans_start + AL].clone()
-        # remask T
-        bpos = T.nonzero(as_tuple=False)
-        x[bpos[:, 0], ans_start + bpos[:, 1]] = mask_id
-        # refill by confidence; refresh commit_conf at refilled positions
-        _, new_conf = confidence_fill(model, x, T.clone(), ans_start, AL,
-                                      mask_id, record_conf=True)
-        commit_conf[T] = new_conf[T]
-        new_tok = x[:, ans_start:ans_start + AL]
-        recommit = ((new_tok == old_tok) & T).sum()
-        remask_counts.append(nT)
-        recommit_counts.append(int(recommit))
-        acc_rounds.append(float((new_tok == gold).all(dim=1).float().mean()))
-    final_pred = x[:, ans_start:ans_start + AL]
-    total_remask = sum(remask_counts)
+                  active.unsqueeze(1).expand(B, AL).clone(),
+                  mask_id, chunk)
+        q = torch.nan_to_num(q, nan=float('inf'))
+        pos = q.argmin(dim=1)                              # [B]
+        old = x[ar, ans_start + pos].clone()
+        x[ar[active], ans_start + pos[active]] = mask_id
+        T = torch.zeros(B, AL, dtype=torch.bool, device=device)
+        T[ar[active], pos[active]] = True
+        confidence_fill(model, x, T, ans_start, AL, mask_id)
+        new = x[ar, ans_start + pos]
+        changed = (new != old) & active
+        n_changed += changed.long()
+        rounds += active.long()
+        active = changed                                   # fixed point: stop
+    pred = x[:, ans_start:ans_start + AL]
     return {
-        'acc_final': float((final_pred == gold).all(dim=1).float().mean()),
-        'acc_rounds': acc_rounds,
-        'rounds_used': rounds_used,
-        'stuck': stuck,
-        'n_remask_total': total_remask,
-        'n_remask_rounds': remask_counts,
-        'recommit_rate': (sum(recommit_counts) / total_remask)
-                         if total_remask else None,
+        'acc_final': float((pred == gold).all(dim=1).float().mean()),
+        'rounds_mean': float(rounds.float().mean()),
+        'rounds_max': int(rounds.max()),
+        'cells_changed_mean': float(n_changed.float().mean()),
+        'rescued': int(((pred == gold).all(dim=1) & ~base['correct']).sum()),
+        'broken': int((~(pred == gold).all(dim=1) & base['correct']).sum()),
     }
 
 
-def decoder_loo(model, base, gold, ans_start, AL, mask_id, tau, rounds, chunk):
-    def sel(st):
-        return st['q'] < tau
-    return run_rounds(model, base, gold, ans_start, AL, mask_id, sel,
-                      rounds, chunk, need_q=True, stop_when_empty=True)
-
-
-def decoder_renoise(model, base, gold, ans_start, AL, mask_id, k, rounds,
-                    chunk, rng):
-    def sel(st):
-        B = st['x'].shape[0]
-        scores = torch.rand(B, AL, generator=rng, device='cpu').to(st['x'].device)
-        thresh = scores.topk(k, dim=1).values[:, -1:]
-        return scores >= thresh
-    return run_rounds(model, base, gold, ans_start, AL, mask_id, sel,
-                      rounds, chunk, need_q=False, stop_when_empty=False)
-
-
-def decoder_conf_frozen(model, base, gold, ans_start, AL, mask_id, k, rounds,
-                        chunk):
-    def sel(st):
-        cc = st['commit_conf']
-        thresh = cc.topk(k, dim=1, largest=False).values[:, -1:]
-        return cc <= thresh
-    return run_rounds(model, base, gold, ans_start, AL, mask_id, sel,
-                      rounds, chunk, need_q=False, stop_when_empty=False)
+@torch.no_grad()
+def decoder_renoise(model, base, gold, ans_start, AL, mask_id, rng):
+    """Minimal ReMDM-style re-noising, one equation:
+        T_t = { j ~ Unif(committed) }
+    Identical loop to decoder_loo — one cell per round, refill by confidence,
+    L rounds total — differing ONLY in the selection score (uniform random
+    instead of the leave-one-out conditional)."""
+    x = base['x'].clone()
+    B = x.shape[0]
+    device = x.device
+    ar = torch.arange(B, device=device)
+    recommit = 0
+    for r in range(AL):
+        pos = torch.randint(0, AL, (B,), generator=rng).to(device)
+        old = x[ar, ans_start + pos].clone()
+        x[ar, ans_start + pos] = mask_id
+        T = torch.zeros(B, AL, dtype=torch.bool, device=device)
+        T[ar, pos] = True
+        confidence_fill(model, x, T, ans_start, AL, mask_id)
+        recommit += int((x[ar, ans_start + pos] == old).sum())
+    pred = x[:, ans_start:ans_start + AL]
+    return {
+        'acc_final': float((pred == gold).all(dim=1).float().mean()),
+        'n_remask_total': B * AL,
+        'recommit_rate': recommit / (B * AL),
+        'rescued': int(((pred == gold).all(dim=1) & ~base['correct']).sum()),
+        'broken': int((~(pred == gold).all(dim=1) & base['correct']).sum()),
+    }
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# Orchestration
+# Stochastic decoding arm (ZTfz Q2)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Two INDEPENDENT axes, kept separate throughout:
+#   token axis    — how the token at the selected position is drawn
+#                   (temperature; nucleus/top-p truncation, either order)
+#   position axis — how the position to commit is selected
+#                   (clean max-logit by default = deterministic and
+#                    temperature-invariant by construction; variants:
+#                    sampled_prob / margin / neg_entropy scores, or
+#                    additive Gumbel noise on the score)
+
+def _gumbel_like(shape, gen, device):
+    u = torch.rand(shape, generator=gen).clamp_(1e-20, 1 - 1e-20)
+    return (-torch.log(-torch.log(u))).to(device)
+
+
+def _nucleus_mask(logits, probs, top_p):
+    """Set logits outside the smallest set with cumulative prob ≥ top_p
+    (computed from `probs`) to -inf. Standard inclusive nucleus."""
+    sp, si = probs.sort(dim=-1, descending=True)
+    cum = sp.cumsum(dim=-1)
+    drop_sorted = (cum - sp) >= top_p          # tokens strictly after crossing
+    drop = torch.zeros_like(drop_sorted).scatter(-1, si, drop_sorted)
+    return logits.masked_fill(drop, -float('inf'))
+
+
+def _draw_tokens(al, T, top_p, order, gen):
+    """Sample a token per position from answer-region logits `al` [B, AL, V]
+    (mask token already excluded). T=0 → greedy (nucleus irrelevant)."""
+    if T <= 0:
+        return al.argmax(dim=-1)
+    if order == 'temp_first':
+        lt = al / T
+        if top_p < 1.0:
+            lt = _nucleus_mask(lt, F.softmax(lt, dim=-1), top_p)
+    else:  # nucleus_first: truncate on the CLEAN distribution, then temper
+        lt = al
+        if top_p < 1.0:
+            lt = _nucleus_mask(lt, F.softmax(lt, dim=-1), top_p)
+        lt = lt / T
+    return (lt + _gumbel_like(lt.shape, gen, lt.device)).argmax(dim=-1)
+
+
+@torch.no_grad()
+def stochastic_decode(model, x0, ans_start, AL, mask_id, cfg, gen):
+    """One full decode under a stochastic config.
+    cfg: dict(T, top_p, order, score, gpos). Returns (pred, commit_rank)."""
+    x = x0.clone()
+    B = x.shape[0]
+    device = x.device
+    ar = torch.arange(B, device=device)
+    masked = torch.ones(B, AL, dtype=torch.bool, device=device)
+    commit_rank = torch.full((B, AL), -1, dtype=torch.long, device=device)
+    for t in range(AL):
+        logits = model(x)
+        al = logits[:, ans_start:ans_start + AL, :].clone()
+        al[:, :, mask_id] = -float('inf')
+        cand = _draw_tokens(al, cfg['T'], cfg['top_p'], cfg['order'], gen)
+        # position score
+        sc = cfg['score']
+        if sc == 'clean_maxlogit':
+            s = al.max(dim=-1).values
+        elif sc == 'sampled_prob':      # LLaDA/MaskGIT: clean prob of drawn token
+            p_clean = F.softmax(al, dim=-1)
+            s = p_clean.gather(-1, cand.unsqueeze(-1)).squeeze(-1)
+        elif sc == 'margin':
+            top2 = F.softmax(al, dim=-1).topk(2, dim=-1).values
+            s = top2[..., 0] - top2[..., 1]
+        elif sc == 'neg_entropy':
+            p_clean = F.softmax(al, dim=-1)
+            s = (p_clean * torch.log(p_clean + 1e-10)).sum(dim=-1)   # = -H
+        else:
+            raise ValueError(sc)
+        if cfg['gpos'] > 0:
+            s = s + cfg['gpos'] * _gumbel_like(s.shape, gen, device)
+        s = s.masked_fill(~masked, -float('inf'))
+        pos = s.argmax(dim=-1)
+        tok = cand[ar, pos]
+        x[ar, ans_start + pos] = tok
+        commit_rank[ar, pos] = t
+        masked[ar, pos] = False
+    return x[:, ans_start:ans_start + AL], commit_rank
+
+
+def stochastic_configs(args):
+    cfgs = []
+    for T in args.temps:
+        for tp in args.top_ps:
+            cfgs.append({'name': f'T={T}, p={tp}', 'T': T, 'top_p': tp,
+                         'order': args.nucleus_order,
+                         'score': 'clean_maxlogit', 'gpos': 0.0})
+    for sc in args.extra_scores:
+        cfgs.append({'name': f'score={sc} (T=1,p=1)', 'T': 1.0, 'top_p': 1.0,
+                     'order': args.nucleus_order, 'score': sc, 'gpos': 0.0})
+    for g in args.gumbel_scales:
+        if g > 0:
+            cfgs.append({'name': f'order-noise s={g} (greedy tok)', 'T': 0.0,
+                         'top_p': 1.0, 'order': args.nucleus_order,
+                         'score': 'clean_maxlogit', 'gpos': g})
+    return cfgs
+
+
+def run_stochastic_bucket(model, base, gold, ans_start, AL, mask_id,
+                          audit, args, seed, bucket_name):
+    """All stochastic configs × N samples on one bucket. Uses the base decode
+    for trap-instance identity (canonical single@dep failures) and for the
+    base-correct set (corruption side)."""
+    x0 = base['x'].clone()
+    x0[:, ans_start:ans_start + AL] = mask_id            # re-mask answer
+    device = x0.device
+    base_correct = base['correct']
+    n_bc = int(base_correct.sum())
+    recs = audit['records']
+    if recs:
+        dep_b = torch.tensor([r['b'] for r in recs], dtype=torch.long,
+                             device=device)
+        # canonical failures are single-error: the dep cell is the wrong pos
+        dep_cell = torch.tensor(
+            [int((~base['pos_correct'][r['b']]).nonzero(as_tuple=True)[0][0])
+             for r in recs], dtype=torch.long, device=device)
+        base_rank = torch.tensor([r['commit_rank'] for r in recs],
+                                 dtype=torch.long, device=device)
+
+    # sanity: T→0, p=1, no order noise ≡ deterministic base (bit-identical)
+    gen0 = torch.Generator().manual_seed(0)
+    pred0, _ = stochastic_decode(
+        model, x0, ans_start, AL, mask_id,
+        {'T': 0.0, 'top_p': 1.0, 'order': args.nucleus_order,
+         'score': 'clean_maxlogit', 'gpos': 0.0}, gen0)
+    assert torch.equal(pred0, base['pred']), \
+        'T→0 limit does not reproduce deterministic base decode'
+
+    out = {'sanity_T0_equals_base': True, 'configs': {}}
+    bsum = sum(ord(c) for c in bucket_name)
+    for ci, cfg in enumerate(stochastic_configs(args)):
+        accs, escapes, rescues, corrupt, flips, rank_same = [], [], [], [], [], []
+        ok_all = []
+        for n in range(args.n_samples):
+            gen = torch.Generator().manual_seed(
+                7_000_000 + seed * 10_000 + ci * 100 + n * 7 + bsum)
+            pred, cr = stochastic_decode(model, x0, ans_start, AL, mask_id,
+                                         cfg, gen)
+            ok = (pred == gold).all(dim=1)
+            ok_all.append(ok)
+            accs.append(float(ok.float().mean()))
+            if n_bc:
+                corrupt.append(float((~ok[base_correct]).float().mean()))
+                flips.append(float(
+                    (pred[base_correct] != gold[base_correct]).float().mean()))
+            if recs:
+                pd = pred[dep_b, dep_cell]
+                gd = gold[dep_b, dep_cell]
+                escapes.append(float((pd == gd).float().mean()))
+                rescues.append(float(ok[dep_b].float().mean()))
+                rank_same.append(float(
+                    (cr[dep_b, dep_cell] == base_rank).float().mean()))
+        ok_any = torch.stack(ok_all, dim=0).any(dim=0)
+        mean = lambda v: (sum(v) / len(v)) if v else None
+        out['configs'][cfg['name']] = {
+            'acc_mean': mean(accs), 'acc_min': min(accs), 'acc_max': max(accs),
+            'pass_at_n': float(ok_any.float().mean()),
+            'trap_pass_at_n': (float(ok_any[dep_b].float().mean())
+                               if recs else None),
+            'trap_escape_rate': mean(escapes),
+            'trap_full_rescue_rate': mean(rescues),
+            'trap_rank_unchanged': mean(rank_same),
+            'corruption_rate': mean(corrupt),
+            'cell_flip_rate': mean(flips),
+            'n_trap': len(recs), 'n_base_correct': n_bc,
+        }
+    return out
+
 
 def _jsonable(o):
     if isinstance(o, dict):
@@ -494,6 +686,16 @@ def run_analysis(args):
         print(f"  bucket {name}: n={len(samples)}")
 
     results = {'config': _jsonable(vars(args)), 'nd': nd}
+    # stochastic-arm bucket selection: natural + two largest chain buckets
+    if args.stoch_buckets:
+        stoch_names = set(args.stoch_buckets)
+    else:
+        chains = sorted([b for b in enc_buckets if b.startswith('chain')],
+                        key=lambda s: int(s.split('>=')[1]))
+        stoch_names = set((['natural'] if 'natural' in enc_buckets else [])
+                          + chains[-2:])
+    if args.mode in ('stochastic', 'all'):
+        print(f"  stochastic buckets: {sorted(stoch_names)}")
     for seed in args.seeds:
         for method in args.methods:
             ck = args.ckpt_template.format(seed=seed, method=method,
@@ -512,7 +714,7 @@ def run_analysis(args):
                 base = base_decode_with_audits(
                     model, x0, gold, ans_start, AL, mask_id,
                     args.audit_every, args.loo_chunk)
-                obs = audit_and_observe(base, gold, metas, tok, args.taus)
+                obs = audit_and_observe(base, gold, metas, tok, DETECT_TAUS)
                 entry = {
                     'base_acc': float(base['correct'].float().mean()),
                     'audit': {k: v for k, v in obs.items()
@@ -521,27 +723,18 @@ def run_analysis(args):
                                 for t in args.fp_tau_grid},
                     'decoders': {},
                 }
-                for dec in args.decoders:
-                    if dec == 'loo':
-                        for tau in args.taus:
-                            r = decoder_loo(model, base, gold, ans_start, AL,
-                                            mask_id, tau, args.loo_rounds,
-                                            args.loo_chunk)
-                            entry['decoders'][f'loo_tau{tau}'] = r
-                    elif dec == 'renoise':
-                        rng = torch.Generator().manual_seed(
-                            10_000 + seed * 97 + sum(ord(c) for c in name))
-                        r = decoder_renoise(model, base, gold, ans_start, AL,
-                                            mask_id, args.renoise_k,
-                                            args.renoise_rounds,
-                                            args.loo_chunk, rng)
-                        entry['decoders']['renoise'] = r
-                    elif dec == 'conf_frozen':
-                        r = decoder_conf_frozen(model, base, gold, ans_start,
-                                                AL, mask_id, args.conf_k,
-                                                args.conf_rounds,
-                                                args.loo_chunk)
-                        entry['decoders']['conf_frozen'] = r
+                if args.mode in ('remask', 'all'):
+                    entry['decoders']['loo'] = decoder_loo(
+                        model, base, gold, ans_start, AL, mask_id,
+                        args.loo_chunk)
+                    rng = torch.Generator().manual_seed(
+                        10_000 + seed * 97 + sum(ord(c) for c in name))
+                    entry['decoders']['renoise'] = decoder_renoise(
+                        model, base, gold, ans_start, AL, mask_id, rng)
+                if args.mode in ('stochastic', 'all') and name in stoch_names:
+                    entry['stochastic'] = run_stochastic_bucket(
+                        model, base, gold, ans_start, AL, mask_id, obs,
+                        args, seed, name)
                 results[key][name] = entry
                 dt = time.time() - t0
                 dstr = ' '.join(f"{k}={v['acc_final']:.3f}"
@@ -555,36 +748,60 @@ def run_analysis(args):
                 torch.cuda.empty_cache()
 
     # ── Summary tables ──
-    print(f"\n{'='*70}\n  SUMMARY (exact-match)\n{'='*70}")
-    dec_cols = None
-    for key in [k for k in results if k.startswith('seed')]:
-        print(f"\n── {key} ──")
-        rows = results[key]
-        if dec_cols is None:
-            any_b = next(iter(rows.values()))
-            dec_cols = list(any_b['decoders'].keys())
-        print(f"  {'bucket':>12s} {'base':>7s}" +
-              ''.join(f" {c:>12s}" for c in dec_cols))
-        for name, e in rows.items():
-            print(f"  {name:>12s} {e['base_acc']:>7.3f}" +
-                  ''.join(f" {e['decoders'][c]['acc_final']:>12.3f}"
-                          for c in dec_cols))
-        # detection-delay digest
-        for name, e in rows.items():
-            recs = e['audit']['records']
-            if not recs:
-                continue
-            for tau in args.taus:
-                ds = [r['detect_rank'][str(tau)] for r in recs]
-                nd_ = sum(1 for d in ds if d is None)
-                dd = [r['detect_rank'][str(tau)] - r['commit_rank']
-                      for r in recs if r['detect_rank'][str(tau)] is not None]
-                ev = [r['evidence_rank'] - r['commit_rank'] for r in recs]
-                if dd:
-                    print(f"    {name} τ={tau}: detect-delay median="
-                          f"{sorted(dd)[len(dd)//2]}, never-detected={nd_}/"
-                          f"{len(recs)}, evidence-delay median="
-                          f"{sorted(ev)[len(ev)//2]}")
+    if args.mode in ('remask', 'all'):
+        print(f"\n{'='*70}\n  TABLE R1 — remasking decoders (3GQB Q1)\n{'='*70}")
+        dec_cols = None
+        for key in [k for k in results if k.startswith('seed')]:
+            print(f"\n── {key} ──")
+            rows = results[key]
+            if dec_cols is None:
+                any_b = next(iter(rows.values()))
+                dec_cols = list(any_b['decoders'].keys())
+            print(f"  {'bucket':>12s} {'base':>7s}" +
+                  ''.join(f" {c:>12s}" for c in dec_cols))
+            for name, e in rows.items():
+                print(f"  {name:>12s} {e['base_acc']:>7.3f}" +
+                      ''.join(f" {e['decoders'][c]['acc_final']:>12.3f}"
+                              for c in dec_cols))
+            for name, e in rows.items():
+                recs = e['audit']['records']
+                if not recs:
+                    continue
+                for tau in DETECT_TAUS:
+                    ds = [r['detect_rank'][str(tau)] for r in recs]
+                    nd_ = sum(1 for d in ds if d is None)
+                    dd = [r['detect_rank'][str(tau)] - r['commit_rank']
+                          for r in recs
+                          if r['detect_rank'][str(tau)] is not None]
+                    ev = [r['evidence_rank'] - r['commit_rank'] for r in recs]
+                    if dd:
+                        print(f"    {name} τ={tau}: detect-delay median="
+                              f"{sorted(dd)[len(dd)//2]}, never-detected="
+                              f"{nd_}/{len(recs)}, evidence-delay median="
+                              f"{sorted(ev)[len(ev)//2]}")
+
+    if args.mode in ('stochastic', 'all'):
+        print(f"\n{'='*70}\n  TABLE R2 — stochastic decoding (ZTfz Q2)\n{'='*70}")
+        for key in [k for k in results if k.startswith('seed')]:
+            for name, e in results[key].items():
+                st = e.get('stochastic')
+                if not st:
+                    continue
+                print(f"\n── {key} | {name} (base={e['base_acc']:.3f}, "
+                      f"n_trap={next(iter(st['configs'].values()))['n_trap']}) ──")
+                print(f"  {'config':>26s} {'acc':>6s} {'Δbase':>7s} "
+                      f"{'corrupt':>8s} {'escape':>7s} {'rescue':>7s} "
+                      f"{'rank=':>6s} {'pass@N':>7s}")
+                for cn, c in st['configs'].items():
+                    fmt = lambda v, w=7: (f"{v:>{w}.3f}" if v is not None
+                                          else f"{'—':>{w}s}")
+                    print(f"  {cn:>26s} {c['acc_mean']:>6.3f} "
+                          f"{c['acc_mean']-e['base_acc']:>+7.3f} "
+                          f"{fmt(c['corruption_rate'],8)} "
+                          f"{fmt(c['trap_escape_rate'])} "
+                          f"{fmt(c['trap_full_rescue_rate'])} "
+                          f"{fmt(c['trap_rank_unchanged'],6)} "
+                          f"{c['pass_at_n']:>7.3f}")
 
     with open(args.out, 'w') as f:
         json.dump(_jsonable(results), f, indent=1)
