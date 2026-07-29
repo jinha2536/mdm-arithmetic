@@ -83,6 +83,7 @@ SEED = 42
 NO_AMP = False
 PATIENCE = 50000
 SKIP_EXISTING = False
+EVAL_ONLY = False
 CONTINUATION_ITERS = 10000
 
 # Extreme-case axes (listops analog of addition chain / maze backbone)
@@ -129,6 +130,11 @@ def parse_args():
     p.add_argument('--no-amp', action='store_true')
     p.add_argument('--tag', type=str, default=''); p.add_argument('--seed', type=int)
     p.add_argument('--seeds', nargs='+', type=int)
+    p.add_argument('--eval-only', action='store_true',
+                   help='Load checkpoint_seed{SEED}_{method}.pt from the exp '
+                        'dir and run the full final-eval battery without '
+                        'training (e.g., capacity run whose session died '
+                        'after checkpoints were saved)')
     p.add_argument('--skip-existing', action='store_true',
                    help='Skip a seed whose results_seed{N}.json already exists - resume-safe single-session multi-seed runs')
     try:
@@ -2014,8 +2020,8 @@ def run(tag=''):
     mount_drive()
     if globals().get('SKIP_EXISTING'):
         try:
-            from core.train_utils import DRIVE_BASE
-            _rp = os.path.join(DRIVE_BASE, exp_name, f'results_seed{SEED}.json')
+            from core.train_utils import get_save_dir
+            _rp = os.path.join(get_save_dir(exp_name), f'results_seed{SEED}.json')
             if os.path.exists(_rp):
                 print(f"  [skip] seed {SEED}: results exist ({_rp})")
                 return
@@ -2073,22 +2079,40 @@ def run(tag=''):
     saved_states = {}
 
     # ── Shared init across methods within this seed (addition convention) ──
-    shared_init = _build_shared_init(tok, max_len, SEED)
-    save_checkpoint(exp_name, shared_init, tag=f'init_seed{SEED}')
-    print(f"  Built shared init for seed {SEED} ({len(shared_init)} tensors)")
+    shared_init = None
+    if not EVAL_ONLY:
+        shared_init = _build_shared_init(tok, max_len, SEED)
+        save_checkpoint(exp_name, shared_init, tag=f'init_seed{SEED}')
+        print(f"  Built shared init for seed {SEED} ({len(shared_init)} tensors)")
 
     # ── Main training ──
     method_seeds = {}
     for mi, mt in enumerate(MASK_TYPES):
         method_seed = SEED * 100 + mi
         method_seeds[mt] = method_seed
-        print(f"\n{'━' * 60}\n▶ {mt}  (seed={SEED}, train_seed={method_seed})\n{'━' * 60}")
-        m, d = train_model(mt, tok, train_data, train_metas,
-                           natural_samples, natural_metas, max_len,
-                           init_state=shared_init, seed_train=method_seed)
+        if EVAL_ONLY:
+            from core.train_utils import get_save_dir
+            ckp = os.path.join(get_save_dir(exp_name),
+                               f'checkpoint_seed{SEED}_{mt}.pt')
+            print(f"\n{'━' * 60}\n▶ {mt}  [eval-only] {ckp}\n{'━' * 60}")
+            state = torch.load(ckp, map_location='cpu')
+            m = Transformer(vocab_size=len(tok), block_size=max_len + 8,
+                            n_layer=N_LAYER, n_head=N_HEAD, n_embd=N_EMBD,
+                            dropout=DROPOUT, is_causal=False,
+                            pos_enc=POS_ENC).to(DEVICE)
+            m.load_state_dict(state)
+            m.eval()
+            d = {}
+            print(f"  loaded ({sum(p.numel() for p in m.parameters()):,} params)")
+        else:
+            print(f"\n{'━' * 60}\n▶ {mt}  (seed={SEED}, train_seed={method_seed})\n{'━' * 60}")
+            m, d = train_model(mt, tok, train_data, train_metas,
+                               natural_samples, natural_metas, max_len,
+                               init_state=shared_init, seed_train=method_seed)
         all_dyn[mt] = d
         saved_states[mt] = {k: v.cpu().clone() for k, v in m.state_dict().items()}
-        save_checkpoint(exp_name, saved_states[mt], tag=f'seed{SEED}_{mt}')
+        if not EVAL_ONLY:
+            save_checkpoint(exp_name, saved_states[mt], tag=f'seed{SEED}_{mt}')
 
         # Standard eval
         for dp in DECODE_POLICIES:
@@ -2274,7 +2298,7 @@ def run(tag=''):
     # ── Continuation training ──
     args = parse_args()
     if not getattr(args, 'no_continuation', False) and len(MASK_TYPES) >= 2:
-        cont_pairs = []
+        cont_pairs = [] if EVAL_ONLY else []
         if 'random' in saved_states and 'puma' in MASK_TYPES:
             cont_pairs.append(('random', 'puma'))
         if 'puma' in saved_states and 'random' in MASK_TYPES:
@@ -2397,6 +2421,7 @@ if __name__ == '__main__':
     args = parse_args()
     seeds = args.seeds if args.seeds else [SEED]
     globals()['SKIP_EXISTING'] = getattr(args, 'skip_existing', False)
+    globals()['EVAL_ONLY'] = getattr(args, 'eval_only', False)
     for si, seed in enumerate(seeds):
         globals()['SEED'] = seed
         # per-seed files are seed-tagged inside ONE experiment dir
